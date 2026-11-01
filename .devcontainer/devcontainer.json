@@ -1,0 +1,12 @@
+{
+  "name": "Strata (Zed)",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": "."
+  },
+  "remoteUser": "dev",
+  "remoteEnv": {
+    "PATH": "${containerEnv:HOME}/.venv-strata/bin:${containerEnv:PATH}"
+  },
+  "postCreateCommand": "bash .devcontainer/post-create.sh"
+}
