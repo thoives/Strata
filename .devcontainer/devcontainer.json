@@ -4,7 +4,7 @@
     "dockerfile": "Dockerfile",
     "context": "."
   },
-  "remoteUser": "dev",
+  "remoteUser": "ubuntu",
   "remoteEnv": {
     "PATH": "${containerEnv:HOME}/.venv-strata/bin:${containerEnv:PATH}"
   },

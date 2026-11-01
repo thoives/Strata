@@ -19,13 +19,3 @@ RUN apt-get update \
         python3 python3-dev python3-pip python3-venv \
     && rm -rf /var/lib/apt/lists/*
 
-# ubuntu:24.04 ships a user called "ubuntu" with UID 1000. Replace it with a developer user of the same UID, so files
-# written into the bind-mounted repo belong to the same user on the host.
-RUN if id -u ubuntu >/dev/null 2>&1; then userdel -r ubuntu; fi \
-    && groupadd --gid "$USER_GID" "$USERNAME" \
-    && useradd --uid "$USER_UID" --gid "$USER_GID" --create-home --shell /bin/bash "$USERNAME" \
-    && echo "$USERNAME ALL=(root) NOPASSWD:ALL" > "/etc/sudoers.d/$USERNAME" \
-    && chmod 0440 "/etc/sudoers.d/$USERNAME"
-
-USER $USERNAME
-WORKDIR /home/$USERNAME
