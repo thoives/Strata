@@ -102,6 +102,7 @@ void usage() {
     std::fprintf(stderr,
                  "maya-ds4 --pack <model>/maya-ds4 [--gpus 0,1,...] [--max-context N] [--reserve-mib N]\n"
                  "           [--vram-experts F] [--cpu-threads N] [--expert-profile FILE|none] [--profile-readonly] [--ssd-cache GB] [--ssd-policy lru|lfu|lfulru] [--no-expert-cache] [--verbose]\n"
+                 "           [--expert-tier PATH,mib=N[,reserve=M][,verify=header|full] (repeatable, one per device)] [--expert-tier-refill]\n"
                  "           [--tp N] [--threads on|off] [--prefill-chunk N] [--dspark on|off|none|auto] [--dspark-block N] [--dspark-conf F] [--experts N|auto]\n"
                  "           [--vision on|off] [--mmap-experts on|off|auto]\n"
                  "           (--ids I,J,... [--images FILE] [--n N] [--dump-logits FILE] | --serve\n"
@@ -1323,6 +1324,8 @@ int main(int argc, char** argv) {
         else if (a == "--expert-profile") o.profile = val("--expert-profile");
         else if (a == "--profile-readonly") o.profile_readonly = true;   // (read the placement, never write the counts back)
         else if (a == "--ssd-cache") o.ssd_cache_gb = std::atof(val("--ssd-cache").c_str());
+        else if (a == "--expert-tier") o.expert_tiers.push_back(val("--expert-tier"));   // (repeatable, one entry per device, in the order given: the order is part of the placement)
+        else if (a == "--expert-tier-refill") o.expert_tier_refill = true;
         else if (a == "--ssd-policy") {
             const std::string v = val("--ssd-policy");
             o.ssd_policy = v == "lfu" ? 1 : v == "lfulru" ? 2 : 0;
@@ -1390,7 +1393,7 @@ int main(int argc, char** argv) {
             usage();
             return 2;
         }
-        return strata::ds4::pack_info(o.pack, stdout);
+        return strata::ds4::pack_info(o.pack, stdout, o.expert_tiers);
     }
     if (o.pack.empty() || (!serve_mode && ids_s.empty() && enc_rgb.empty() && score_ids.empty() && prof_ids.empty() && spec_ids.empty())) {
         usage();
@@ -1599,6 +1602,13 @@ int main(int argc, char** argv) {
                      (long long) s.store_slots, (long long) s.store_slots_max, (long long) (s.store_evictions - s0.store_evictions),
                      (long long) (s.store_fails - s0.store_fails), (double) (s.store_zc - s0.store_zc) / nt,
                      (long long) s.store_zc_visible);
+    }
+    if (s.tier_devices > 0) {   // --expert-tier (docs/EXPERT_TIER_DSV41_PLAN.md §8.2: the tier's copies are not file bytes)
+        std::fprintf(stderr,
+                     "tier: %lld experts on %lld tier devices; %.1f experts a token copied from them (%.1f MB a token not read from the files); %s\n",
+                     (long long) s.tier_experts, (long long) s.tier_devices,
+                     (double) (s.tier_hits - s0.tier_hits) / nt, (double) (s.tier_bytes - s0.tier_bytes) / 1e6 / nt,
+                     s.tier_fill_s > 0.0 ? "the fill read them once at start" : "the placement was reused");
     }
     if (s.ahead_picks > s0.ahead_picks) {   // lookahead
         const double p = (double) (s.ahead_picks - s0.ahead_picks), c = (double) (s.ahead_cold - s0.ahead_cold);

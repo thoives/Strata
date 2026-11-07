@@ -23,6 +23,7 @@ class ClockedThinkingEngine(ThinkingEngine):
         self.done = []
         self.fail_continuation = False
         self.cancel_continuation = False
+        self.omit_tier = False   # True: the DONE says nothing about a tier (no tier, or an engine that does not print it)
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         self.attempts += 1
@@ -47,7 +48,11 @@ class ClockedThinkingEngine(ThinkingEngine):
                              drafts_offered=18 if first else 11, drafts_accepted=8 if first else 7,
                              hits=9 if first else 7, lookups=10 if first else 8,
                              ram_blobs=1 if first else 3, file_blobs=2 if first else 4,
-                             file_mb=1.5 if first else 2.5)
+                             file_mb=1.5 if first else 2.5,
+                             tier_reads=2 if first else 5, tier_mb=2.5 if first else 6.5, tier_ms=3.0 if first else 7.5)
+            if self.omit_tier:   # without a tier the engine appends none of the three (docs/DETAILS.md §Reading the tiers)
+                for key in ("tier_reads", "tier_mb", "tier_ms"):
+                    self.last.pop(key)
             self.done.append(dict(self.last))
 
 
@@ -111,6 +116,7 @@ class RequestAccounting(unittest.TestCase):
         self.assertEqual(row["decode_tok_s"], timings["predicted_per_second"])
         self.assertEqual((row["prompt_ms"], row["decode_ms"]), (47.0, 280.0))
         self.assertEqual((row["ram_blobs"], row["file_blobs"], row["file_mb"]), (4, 6, 4.0))
+        self.assertEqual((row["tier_reads"], row["tier_mb"], row["tier_ms"]), (7, 9.0, 10.5))
         self.assertAlmostEqual(row["hit_rate"], 16 / 18, places=3)
         self.assertEqual((totals["requests"], totals["prompt_tokens"], totals["reused"]), (1, original, 5))
         self.assertEqual((totals["prompt_ms"], totals["decode_ms"]), (47.0, 280.0))
@@ -118,6 +124,21 @@ class RequestAccounting(unittest.TestCase):
         code, raw = self.request("/v1/status")
         self.assertEqual(code, 200)
         self.assertEqual(json.loads(raw)["last_timings"]["draft_n"], 29)
+
+    def test_a_tier_free_run_keeps_the_tier_figures_out_of_the_row(self):
+        """An engine whose DONE says nothing about a tier (no --expert-tier, or an engine that does not print them):
+        the row's tier figures are None like an older engine's, and the RAM and file figures are unchanged."""
+        self.engine.omit_tier = True
+        response = self.chat()
+        self.assertEqual(response["choices"][0]["message"]["content"], self.engine.ANSWER)
+        code, raw = self.request("/metrics")
+        self.assertEqual(code, 200)
+        row = json.loads(raw)["requests"][0]
+        self.assertIsNone(row["tier_reads"])
+        self.assertIsNone(row["tier_mb"])
+        self.assertIsNone(row["tier_ms"])
+        self.assertEqual((row["ram_blobs"], row["file_blobs"], row["file_mb"]), (4, 6, 4.0))
+        self.assertEqual(json.loads(raw)["totals"]["requests"], 1)
 
     def test_openai_nonstream_keeps_original_cache_and_all_segment_work(self):
         response = self.chat()

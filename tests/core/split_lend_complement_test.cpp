@@ -4,6 +4,7 @@
 // PC: the device calls are wrapped at the link (`--wrap` in CMakeLists.txt, conversation_transfer_test's
 // pattern), the memory is ordinary memory, and `pin = false` keeps the copy pageable.
 #include "strata/core/expert_source.hpp"
+#include "strata/core/expert_tier.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 
 #include <cuda_runtime.h>
@@ -92,7 +93,7 @@ struct Rig {
     strata::core::ExpertCache stage0, stage1;   // the two split stages' caches
     size_t blob = 0;
 
-    explicit Rig(const char* tag) {
+    explicit Rig(const char* tag, bool fill_caches = true) {
         std::string err;
         require(strata::kernels::cpu::expert_layout_load(dir.path.string(), kLayers, kExperts, err), err);
         blob = (size_t) strata::kernels::cpu::BLOB;
@@ -112,6 +113,7 @@ struct Rig {
         // kExperts slots each: every layer of the stage, and the tail the prompt path borrows
         require(stage0.open(kExperts, kLayers, kExperts, blob, err), err);
         require(stage1.open(kExperts, kLayers, kExperts, blob, err), err);
+        if (!fill_caches) return;   // the tier test's shape: the caches open but admit nothing
         for (int64_t e = 0; e < kExperts; ++e) {
             const int32_t s0 = stage0.admit(0, e);
             require(s0 >= 0 && stage0.fill_slot_blocking(s0, truth[(size_t) e].data(), err), err);
@@ -203,6 +205,88 @@ void test_split_without_regions_keeps_nothing() {
             require(!rig.src.has_resident(l, e), "an expert neither in a cache's complement region entered the copy");
 }
 
+// §12.5 (docs/EXPERT_TIER_PLAN.md §4.4, §7.6): beside the RAM copy, an expert tier. The fill list is the complement
+// minus what the copy already holds (exactly what generate hands the tier at start), so no expert has two homes;
+// a tier-held expert is served from the tier's bytes with the §7.4 counters, and only an expert no band holds
+// still reads the file tier.
+void test_tier_holds_what_no_band_holds() {
+    Rig rig("tier beside the RAM copy", false);   // the caches open but hold nothing: the complement is every expert
+    std::string err;
+
+    const uint64_t budget = 2 * (uint64_t) rig.blob;
+    std::vector<std::pair<int32_t, int32_t>> no_gpu_pairs;
+    require(rig.src.pin_cache_complement(rig.stage0, err, false, no_gpu_pairs, -1, 0, budget), err);
+    require(rig.src.resident_bytes() == budget, "the budget did not cap the RAM copy at two blobs");
+
+    // the caller's ranked remainder: rank order, every pair the RAM copy already holds taken out (§4.4)
+    std::vector<std::pair<int32_t, int32_t>> ranked_rest;
+    for (int64_t l = 0; l < kLayers; ++l)
+        for (int64_t e = 0; e < kExperts; ++e)
+            if (!rig.src.has_resident(l, e)) ranked_rest.emplace_back((int32_t) l, (int32_t) e);
+    require(ranked_rest.size() == 6, "the RAM copy should hold exactly the two blobs the budget fits");
+
+    // one device, room for six blobs (6 x 1.32 MiB) plus the header areas and tables; sparse, so the test
+    // writes only what it fills
+    const uint64_t mib = 16;
+    const fs::path tier_file = rig.dir.path / "tier.bin";
+    {
+        std::ofstream out(tier_file, std::ios::binary);
+        out.seekp((std::streamoff) (mib << 20) - 1);
+        out.put('\0');
+    }
+    strata::core::TierIdentity id;
+    id.pack_id = "st:test";
+    id.profile_id = "profile:none";
+    id.n_layers = kLayers;
+    id.n_expert = kExperts;
+    id.layer_blob_bytes.assign((size_t) kLayers, (uint64_t) rig.blob);
+    strata::core::ExpertTierSet set;
+    bool reused = false;
+    require(set.open({strata::core::TierSpec{tier_file.string(), mib, 0, false}}, id, err, reused), err);
+    require(set.fill(rig.src, ranked_rest, id, err), err);
+    require(set.experts_held() == 6, "the tier should hold the six experts no band holds");
+
+    // no expert is in two homes: the copy's two and the tier's six are exactly the eight
+    int held = 0;
+    for (int64_t l = 0; l < kLayers; ++l)
+        for (int64_t e = 0; e < kExperts; ++e) {
+            const bool both = rig.src.has_resident(l, e) && set.has(l, e);
+            require(!both, "the tier and the RAM copy hold the same expert");
+            held += (rig.src.has_resident(l, e) || set.has(l, e)) ? 1 : 0;
+        }
+    require(held == kLayers * kExperts, "some expert has no home at all");
+
+    // §7.4: with no tier open yet, the tier's trio stays 0 however those experts were read
+    require(rig.src.tier_reads() == 0 && rig.src.tier_read_bytes() == 0 && rig.src.tier_ms() == 0.0,
+            "the §7.4 counters moved with no tier open");
+
+    // a tier-held expert is served from the tier: same bytes as the file's, no file read, and the §7.4 counters move
+    rig.src.set_tier(&set);
+    std::vector<uint8_t> dst(rig.blob);
+    const int64_t files_before = rig.src.file_reads();
+    const int64_t tier_reads_before = rig.src.tier_reads();
+    const uint64_t tier_bytes_before = rig.src.tier_read_bytes();
+    const double tier_ms_before = rig.src.tier_ms();
+    for (int64_t l = 0; l < kLayers; ++l)
+        for (int64_t e = 0; e < kExperts; ++e) {
+            if (!set.has(l, e)) continue;
+            const uint8_t* b = rig.src.blob(l, e);
+            require(b == set.blob(l, e), "a tier-held expert is not served from the tier");
+            require(rig.src.copy_blob(l, e, dst.data()) && dst == rig.truth[(size_t) l * kExperts + e],
+                    "the tier serves wrong bytes");
+        }
+    require(rig.src.file_reads() == files_before, "a tier-held expert was read from the file tier");
+    // §7.4: both ways the tier answers count as a tier read and its bytes - the pointer lookup and the copy. Only the
+    // copy is timed, which is what the printed "copies from the tier" seconds say (docs/DETAILS.md §Reading the tiers).
+    const int64_t held = set.experts_held();
+    require(rig.src.tier_reads() - tier_reads_before == 2 * held,
+            "the §7.4 read count is not the pointer lookups plus the copies");
+    require(rig.src.tier_read_bytes() - tier_bytes_before == (uint64_t) (2 * held) * (uint64_t) rig.blob,
+            "the §7.4 byte count is not the pointer lookups plus the copies");
+    require(rig.src.tier_ms() - tier_ms_before > 0.0, "the tier's copies were not timed");
+    set.close();
+}
+
 }  // namespace
 
 int main() {
@@ -210,6 +294,7 @@ int main() {
         test_split_lend_region_served_from_ram();
         test_split_lend_region_budget();
         test_split_without_regions_keeps_nothing();
+        test_tier_holds_what_no_band_holds();
         std::cout << "split_lend_complement_test: PASS\n";
         return 0;
     } catch (const std::exception& error) {

@@ -46,6 +46,7 @@ namespace strata::core {
 
 class PeerExperts;   // multi-GPU: the second GPU's expert tier (peer_experts.hpp)
 class RemoteExperts;
+class ExpertTierSet;   // the expert tier on a disk device (expert_tier.hpp): see docs/EXPERT_TIER_PLAN.md
 struct LoadStats;
 
 namespace detail {
@@ -502,6 +503,22 @@ public:
     // STRATA_EXCHANGE_ROTATE=1 can instead transfer buffer ownership (uniform, fully pinned/mapped slots).
     /// Whether the compact copy holds `(layer, expert)`.
     bool has_resident(int64_t layer, int64_t expert) const;
+    /// Whether the expert tier holds `(layer, expert)` (§7.6: the tier's parallel of `has_resident`; RAM is never
+    // asked of a tier-held expert at fill time, §4.4). The SYCL mirror: only the registration is backend-specific
+    // (docs/EXPERT_TIER_PLAN.md §13); the tier itself is backend-neutral. `blob()` / `copy_blob()` take the order
+    // RAM copy, tier, file.
+    bool has_tier(int64_t layer, int64_t expert) const;
+    /// The model files this source reads the experts from (experts.bin, or the GGUF shards read in place): the expert
+    /// tier's identity covers them and no tier device may be one of them (docs/EXPERT_TIER_PLAN.md §5.4, §6.2).
+    const std::vector<std::string>& model_files() const { return paths_; }
+    /// The tier this source reads through, or null (no `--expert-tier`: every path below stays exactly as it is
+    // today, acceptance criterion 1). The engine owns it: opened after `pin_cache_complement`, closed at exit.
+    void set_tier(ExpertTierSet* t) { tier_ = t; }
+    /// §7.4: three counters beside the file ones: tier reads, tier bytes read, and the time spent copying from
+    // the tier (the tier share of the prompt's wait, §7.3).
+    uint64_t tier_reads() const { return tier_reads_.load(std::memory_order_relaxed); }
+    uint64_t tier_read_bytes() const { return tier_read_bytes_.load(std::memory_order_relaxed); }
+    double tier_ms() const { return (double) tier_us_.load(std::memory_order_relaxed) / 1000.0; }
     /// Host room for `n` evicted blobs (page-locked when possible).  Idempotent for the same or a smaller `n`.
     bool reserve_exchanges(int64_t n, std::string& err);
     int64_t exchange_capacity() const { return xstage_cap_; }
@@ -684,6 +701,10 @@ private:
     int64_t exchanges_ = 0;
     std::atomic<int64_t> file_reads_{0};
     int64_t reads_ = 0;
+    // ---- the expert tier (§8.3): a non-owning pointer; the engine opens and closes the ExpertTierSet around
+    // the run. Every tier branch below is guarded on this pointer, so the no-tier path is byte-identical.
+    ExpertTierSet* tier_ = nullptr;
+    std::atomic<uint64_t> tier_reads_{0}, tier_read_bytes_{0}, tier_us_{0};   // §7.4
 #if defined(_WIN32)
     void* file_ = nullptr;
     void* mapping_ = nullptr;

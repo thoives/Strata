@@ -559,10 +559,36 @@ def derive_config(base: dict, s: S.LaunchSettings, *, bool_flags: frozenset[str]
         cfg["args"] = tune_knobs.apply_to_argv([str(x) for x in cfg.get("args") or []], a_changes)
         if e_changes:
             cfg["env"] = tune_knobs.apply_to_env(dict(cfg.get("env") or {}), e_changes)
+    if s.expert_tiers:                                # --expert-tier: repeated flags, one per device, in order (§5.1)
+        from strata_control import user_args as _ua    # the group mechanism: replace every old --expert-tier group, keep the order
+        rest = [g for g in _ua.groups(cfg.get("args") or []) if _ua.flag_of(g) != "--expert-tier"]
+        cfg["args"] = _ua.flat(rest) + [x for v in s.expert_tiers for x in ("--expert-tier", str(v))]
+        # serve/server.py engine_args() puts "user_args" over "args" at every start, and a --expert-tier group there would
+        # replace the devices this launch asked for with the ones the config remembered: the requested devices replace the
+        # tier groups of "user_args" too (its other options stay as they are)
+        if cfg.get(_ua.USER_KEY):
+            kept = [g for g in _ua.groups(cfg[_ua.USER_KEY]) if _ua.flag_of(g) != "--expert-tier"]
+            if kept:
+                cfg[_ua.USER_KEY] = _ua.flat(kept)
+            else:
+                cfg.pop(_ua.USER_KEY, None)
     from strata_control import draft_layer
     draft_layer.apply(cfg)                                   # "mtp": false (from the installed config too) never sits beside --mtp in the saved args (B10)
     apply_experts(cfg, experts)
     return cfg
+
+
+def dsv41_tier_store_problem(cfg: dict) -> str:
+    """The DeepSeek engine plans an expert tier against the RAM store's guaranteed size and stops at the store's auto size, so a
+    run config that names --expert-tier needs an explicit --ssd-cache (or DS4_STORE_GB).  "" when nothing is wrong (any other
+    family, no tier, or a size given); else what is missing, for a LaunchError before the engine is started and fails."""
+    if cfg.get("arch") != "deepseek41":
+        return ""
+    from strata_control import user_args as _ua
+    args = _ua.merge(cfg.get("args") or [], cfg.get(_ua.USER_KEY) or [])          # what serve/server.py engine_args() starts it with
+    if "--expert-tier" not in args or "--ssd-cache" in args or (cfg.get("env") or {}).get("DS4_STORE_GB"):
+        return ""
+    return "The DeepSeek engine needs the RAM store's size to plan an expert tier, and this run has none."
 
 
 def write_private(path: Path, data: dict) -> None:
@@ -620,8 +646,12 @@ class Runner:
                  components_dir: str | None = None, hardware: dict | None = None,
                  confirm: Callable[[str, str], bool] | None = None, assume_yes: bool = False, move_data: bool = False,
                  retune: bool = False, restart: bool = False, confirm_restart: Callable[[str, str], bool] | None = None,
-                 after_check: Callable[[], None] | None = None):
+                 after_check: Callable[[], None] | None = None, tier_overwrite: bool = False,
+                 confirm_overwrite: Callable[[str, str], bool] | None = None):
         self.s = s
+        self.tier_overwrite = tier_overwrite  # --expert-tier-overwrite: a tier device holding other data may be written over (said, not asked)
+        self.tier_consented: set[str] = set()  # the devices whose data the person confirmed (check_expert_tiers); clear_expert_tiers writes only those
+        self.confirm_overwrite = confirm_overwrite  # asked (title, text) before such a device is cleared; only True goes on. None: nobody to ask
         self.after_check = after_check        # called once when nothing blocks the launch (no server, the same one, or "Restart" was answered): the screens save the preset then
         self.restart = restart                # --restart: a server that serves other choices (or holds this port) is stopped and replaced without asking
         self.confirm_restart = confirm_restart  # the screens: asked (question, detail) once; True = restart. None (no screens) and no --restart: refuse in one line
@@ -928,6 +958,10 @@ class Runner:
             args += ["--gguf-dir", str(p if p.is_dir() else p.parent)]
         if s.dsv41_package and s.family == "deepseek41":
             args += ["--dsv41-package", s.dsv41_package]
+        for entry in s.expert_tiers or []:               # one flag per device, in order: setup works the DeepSeek store size out from them
+            args += ["--expert-tier", str(entry)]
+        if s.expert_tiers and self.tier_overwrite:
+            args.append("--expert-tier-overwrite")
         if self.feed:                                     # --feed / STRATA_UPDATE_FEED: setup fetches the DeepSeek engine from it too
             args += ["--feed", str(self.feed)]
         if s.gpu_roles:
@@ -1435,6 +1469,83 @@ class Runner:
             self.notices.append(text)
             self.emit("model", text, None, level="warn")
 
+    def absolute_tiers(self) -> None:
+        """The devices as absolute paths from this process's working directory (a preset may carry a relative one): the checks, setup
+        and the engine then get the same file wherever they run. An entry that does not parse is kept as typed (the checks say why)."""
+        from strata_control import expert_tier
+        if self.s.expert_tiers:
+            out = []
+            for raw in self.s.expert_tiers:
+                spec, _why = expert_tier.parse(str(raw))
+                out.append(expert_tier.canonical(expert_tier.absolute(spec)) if spec is not None else str(raw))
+            self.s.expert_tiers = out
+
+    def expert_tier_problems(self, args: list | None = None) -> list[str]:
+        """What stops this launch's --expert-tier devices (strata_control/expert_tier.problems: the engines' own checks, made
+        earlier). `args`: the engine arguments, whose model files a device may not be. Nothing is written."""
+        from strata_control import expert_tier
+        specs, bad = expert_tier.parse_all(self.s.expert_tiers or [])
+        if bad:
+            return bad
+        protect = expert_tier.model_paths_from_args(args or [])
+        if self.s.model_path:
+            protect.append(self.s.model_path)
+        return expert_tier.problems(specs, protect)
+
+    def check_expert_tiers(self) -> None:
+        """Before anything is downloaded: the devices are usable (expert_tier_problems), a line says the first start writes over
+        them, and a device that holds data that is not an expert tier is written over only after a yes - --expert-tier-overwrite,
+        or a typed yes where someone can answer (--yes alone is not a yes to losing data). Nothing is written here: the question is
+        asked now, and clear_expert_tiers does the writing once the model's files are known."""
+        from strata_control import expert_tier
+        self.tier_consented = set()
+        if not self.s.expert_tiers:
+            return
+        probs = self.expert_tier_problems()
+        if probs:
+            raise LaunchError(f"The expert tier cannot be used: {probs[0]}.",
+                              "Give another file or device with --expert-tier, or leave --expert-tier out.", 2)
+        specs, _bad = expert_tier.parse_all(self.s.expert_tiers)
+        self.emit("config", capital(expert_tier.overwrite_warning(specs)) + ".", None, level="warn")
+        held = expert_tier.foreign(specs)
+        if not held or self.tier_overwrite:
+            self.tier_consented = set(held)
+            return
+        text = capital(expert_tier.foreign_message(held))
+        asked = self.confirm_overwrite is not None and self.confirm_overwrite("Overwrite the expert tier device?", text + ".")
+        if not asked:
+            raise LaunchError(f"{text}. Nothing was written.",
+                              "If that data may go, run this again with --expert-tier-overwrite; otherwise give an empty file or device.", 2)
+        self.tier_consented = set(held)
+
+    def clear_expert_tiers(self, cfg: dict) -> None:
+        """After the run config is written, so the model's files are known (the final args, carried-over ones included): the
+        devices are checked again with them, and a device that holds data is cleared only if its data was confirmed in
+        check_expert_tiers. Nothing is written when any check fails. Each device is cleared under its own lock."""
+        from strata_control import expert_tier, user_args as _ua
+        if not self.s.expert_tiers:
+            return
+        probs = self.expert_tier_problems(_ua.merge(cfg.get("args") or [], cfg.get(_ua.USER_KEY) or []))
+        if probs:
+            raise LaunchError(f"The expert tier cannot be used: {probs[0]}.",
+                              "Give another file or device with --expert-tier, or leave --expert-tier out.", 2)
+        specs, _bad = expert_tier.parse_all(self.s.expert_tiers)
+        held = expert_tier.foreign(specs)
+        unconfirmed = [p for p in held if p not in self.tier_consented and not self.tier_overwrite]
+        if unconfirmed:
+            raise LaunchError(f"{capital(expert_tier.foreign_message(unconfirmed))}. Nothing was written.",
+                              "Run this again and confirm it, or give an empty file or device.", 2)
+        by_path = {s.path: s for s in specs}
+        for path in held:
+            try:
+                expert_tier.claim(path, by_path[path].mib)
+            except OSError as e:
+                raise LaunchError(f"The expert tier device {path} could not be cleared ({e}).",
+                                  "Check that this user may write to it, and that no other Strata process uses it.", 5) from None
+        if held:
+            self.emit("config", f"The expert tier device{'s' if len(held) > 1 else ''} {', '.join(held)} "
+                                f"{'were' if len(held) > 1 else 'was'} cleared for the tier, as you confirmed.", None, level="warn")
+
     def build_config(self, base_path: Path) -> Path:
         from strata_control import tune_knobs
         base = read_config(base_path)
@@ -1443,6 +1554,21 @@ class Runner:
         if self.s.gpus and not self.s.gpu_roles:             # a DeepSeek model on AMD keeps the card the person names from now on (strata_control/gpu_pick.py)
             from strata_control import gpu_pick
             gpu_pick.remember(base_path, [int(g) for g in self.s.gpus])
+        if self.s.expert_tiers:                              # the tier paths: absolute, the same file for setup and the engine (any working directory)
+            from strata_control import expert_tier as _et, user_args as _ua0
+            cfg["args"] = _et.absolute_args(cfg.get("args") or [])
+            if cfg.get(_ua0.USER_KEY):
+                cfg[_ua0.USER_KEY] = _et.absolute_args(cfg[_ua0.USER_KEY])
+        if self.s.expert_tiers:                              # the final args name the model's files: no tier device may be one of them
+            from strata_control import user_args as _ua
+            probs = self.expert_tier_problems(_ua.merge(cfg.get("args") or [], cfg.get(_ua.USER_KEY) or []))
+            if probs:
+                raise LaunchError(f"The expert tier cannot be used: {probs[0]}.",
+                                  "Give another file or device with --expert-tier, or leave --expert-tier out.", 2)
+        problem = dsv41_tier_store_problem(cfg)
+        if problem:
+            raise LaunchError(problem, "Add --set ssd-cache=GB (the RAM, in GB, the store may keep: about the RAM you have less 9 GB, at most "
+                                       "the CPU's experts), or run setup with --expert-tier, which works the size out; or leave --expert-tier out.", 2)
         self.apply_four_card(cfg)
         self.use_own_dsv41_engine(cfg)
         apply_experts(cfg, self.experts_flag(cfg.get("exe")))   # after the engine is settled: only a 0.1.50+ engine is given --experts
@@ -2056,9 +2182,18 @@ class Runner:
 
     def plan(self) -> dict:
         s = self.s
+        self.absolute_tiers()
         self.check_own_files()
         warns = [n.line() for n in (*S.check_access(s),)]
         warns += self.preflight_words()
+        if s.expert_tiers:                                   # the tier devices as the run would find them; nothing is written in a plan
+            from strata_control import expert_tier
+            specs, _bad = expert_tier.parse_all(s.expert_tiers)
+            warns += [f"The expert tier cannot be used: {p}." for p in self.expert_tier_problems()]
+            warns.append(capital(expert_tier.overwrite_warning(specs)) + ".")
+            held = expert_tier.foreign(specs)
+            if held:
+                warns.append(capital(expert_tier.foreign_message(held)) + ": the run asks first, or needs --expert-tier-overwrite.")
         row = self.row()
         try:
             self.resolved_vision()
@@ -2287,10 +2422,12 @@ class Runner:
         self.restart_after = start
         try:
             self.check_own_files()                           # a wrong --model-path is said before the engine is downloaded
+            self.absolute_tiers()                            # the tier devices, absolute: the same files for setup, the checks and the engine
             if start:
                 reused = self.check_serving()                # before anything is downloaded or stopped
                 if reused is not None:
                     return reused
+            self.check_expert_tiers()                        # the tier devices: checked, and confirmed when they hold data, before any download
             self.ensure_engine()
             self.check_cancel()
             base = self.ensure_model()
@@ -2299,6 +2436,8 @@ class Runner:
             self.check_cancel()
             self.emit("config", "Writing this launch's settings…")
             cfg = self.build_config(base)
+            if self.s.expert_tiers:                          # (a launch with no tier does not read the config here at all)
+                self.clear_expert_tiers(read_config(cfg))    # the tier devices: cleared only now that the model's files are known
             self.ensure_profile(cfg)
             self.emit("config", "Settings are saved.", 100)
             if self.engine_problem:

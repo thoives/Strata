@@ -251,6 +251,9 @@ target_include_directories(strata_kernels PRIVATE ${STRATA_ROOT}/third_party/ggm
 target_link_libraries(strata_kernels PUBLIC strata_core)
 
 strata_resolve(_engine src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
+                       src/core/expert_tier.cpp src/core/expert_tier_plan.cpp   # the expert tier (docs/EXPERT_TIER_PLAN.md):
+                       # backend-neutral, so this is the CUDA tree's file; only the §5.3 registration is CUDA (the SYCL
+                       # build registers nothing and the startup notes say so per device, §13)
                        src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp
                        src/core/mtp.cpp src/core/conversation_snapshot.cpp src/core/conversation_state.cpp
                        src/core/conversation_memory.cpp   # 0.1.31: the conversation snapshots (#216)
@@ -290,6 +293,26 @@ if(STRATA_SYCL_PARITY)
   add_test(NAME spec_admission_pick COMMAND ${CMAKE_COMMAND} -E env STRATA_SPEC_PROB_GATE=pick $<TARGET_FILE:spec_admission_test> pick)
   add_test(NAME spec_admission_top COMMAND ${CMAKE_COMMAND} -E env STRATA_SPEC_PROB_GATE=top $<TARGET_FILE:spec_admission_test> top)
   add_test(NAME spec_admission_exact_top_only COMMAND ${CMAKE_COMMAND} -E env STRATA_SPEC_PROB_GATE=TOP $<TARGET_FILE:spec_admission_test> pick)
+  # The expert tier's own contracts (docs/EXPERT_TIER_PLAN.md §12.1-§12.4): host-only, like the CUDA build's four
+  # tier tests - no SYCL runtime, no GPU; they run on any PC this builds on.
+  add_executable(expert_tier_spec_test ${STRATA_ROOT}/tests/core/expert_tier_spec_test.cpp)
+  target_include_directories(expert_tier_spec_test PRIVATE ${STRATA_ROOT}/include)
+  add_test(NAME expert_tier_spec_test COMMAND expert_tier_spec_test ${STRATA_ROOT}/tests/core/expert_tier_spec_cases.txt)
+  add_executable(expert_tier_plan_test ${STRATA_ROOT}/src/core/expert_tier_plan.cpp ${STRATA_ROOT}/tests/core/expert_tier_plan_test.cpp)
+  target_include_directories(expert_tier_plan_test PRIVATE ${STRATA_ROOT}/include)
+  add_test(NAME expert_tier_plan_test COMMAND expert_tier_plan_test)
+  add_executable(expert_tier_layout_test ${STRATA_ROOT}/src/core/expert_tier.cpp ${STRATA_ROOT}/src/core/expert_tier_plan.cpp ${STRATA_ROOT}/tests/core/expert_tier_layout_test.cpp)
+  target_include_directories(expert_tier_layout_test PRIVATE ${STRATA_ROOT}/include)
+  target_link_libraries(expert_tier_layout_test PRIVATE Threads::Threads)
+  add_test(NAME expert_tier_layout_test COMMAND expert_tier_layout_test)
+  add_executable(expert_tier_test ${STRATA_ROOT}/src/core/expert_tier.cpp ${STRATA_ROOT}/src/core/expert_tier_plan.cpp ${STRATA_ROOT}/tests/core/expert_tier_test.cpp)
+  target_include_directories(expert_tier_test PRIVATE ${STRATA_ROOT}/include)
+  target_link_libraries(expert_tier_test PRIVATE Threads::Threads)
+  add_test(NAME expert_tier_test COMMAND expert_tier_test)
+  add_executable(expert_tier_copy_test ${STRATA_ROOT}/src/core/expert_tier.cpp ${STRATA_ROOT}/src/core/expert_tier_plan.cpp ${STRATA_ROOT}/tests/core/expert_tier_copy_test.cpp)
+  target_include_directories(expert_tier_copy_test PRIVATE ${STRATA_ROOT}/include)
+  target_link_libraries(expert_tier_copy_test PRIVATE Threads::Threads)
+  add_test(NAME expert_tier_copy_test COMMAND expert_tier_copy_test)
   if(STRATA_NATIVE_EXPERTS)
     # a token's native expert rows are the same bits at every number of tokens that share its expert (host CPU kernels)
     add_executable(native_arithmetic_parity ${STRATA_ROOT}/src/kernels/cpu/native_arithmetic_parity.cpp)

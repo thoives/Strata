@@ -25,6 +25,7 @@
 #include "ds4_os.hpp"
 #include "ds4_pool.hpp"
 #include "ds4_store.hpp"
+#include "ds4_tier.hpp"
 #include "ds4_vision.cuh"
 #include "strata/dsv41/exl3_cpu.hpp"
 #include "strata/dsv41/exl3.hpp"
@@ -1200,6 +1201,13 @@ struct Model::Impl {
         const char* v = std::getenv("STRATA_DS4_DISK_SKIP_FROM");
         return v != nullptr ? std::max(0, std::atoi(v)) : 0;
     }();
+    // the expert tier (--expert-tier, ds4_tier.hpp): the devices holding the experts the store's guard and the configured
+    // VRAM share do not cover; null: no tier (acceptance 1: without the flag every path is the release's).  Declared
+    // before the store, so it is destroyed AFTER it (members go in reverse order): the queues' jobs read the tier's mapping
+    // but write the store's slots, so the store drains the tier's queues first (its tier_drain hook, set in init_tier) and
+    // releases its arena only then; the tier's mappings close last.
+    std::unique_ptr<ExpertTierSet> tier;
+    double tier_fill_s = 0.0;   // (the fill phase's time: a load statistic, §9)
     // the RAM store (--ssd-cache): the CPU lane's experts in slots a policy owns, read unbuffered (null: off)
     std::unique_ptr<ExpertStore> store;
     uint8_t* zc_stage_buf = nullptr;   // device: k staging slots for the store's experts of a decode token
@@ -3182,6 +3190,7 @@ struct Model::Impl {
             }
         calibrate_paths();
         init_store();      // (last: the store's arena is registered with the driver - page-locked memory the other pinned allocations must come before)
+        init_tier();       // (opens the --expert-tier devices and decides reuse or refill: a reuse reads the tier from here on, §8.5)
         preload_store();
         // On by default for a Windows HIP build on an APU (Strix Halo: measured +7.5% decode, no change in the prompt); DS4_NO_VIEW=1 forces it
         // on anywhere, DS4_NO_VIEW=0 turns it off
@@ -3198,6 +3207,7 @@ struct Model::Impl {
             views = false;
             std::fprintf(stderr, "ds4: no view of the model's files after the load: unbuffered reads at the drive's rate\n");
         }
+        tier_fill();   // (§9: the refill path places every tier-held expert once, behind the preload: a reuse returned already readable and this returns at once)
         if (o.verbose) std::fprintf(stderr, "ds4: loaded in %.1f s\n%s", (now_ms() - t0) / 1000.0, describe().c_str());
         if (chunk > 0) (void) pick_flow_min();   // (the startup line)
         reset();
@@ -5591,6 +5601,137 @@ struct Model::Impl {
             std::fprintf(stderr, "ds4: RAM store: %zu more experts (%.1f GB) read in the background in %.1f s\n", got,
                          (double) got * (double) L[0].blob / 1e9, (now_ms() - tb) / 1000.0);
         });
+    }
+    // the expert tier (--expert-tier, ds4_tier.hpp): the disk devices holding what the store's guard and the configured
+    // VRAM share do not cover (docs/EXPERT_TIER_DSV41_PLAN.md §5.1's bands), decided once from the profile and reused
+    // across starts (§7.4).  Runs only with the flag given, after init_store: its slot size, its geometry and its
+    // guard (the store's configured slots) are the store's.
+    void init_tier() {
+        if (o.expert_tiers.empty() || !pk.gguf) return;
+#if defined(STRATA_METAL)
+        std::fprintf(stderr, "ds4: --expert-tier: there is no PCIe tier on a Mac (docs/EXPERT_TIER_DSV41_PLAN.md §12): the unified-memory path keeps the experts in the PC's RAM\n");
+        std::exit(2);
+#endif
+        if (o.ssd_cache_gb <= 0.0 && !std::getenv("DS4_STORE_GB")) {   // (§5.2: the tier plans against the store's guaranteed minimum: at auto there is none yet (open item 1), and --ssd-cache 0 leaves no slots to serve a tier through)
+            std::fprintf(stderr, "ds4: --expert-tier: the RAM store is at %s: the tier needs a store size it can plan against, so give --ssd-cache GB "
+                                 "(docs/EXPERT_TIER_DSV41_PLAN.md §5.2: at auto its minimum is not decided yet, open item 1; off has no slots at all)\n",
+                         o.ssd_cache_gb == 0.0 ? "off" : "auto");
+            std::exit(2);
+        }
+        if (!store) {   // (the store was asked for but did not start: the tier's bytes would be written and never read)
+            std::fprintf(stderr, "ds4: --expert-tier: the RAM store is not running, so the tier has nothing to serve: skipped\n");
+            return;
+        }
+        std::vector<TierSpec> specs;
+        for (const std::string& s : o.expert_tiers) {
+            TierSpec t;
+            std::string w;
+            if (!parse_tier_spec(s, t, w)) { std::fprintf(stderr, "ds4: --expert-tier %s: %s\n", s.c_str(), w.c_str()); std::exit(2); }
+            specs.push_back(t);
+        }
+        // §7.1: the pack's identity.  Setup verified the shards and could keep a SHA-256 per file, but the GGUF carries
+        // none, so this engine takes §7.1's fallback: the sorted (name, size, mtime) list, hashed once - no shard re-read.
+        // The shards are looked at where the loader opened them (model_dir/name), and one that cannot be read stops the start.
+        // The effective expert geometry (the loader's layout): every routed expert's file, offset and bytes, and each piece's size, per
+        // layer. It is part of the identity, so bytes that moved inside the same files refill the tier (ds4_tier.hpp, §7.1).
+        std::string geometry;
+        for (const Layer& l : L) {
+            if (l.n_exp <= 0) continue;
+            geometry += std::to_string(l.il) + ' ' + std::to_string(l.n_exp) + ' ' + std::to_string((unsigned long long) l.blob) + '\n';
+            for (int e = 0; e < l.n_exp; ++e)
+                geometry += std::to_string(l.region_file[(size_t) e]) + ' ' + std::to_string((unsigned long long) l.region_off[(size_t) e]) + ' ' +
+                            std::to_string((unsigned long long) l.region_bytes[(size_t) e]) + '\n';
+            for (int r = 0; r < 3; ++r)
+                for (int q = 0; q < 3; ++q) geometry += std::to_string((unsigned long long) l.piece_bytes[r][q]) + ' ';
+            geometry += '\n';
+        }
+        const std::string geometry_id = strata::core::tier_sha256_hex((const uint8_t*) geometry.data(), geometry.size());
+        std::string pack_id, err;
+        if (!ds4_pack_identity(pk.model_dir, pk.files, geometry_id, pack_id, err)) {
+            std::fprintf(stderr, "ds4: expert tier: the model's identity cannot be worked out (%s): the tier is not used blind\n", err.c_str());
+            std::exit(2);
+        }
+        // §6.2: no tier device may be - or hold - a file this engine reads the model from: the shards, the pack's own files
+        // (ds4.txt, tensors.txt, engram.bin, ...) and the expert profile
+        std::vector<std::string> protect;
+        for (const std::string& f : pk.files) protect.push_back(pk.model_dir + "/" + f);
+        for (const std::string& f : strata::core::tier_pack_files(pk.dir)) protect.push_back(f);
+        if (!o.profile.empty() && o.profile != "none") protect.push_back(o.profile);
+        auto tt = std::make_unique<ExpertTierSet>();
+        if (!tt->open(specs, err, protect)) { std::fprintf(stderr, "ds4: expert tier: %s\n", err.c_str()); std::exit(2); }
+        tier = std::move(tt);
+        // §5.2's guards: the VRAM share counts only when --vram-experts was given (auto promises nothing: the tier
+        // then covers the VRAM's ranks too, which only duplicates bytes); the store's guard is the slots it has committed.
+        uint64_t vram_guard = 0;
+        if (!o.vram_experts_auto)
+            for (const Layer& l : L)
+                if (l.il < g.nl) vram_guard += (uint64_t) std::min(l.n_vram, l.n_exp);
+        // the store's guard is the slots it has COMMITTED, not its nominal size: a chunk the RAM floor refused is not a slot the tier may count on
+        const uint64_t store_guard = (uint64_t) store->committed_slots();
+        // §5.1: the planner's list - every trunk expert in the profile's order (hottest first, never-routed last in
+        // index order) minus the first vram_guard + store_guard ranks.  Its length depends only on the shape and the
+        // guards, so a placement made from any profile is reused whatever the next start's profile says (§7.2: a
+        // placement from an older profile is slower, not wrong); a refill uses the current profile's order.
+        std::vector<std::pair<double, std::pair<int, int>>> cand;
+        for (const Layer& l : L) {
+            if (l.il >= g.nl) continue;
+            const uint32_t* p = prof.data() + (size_t) l.il * g.n_exp;
+            for (int e = 0; e < l.n_exp; ++e)
+                cand.push_back({(double) p[e] / (double) std::max<uint64_t>(1, l.blob), {l.il, e}});
+        }
+        std::stable_sort(cand.begin(), cand.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+        std::vector<std::pair<int32_t, int32_t>> ranked;
+        const size_t skip = std::min(cand.size(), (size_t) (vram_guard + store_guard));
+        for (size_t i = skip; i < cand.size(); ++i) ranked.push_back({cand[i].second.first, cand[i].second.second});
+        bool reused = false;
+        std::string why;
+        std::vector<std::string> notes;
+        const std::string profile_sha = strata::core::tier_sha256_file(o.profile);   // (§7.2: information only)
+        if (!tier->decide(store->slot_bytes(), vram_guard, store_guard, (uint64_t) g.nl, (uint64_t) g.n_exp, pack_id, profile_sha,
+                          o.expert_tier_refill, ranked, reused, why, notes)) {
+            std::fprintf(stderr, "ds4: expert tier: %s\n", why.c_str());
+            std::exit(2);   // (the tier was asked for and cannot be honoured: a silent file fallback would hide it)
+        }
+        for (const std::string& n : notes) std::fprintf(stderr, "ds4: %s\n", n.c_str());
+        if (reused)
+            std::fprintf(stderr, "ds4: expert tier: %zu devices, %lld experts reused from the placement: nothing copied at start\n",
+                         tier->device_count(), (long long) tier->experts_held());
+        else
+            std::fprintf(stderr, "ds4: expert tier: %zu devices, %lld experts planned (%.1f GB of slots): %s\n",
+                         tier->device_count(), (long long) tier->experts_held(),
+                         (double) tier->experts_held() * (double) tier->slot_bytes() / 1e9,
+                         why.empty() ? "the first fill" : why.c_str());
+        // §8.1: the store checks itself first, then these hooks; find() answers only once the tier is readable (a
+        // reuse from here, a fill after tier_fill below).  A copy that fails (§8.4) marks its device: its experts fall
+        // back to the files, and the next start writes the tier again (§9).
+        store->set_tier([this](int layer, int e, int& dev, uint64_t& slot) { return tier->find(layer, e, dev, slot); },
+                        [this](int dev, uint64_t slot) { return tier->slot_base(dev, slot); },
+                        [this](int dev) { return tier->queue(dev); },
+                        [this](int dev) { tier->note_refill(dev); },
+                        [this]() { if (tier) tier->drain(); });   // (the store's destructor: every queued tier copy lands before the arena is released)
+    }
+    // §9: the fill reads every tier-held expert once from the model's files onto its device: rank order, on the
+    // device's own queue, so the devices fill at once and each link keeps its own workers busy (§8.6).  Bytes are
+    // the store's read jobs landing in a tier slot (E2: the tier's slot layout is the store's).
+    void tier_fill() {
+        if (!tier || tier->readable()) return;   // (no tier, or a placement reused: nothing to place)
+        const double t0 = now_ms();
+        ExpertTierSet::Fill f{};
+        std::string err;
+        const bool ok = tier->fill(
+            [this](int layer, int e, uint8_t* slot_base, int dev, std::atomic<int>& left, std::atomic<bool>& bad, uint64_t& bytes) {
+                return store->tier_fill_read(layer, e, slot_base, dev, left, bad, bytes);
+            },
+            f, err);
+        tier_fill_s = (now_ms() - t0) / 1000.0;
+        if (!ok) {   // (a failed copy marks every device: its headers go to fill_state 1, so the next start writes again; until then the reads use the files - the same bytes)
+            std::fprintf(stderr, "ds4: expert tier: the fill failed (%s): the tier will be written again at the next start; the reads use the files\n", err.c_str());
+            return;
+        }
+        std::fprintf(stderr, "ds4: expert tier: %lld experts read from the files onto the devices (%.1f GB) in %.1f s\n",
+                     (long long) f.placed, (double) f.bytes / 1e9, tier_fill_s);
+        for (size_t i = 0; i < f.per_dev.size() && i < tier->device_count(); ++i)
+            std::fprintf(stderr, "ds4: expert tier %s: %lld experts placed\n", tier->spec_at(i).path.c_str(), (long long) f.per_dev[i]);
     }
     // at a window boundary: the store's ready slots become the device's (zero-copy) experts, taken back when it needs the room;
     // each touched layer's whole table is written again (VRAM slots, the store's, 0), in stream order before the next window
@@ -10790,6 +10931,13 @@ const Stats& Model::stats() const {
         st.store_zc_visible = (int64_t) x.visible_count();
         st.store_slots = (int64_t) x.slots_allocated();
         st.store_slots_max = (int64_t) x.slots_max();
+        st.tier_hits = x.stats().tier_hits.load();
+        st.tier_bytes = x.stats().tier_bytes.load();   // (§8.2: the tier's copies, kept out of store_bytes: the file-read figure stays meaningful)
+    }
+    if (p_->tier) {   // (the tier's own counters: what it holds, and what its fill cost at load, §9)
+        st.tier_experts = p_->tier->experts_held();
+        st.tier_devices = (int64_t) p_->tier->device_count();
+        st.tier_fill_s = p_->tier_fill_s;
     }
     return st;
 }

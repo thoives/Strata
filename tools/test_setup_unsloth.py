@@ -444,6 +444,51 @@ class Main(Base):
         self.assertNotIn("layer_split", cfg)
         self.assertIn("--resident-budget-gib", cfg["args"])
 
+    def test_no_expert_tier_by_default(self):
+        """§9.5 (docs/EXPERT_TIER_PLAN.md): no tier by default; the args keep the golden shape; the option is mentioned
+        where part of the experts would read from the SSD."""
+        code, out, cfg = self.main(["--context", "8192"])
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("--expert-tier", cfg["args"])
+        self.assertIn("Option: an expert tier", out)
+
+    def test_expert_tier_flags_kept_in_order(self):
+        """§5.1/§12.7: one --expert-tier per device, in the order the user gave them; setup checked the sizes first."""
+        d1, d2 = self.t / "tier1.bin", self.t / "tier2.bin"
+        for f, mib in ((d1, 40960), (d2, 81920)):
+            with open(f, "wb") as fh:
+                fh.truncate(mib * 1024 * 1024)              # sparse: the size check sees mib, the disk does not
+        code, out, cfg = self.main(["--context", "8192", "--expert-tier", f"{d2},mib=81920,verify=full",
+                                    "--expert-tier", f"{d1},mib=40960"], version="0.1.55")
+        self.assertEqual(code, 0, out)
+        args = cfg["args"]
+        pos = [i for i, x in enumerate(args) if x == "--expert-tier"]
+        self.assertEqual(len(pos), 2)
+        self.assertEqual([args[i + 1] for i in pos], [f"{d2},mib=81920,verify=full", f"{d1},mib=40960"])   # repeated, in order, value next to flag
+        self.assertEqual(cfg.get("user_args"), ["--expert-tier", f"{d2},mib=81920,verify=full", "--expert-tier", f"{d1},mib=40960"])
+        self.assertIn("written once and read from there after the fill", out)   # §9.2's coverage report
+
+    def test_tier_flag_for_an_old_engine_is_kept_with_a_warning(self):
+        """The flag reaches the config through the user-args channel (explicit_args); an engine without --expert-tier
+        (before 0.1.55) gets a warning, not a silent drop (the user's choice is theirs)."""
+        d1 = self.t / "tier1.bin"
+        with open(d1, "wb") as fh:
+            fh.truncate(4 * 1024 * 1024)
+        code, out, cfg = self.main(["--context", "8192", "--expert-tier", f"{d1},mib=4"])   # version 0.1.32 default
+        self.assertEqual(code, 0, out)
+        self.assertIn("--expert-tier", cfg["args"])                     # the user's flag is kept
+        self.assertIn("does not know --expert-tier yet", out)
+        self.assertEqual(cfg["args"][cfg["args"].index("--expert-tier") + 1], f"{d1},mib=4")
+
+    def test_a_device_smaller_than_mib_is_a_refusal(self):
+        """§9.4: a device smaller than mib is refused with the reason; nothing is configured."""
+        d1 = self.t / "tier1.bin"
+        d1.write_bytes(b"x" * 1024)                           # 1 KiB
+        code, out, cfg = self.main(["--context", "8192", "--expert-tier", f"{d1},mib=64"], version="0.1.55")
+        self.assertNotEqual(code, 0, out)
+        self.assertIn("smaller than mib=64 MiB", out)
+        self.assertIsNone(cfg)
+
 
 X = "UD-IQ4_XS"
 

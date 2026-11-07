@@ -682,12 +682,18 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # library is the honest shape of the dependency graph: core knows about devices and weights, kernels know
   # about arithmetic, and this one knows the ORDER the arithmetic happens in.
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
+    src/core/expert_tier.cpp src/core/expert_tier_plan.cpp
     src/core/remote_expert_opt.cu
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp src/core/dflash2.cpp
     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
     src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
+  # the expert tier registers its mapping with the GPU runtime (cudaHostRegister; hipHostRegister through hip_compat) only in
+  # this library, the CUDA and HIP engine: the build says so, a cuda_runtime.h that happens to be installed does not (SYCL,
+  # Metal, strata-dsv41 and the host-only tier tests compile src/core/expert_tier.cpp without any CUDA runtime call)
+  # (PRIVATE, on the target: a source-file property would reach every target of this directory that compiles the file)
+  target_compile_definitions(strata_engine PRIVATE STRATA_TIER_CUDA_REGISTER=1)
   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906)
     add_executable(host_graph_launch_test tests/core/host_graph_launch_test.cu)
     target_include_directories(host_graph_launch_test PRIVATE include)
@@ -710,6 +716,41 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_include_directories(memory_guard_test PRIVATE include)
     add_test(NAME memory_guard_test COMMAND memory_guard_test)
     set_tests_properties(memory_guard_test PROPERTIES TIMEOUT 60)
+  endif()
+
+  # The expert tier (docs/EXPERT_TIER_PLAN.md §12.1-§12.4): the placement planner, the on-disk header/table codec, the
+  # device on /tmp and the copy workers. The tier files talk to no device code except behind a CUDA include guard, so
+  # these build and run on any PC: no GPU, no CUDA, no engine link.
+  if(STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/expert_tier_plan_test.cpp")
+    enable_testing()
+    add_executable(expert_tier_spec_test tests/core/expert_tier_spec_test.cpp)
+    target_include_directories(expert_tier_spec_test PRIVATE include)
+    add_test(NAME expert_tier_spec_test COMMAND expert_tier_spec_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/core/expert_tier_spec_cases.txt)
+    set_tests_properties(expert_tier_spec_test PROPERTIES TIMEOUT 30)
+    add_executable(expert_tier_plan_test tests/core/expert_tier_plan_test.cpp src/core/expert_tier_plan.cpp)
+    target_include_directories(expert_tier_plan_test PRIVATE include)
+    add_test(NAME expert_tier_plan_test COMMAND expert_tier_plan_test)
+    set_tests_properties(expert_tier_plan_test PROPERTIES TIMEOUT 30)
+    add_executable(expert_tier_layout_test tests/core/expert_tier_layout_test.cpp src/core/expert_tier.cpp src/core/expert_tier_plan.cpp)
+    target_include_directories(expert_tier_layout_test PRIVATE include)
+    target_link_libraries(expert_tier_layout_test PRIVATE Threads::Threads)
+    add_test(NAME expert_tier_layout_test COMMAND expert_tier_layout_test)
+    set_tests_properties(expert_tier_layout_test PROPERTIES TIMEOUT 30)
+    add_executable(expert_tier_test tests/core/expert_tier_test.cpp src/core/expert_tier.cpp src/core/expert_tier_plan.cpp)
+    target_include_directories(expert_tier_test PRIVATE include)
+    target_link_libraries(expert_tier_test PRIVATE Threads::Threads)
+    add_test(NAME expert_tier_test COMMAND expert_tier_test)
+    set_tests_properties(expert_tier_test PROPERTIES TIMEOUT 120)
+    add_executable(expert_tier_copy_test tests/core/expert_tier_copy_test.cpp src/core/expert_tier.cpp src/core/expert_tier_plan.cpp)
+    target_include_directories(expert_tier_copy_test PRIVATE include)
+    target_link_libraries(expert_tier_copy_test PRIVATE Threads::Threads)
+    add_test(NAME expert_tier_copy_test COMMAND expert_tier_copy_test)
+    set_tests_properties(expert_tier_copy_test PROPERTIES TIMEOUT 120)
+    add_executable(expert_tier_lock_test tests/core/expert_tier_lock_test.cpp src/core/expert_tier.cpp src/core/expert_tier_plan.cpp)
+    target_include_directories(expert_tier_lock_test PRIVATE include)
+    target_link_libraries(expert_tier_lock_test PRIVATE Threads::Threads)
+    add_test(NAME expert_tier_lock_test COMMAND expert_tier_lock_test)
+    set_tests_properties(expert_tier_lock_test PROPERTIES TIMEOUT 120)
   endif()
 
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/file_expert_source_test.cpp")
@@ -917,7 +958,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(strata_dsv41_kernels PUBLIC ${_strata_gpu_runtime_target})
     add_executable(strata-dsv41 src/dsv41/ds4_main.cpp src/dsv41/ds4_model.cu src/dsv41/ds4_kernels.cu src/dsv41/ds4_vision.cu
                    src/dsv41/ds4_gguf.cu src/dsv41/ds4_gguf_cpu.cpp src/dsv41/ds4_iq.cu src/dsv41/ds4_iq_cpu.cpp
-                   src/dsv41/ds4_tq.cu src/dsv41/ds4_tq_cpu.cpp src/dsv41/ds4_gg_cpu.cpp src/dsv41/ds4_packinfo.cpp)
+                   src/dsv41/ds4_tq.cu src/dsv41/ds4_tq_cpu.cpp src/dsv41/ds4_gg_cpu.cpp src/dsv41/ds4_packinfo.cpp
+                   # the expert tier's shared pieces (docs/EXPERT_TIER_DSV41_PLAN.md E1): the planner and the header/table codec,
+                   # host files the tier (ds4_tier.hpp) calls: same sources the Qwen engine's strata_engine carries
+                   src/core/expert_tier.cpp src/core/expert_tier_plan.cpp)
     # the commit the binary was built from, readable with --version (set -DSTRATA_BUILD_ID=... for a tree without .git)
     if(NOT STRATA_BUILD_ID AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/BUILD_ID)   # (a git archive has no .git: the packer writes the commit here)
       file(STRINGS ${CMAKE_CURRENT_SOURCE_DIR}/BUILD_ID STRATA_BUILD_ID LIMIT_COUNT 1)
@@ -1005,6 +1049,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       add_executable(ds4_pick_rule_test tests/dsv41/pick_rule_test.cpp)
       target_include_directories(ds4_pick_rule_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41)
       target_compile_features(ds4_pick_rule_test PRIVATE cxx_std_17)
+      # the DeepSeek engine's expert tier (docs/EXPERT_TIER_DSV41_PLAN.md §14): the tier's header/tables on a file, the fill
+      # bytes identical to the file's, a start reusing the placement: no GPU, no model, no CUDA runtime
+      add_executable(ds4_expert_tier_test tests/dsv41/expert_tier_dsv41_test.cpp src/core/expert_tier.cpp src/core/expert_tier_plan.cpp)
+      target_include_directories(ds4_expert_tier_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41 ${CMAKE_CURRENT_SOURCE_DIR}/include)
+      target_compile_features(ds4_expert_tier_test PRIVATE cxx_std_17)
+      target_link_libraries(ds4_expert_tier_test PRIVATE Threads::Threads)
+      add_test(NAME ds4_expert_tier_test COMMAND ds4_expert_tier_test)
+      set_tests_properties(ds4_expert_tier_test PROPERTIES TIMEOUT 120)
     endif()
     if(STRATA_ENABLE_HIP)
       foreach(_t strata_dsv41_kernels strata-dsv41)

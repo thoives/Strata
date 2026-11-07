@@ -119,6 +119,14 @@ def add_parsers(sp: argparse._SubParsersAction) -> list[argparse.ArgumentParser]
                         "The same as --set dspark=<word>")
     g.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
                    help="an advanced engine setting or STRATA_* variable, e.g. prefill=65536 (repeat); unknown names get a warning, not a refusal")
+    g.add_argument("--expert-tier", action="append", default=[], metavar="PATH,mib=N[,reserve=M][,verify=header|full]",
+                   help="the expert tier on a disk device you give: one flag per device, repeatable, in order. The engine "
+                        "keeps the experts your card and RAM do not hold there once, and reads them over that device from "
+                        "then on; any change to the device or the model's identity writes it again (see docs/EXPERT_TIER.md). "
+                        "The first start WRITES OVER the device, up to mib")
+    g.add_argument("--expert-tier-overwrite", action="store_true",
+                   help="a --expert-tier device that holds data that is not an expert tier may be written over (its data is lost). "
+                        "Without it Strata asks in a terminal and stops elsewhere; --yes alone does not say this")
     g.add_argument("--pool-cores", metavar="LIST",
                    help="experimental: pin the CPU workers to exactly these logical processors, e.g. 2,4,6,8 or 2-14:2 (the numbers Task Manager or "
                         "lscpu show). The default is one worker per physical core, which the engine's start line names; "
@@ -283,6 +291,15 @@ def settings_from_args(a: argparse.Namespace, catalog=None) -> tuple[S.LaunchSet
         s.no_key = False
     if a.set:
         s.extra = {**s.extra, **S.settings_from_pairs(a.set)}
+    if getattr(a, "expert_tier", None):
+        # one entry per device, in the order given (§5.1), each in the engines' one grammar and written back canonical, so the
+        # config holds exactly what both engines and setup accept (strata_control/expert_tier.py)
+        from strata_control import expert_tier
+        specs, bad = expert_tier.parse_all(a.expert_tier)
+        if bad:
+            notices.append(S.Notice("error", bad[0] + ".", f"Each --expert-tier is {expert_tier.GRAMMAR}, one flag per device."))
+        else:
+            s.expert_tiers = [expert_tier.canonical(expert_tier.absolute(t)) for t in specs]   # absolute: setup and the engine get this same path
     if a.dspark:
         s.extra = {**s.extra, "--dspark": a.dspark}
         if a.dspark == "on" and sys.platform == "darwin":
@@ -516,6 +533,20 @@ def _can_ask() -> bool:
     if os.environ.get("CI") or os.environ.get("STRATA_NO_PROMPT"):
         return False
     return bool(os.environ.get("MSYSTEM") or os.environ.get("TERM_PROGRAM") or os.environ.get("TERM") or os.environ.get("WT_SESSION"))
+
+
+def _ask_overwrite(title: str, text: str) -> bool:
+    """Ask before data on an expert tier device is written over. Unlike _ask_yes, only a typed "yes" is a yes, and with no
+    keyboard the answer is no: losing data is never the default."""
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return False
+    _say("")
+    _say(f"[!] {text}")
+    try:
+        answer = input("Type yes to overwrite it, anything else to stop: ").strip().lower()
+    except EOFError:
+        return False
+    return answer == "yes"
 
 
 def _ask_yes(title: str, text: str) -> bool:
@@ -775,13 +806,16 @@ def run_launch(a: argparse.Namespace) -> int:
             if catalog is None:
                 return fail("This Terminal does not carry the model list, so the screens cannot open. Install it again with the one-line installer.", 5)
             from strata_cli.launch import app
-            return _tui(app.run_tui, None, catalog=catalog, feed=a.feed, open_page=bool(a.open), restart=bool(getattr(a, "restart", False)))
+            return _tui(app.run_tui, None, catalog=catalog, feed=a.feed, open_page=bool(a.open), restart=bool(getattr(a, "restart", False)),
+                        tier_overwrite=bool(getattr(a, "expert_tier_overwrite", False)))
         if catalog is None:
             return fail("This Terminal does not carry the model list. Install it again with the one-line installer.", 5)
         if getattr(a, "retune", False) and s.tune == "skip":
             s.tune = "quick"
         runner = Runner(s, catalog=catalog, emit=_printer(machine), feed=a.feed, assume_yes=bool(a.yes or machine), confirm=_ask_yes,
-                        retune=bool(getattr(a, "retune", False)), restart=bool(getattr(a, "restart", False)))
+                        retune=bool(getattr(a, "retune", False)), restart=bool(getattr(a, "restart", False)),
+                        tier_overwrite=bool(getattr(a, "expert_tier_overwrite", False)),
+                        confirm_overwrite=None if (machine or a.no_tui) else _ask_overwrite)
         try:
             runner.check_own_files()                         # the person's own files: a wrong path is said now, and the files name the model
         except LaunchError as e:
@@ -800,7 +834,8 @@ def run_launch(a: argparse.Namespace) -> int:
         runner.s, runner.move_data = s, move_data
         if a.plan:
             plan = runner.plan()
-            plan["warnings"] = [n.line() for n in notes]
+            # the plan's own warnings (Runner.plan: the tier devices, the access, the preflight) and the flags' notes, kept together
+            plan["warnings"] = list(dict.fromkeys([*plan.get("warnings", []), *[n.line() for n in notes]]))
             if machine:
                 print(json.dumps({"schema_version": 1, "ok": True, "plan": plan}))
             else:
@@ -820,8 +855,8 @@ def run_launch(a: argparse.Namespace) -> int:
                 _placement_lines(plan.get("placement"))
                 _say(f"  tuning    {s.tune}    access {S.ACCESS_WORDS[s.access]}, port {s.port}"
                      + ("    API key on" if s.api_key else ""))
-                for n in notes:
-                    _say(f"  [!] {n.line()}")
+                for w in plan["warnings"]:
+                    _say(f"  [!] {w}")
                 line = roles_line(s, catalog)
                 if line:
                     _say(f"  cards     {line}")

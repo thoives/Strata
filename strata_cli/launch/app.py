@@ -45,6 +45,7 @@ class Ctx:
     move_data: bool = False
     retune: bool = False
     restart: bool = False
+    tier_overwrite: bool = False           # --expert-tier-overwrite: a tier device holding other data may be written over (said, not asked)
     pending_save: str | None = None          # the preset name "Save as a preset and launch" saves once nothing blocks the launch
     notes: list[str] = field(default_factory=list)
     start_own_files: bool = False
@@ -286,7 +287,8 @@ class LaunchApp(App):
         self.cancel = threading.Event()
         self.runner = Runner(s, catalog=self.ctx.catalog, emit=self._emit, cancel=self.cancel, feed=self.ctx.feed, confirm=self._ask_from_run,
                              move_data=self.ctx.move_data, retune=self.ctx.retune, restart=self.ctx.restart,
-                             confirm_restart=self._ask_restart, after_check=self._save_pending)
+                             confirm_restart=self._ask_restart, after_check=self._save_pending,
+                             tier_overwrite=self.ctx.tier_overwrite, confirm_overwrite=self._ask_overwrite)
         gb = getattr(self.runner, "download_gb", lambda: 0.0)() if not confirmed else 0.0
         if gb >= 1.0:
             free = self.ctx.catalog.disk_free(s.data_dir or self.ctx.catalog.data_dir())
@@ -317,6 +319,10 @@ class LaunchApp(App):
                 store.save(self.ctx.settings, name)
             except store.PresetError:
                 pass
+
+    def _ask_overwrite(self, title: str, text: str) -> bool:
+        """An expert tier device holds data that is not a tier: asked before it is written over. Stop is the default (no answer, no write)."""
+        return self._ask_from_run(title, text, [("go", "Overwrite"), ("no", "Stop")], default=False)
 
     def _ask_restart(self, title: str, text: str) -> bool:
         """Another model is serving other choices: ask once, in the same pop-up, whether to restart it. Cancel leaves it running."""
@@ -441,7 +447,7 @@ def run_monitor(info: dict, *, keep_default: bool = True, color: str = "auto") -
 
 def run_tui(settings: S.LaunchSettings | None, *, catalog: Catalog | None = None, feed: str | None = None, auto_run: bool = False,
             save: bool = False, open_page: bool = False, move_data: bool = False, retune: bool = False,
-            restart: bool = False) -> int:
+            restart: bool = False, tier_overwrite: bool = False) -> int:
     """Open the launch screens. `settings` given and `auto_run`: skip the questions and go straight to the run."""
     catalog = catalog or Catalog()
     print("Looking at this computer…", flush=True)
@@ -456,7 +462,8 @@ def run_tui(settings: S.LaunchSettings | None, *, catalog: Catalog | None = None
             s.name = f"{s.model or 'model'} {S.context_label(s.context)}"
         if save:
             store.save(s, s.name)
-    ctx = Ctx(catalog=catalog, computer=computer, rows=rows, settings=s, glyphs=Glyphs(), feed=feed, move_data=move_data, retune=retune, restart=restart)
+    ctx = Ctx(catalog=catalog, computer=computer, rows=rows, settings=s, glyphs=Glyphs(), feed=feed, move_data=move_data, retune=retune, restart=restart,
+              tier_overwrite=tier_overwrite)
     app = LaunchApp(ctx, auto_run=auto_run)
     result = app.run()
     if getattr(app, "return_code", 0) not in (0, None) or getattr(app, "_exception", None) is not None:

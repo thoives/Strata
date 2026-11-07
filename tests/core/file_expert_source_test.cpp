@@ -1,4 +1,5 @@
 #include "strata/core/expert_source.hpp"
+#include "strata/core/expert_tier.hpp"
 #include "strata/core/foresight_swap.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
@@ -1036,6 +1037,74 @@ void test_replace_resident(bool pin) {
     std::cout << "replace_resident: pinned=" << pin << " exact_bytes=PASS\n";
 }
 
+// §7.4 (docs/EXPERT_TIER_PLAN.md §12.5, docs/DETAILS.md §Reading the tiers): the tier's three counters beside the file
+// ones. Every backend that builds this file runs it: the tier's only device call is the portable §5.3 registration, which
+// a GPU-less box may refuse and the tier tolerates (src/core/expert_tier.cpp). Nothing here is a speed claim - the tier's
+// seconds are checked to move, not compared to any rate.
+void test_expert_tier_counters() {
+    using namespace strata::core;
+    using namespace strata::kernels::cpu;
+    constexpr int64_t layers = 2;
+    constexpr int64_t experts = 3;
+    const uint64_t layer_bytes = (uint64_t) experts * BLOB;
+    const uint64_t total = (uint64_t) layers * layer_bytes;
+    TempDirectory dir;
+
+    std::string err;
+    require(expert_layout_load(dir.path.string(), layers, experts, err), "could not load canonical layout: " + err);
+    create_pack(dir.path, total, {{0, 'a'}, {(uint64_t) BLOB, 'b'}, {2 * (uint64_t) BLOB, 'e'},
+                                  {layer_bytes, 'c'}, {layer_bytes + (uint64_t) BLOB, 'd'}});
+    FileExpertSource source;
+    require(source.open(dir.path.string(), layers, experts, err), "could not map the synthetic pack: " + err);
+
+    // one device with room for three blobs (3 x 1.32 MiB) plus the header areas and the tables, sparse until filled
+    const uint64_t mib = 16;
+    const fs::path device = dir.path / "tier.bin";
+    {
+        std::ofstream out(device, std::ios::binary);
+        out.seekp((std::streamoff) (mib << 20) - 1);
+        out.put('\0');
+    }
+    TierIdentity id;
+    id.pack_id = "st:tier-counters";
+    id.profile_id = "profile:none";
+    id.n_layers = layers;
+    id.n_expert = experts;
+    id.layer_blob_bytes.assign((size_t) layers, (uint64_t) BLOB);
+    ExpertTierSet set;
+    bool reused = false;
+    require(set.open({TierSpec{device.string(), mib, 0, false}}, id, err, reused), err);
+    require(set.fill(source, {{0, 0}, {0, 1}, {1, 2}}, id, err), err);   // the fill reads the file tier (§8.4)
+    require(set.experts_held() == 3, "the tier did not place the three ranked experts");
+
+    // with no tier open on the source, the trio stays 0 however those reads went
+    require(source.tier_reads() == 0 && source.tier_read_bytes() == 0 && source.tier_ms() == 0.0,
+            "the tier counters moved with no tier open");
+
+    source.set_tier(&set);
+    const int64_t reads_before = source.tier_reads();
+    const uint64_t bytes_before = source.tier_read_bytes();
+    const double ms_before = source.tier_ms();
+    const int64_t file_reads_before = source.file_reads();
+
+    // the two ways the tier answers, as the decode uses them: a pointer lookup and a copy of the blob
+    const uint8_t* held = source.blob(0, 0);
+    require(held != nullptr && held[0] == 'a', "a tier-held expert is not served from the tier");
+    std::vector<uint8_t> copy((size_t) BLOB);
+    require(source.copy_blob(0, 0, copy.data()) && copy[0] == 'a', "a tier-held copy differs from the tier's bytes");
+    require(source.tier_reads() - reads_before == 2, "the pointer lookup and the copy are both tier reads");
+    require(source.tier_read_bytes() - bytes_before == 2 * (uint64_t) BLOB, "the tier's byte count is not both reads");
+    require(source.tier_ms() - ms_before > 0.0, "the tier's copy was not timed (the printed seconds are the copies)");
+    require(source.file_reads() == file_reads_before, "a tier-held expert was read from the file tier");
+
+    // an expert the tier does not hold keeps the file path, and moves no tier counter
+    require(source.blob(0, 2) != nullptr && source.blob(0, 2)[0] == 'e', "an expert outside the tier lost the file path");
+    require(source.tier_reads() == reads_before + 2 && source.tier_read_bytes() == bytes_before + 2 * (uint64_t) BLOB,
+            "a file read changed the tier's counters");
+    set.close();
+    source.close();
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1053,6 +1122,7 @@ int main(int argc, char** argv) {
         test_canonical_layout();
         test_unbuffered_reads();
         test_io_prefetch();
+        test_expert_tier_counters();
 #if defined(STRATA_NATIVE_EXPERTS)
         test_native_variable_layout();
 #endif

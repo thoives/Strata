@@ -1,7 +1,9 @@
 # Expert tier for the DeepSeek-V4.1 engine (strata-dsv41): plan
 
-Status: plan, not implemented. No hardware for the full model is connected, so no speed number exists. Every number
-marked **target** is a goal to test, not a result. This plan is the DeepSeek companion of
+Status: phases D1-D6 are in the tree and host-tested (no GPU, no model: `ds4_expert_tier_test` plus the shared tier
+tests pass; the fit and setup tests cover the flags). Phase D7 (byte-identical answers on the real model) and D8
+(speed) wait for hardware with the model — still no speed number here. Every number marked **target** is a goal to
+test, not a result. This plan is the DeepSeek companion of
 [EXPERT_TIER_PLAN.md](EXPERT_TIER_PLAN.md). Read that plan first. This document covers only what differs for
 `src/dsv41`, and says where the two plans share code.
 

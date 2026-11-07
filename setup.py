@@ -70,6 +70,7 @@ from strata_control import atomic
 from strata_control import draft_layer
 from strata_control import dsv41_context
 from strata_control import engine_component
+from strata_control import expert_tier
 from strata_control.discovery import in_trash
 from strata_control import user_args
 
@@ -5987,6 +5988,7 @@ DATA_ITEMS = ("models", "packs", "mtp")
 
 LOW_RAM_HEADROOM_GB = 10   # RAM beside the experts: the OS, the engine's other buffers, the server
 RESIDENT_ENGINE = (0, 1, 30)   # the first engine with --resident-experts (the low-RAM mode's resident variant)
+TIER_ENGINE = (0, 1, 55)       # the first engine with --expert-tier (docs/EXPERT_TIER_PLAN.md): setup writes the flag only for it
 RESIDENT_SPLIT_ENGINE = (0, 1, 40)   # #642: the first engine that runs it on a layer split
 
 
@@ -6025,15 +6027,230 @@ def low_ram_gpu_share(model, vram_gb, ctx=32768, kv="int8", mtp=True) -> float:
 def low_ram_resident(model, ram, vram_gb, ctx=32768, kv="int8", mtp=True) -> bool:
     """In the low-RAM mode: the experts the GPU does not hold fit the RAM with the usual room beside them, so they are
     copied into RAM once (the resident variant, `--resident-experts`) instead of being read through the OS file cache
-    (plain `--mmap-experts`, which a PC this short of RAM keeps re-reading from the SSD)."""
+    (plain `--mmap-experts`, which a PC this short of RAM keeps re-reading from the SSD).  An expert tier never counts here:
+    `--resident-experts` copies EVERY expert the GPU does not hold into RAM, whatever a tier holds, so a tier cannot make that
+    copy fit (docs/EXPERT_TIER_PLAN.md §9.1)."""
     rest = MODELS[model]["arena_gb"] - low_ram_gpu_gb(model, vram_gb, ctx, kv, mtp)
     return ram >= rest + LOW_RAM_HEADROOM_GB
 
 
-def low_ram_fits(model, ram, vram_gb, mtp=True) -> bool:
-    """In the low-RAM mode: the experts the GPU does not hold fit the RAM left beside the rest (as file cache)."""
+def low_ram_fits(model, ram, vram_gb, mtp=True, tier_gb=0.0) -> bool:
+    """In the low-RAM mode: the experts the GPU does not hold fit the RAM left beside the rest (as file cache).
+    `tier_gb` (§9.1): a tier of that size carries it for the RAM; 0 (the default) answers exactly as before."""
     arena = MODELS[model]["arena_gb"]
+    if tier_gb:
+        arena -= tier_gb
     return ram - 6 + max(0.0, vram_gb - 5 - (MTP_VRAM_GB if mtp else 0.0)) >= arena
+
+
+def low_ram_tier_needed(model, ram, vram_gb, ctx=32768, kv="int8", mtp=True) -> float:
+    """§9.2: how many GB of experts an expert tier has to carry for the file tier to hold only the remainder:
+    the arena less what the GPU's cache holds less the RAM copy budget.  Setup recommends, never adds: the user
+    chooses the devices."""
+    arena = MODELS[model]["arena_gb"]
+    gpu = low_ram_gpu_gb(model, vram_gb, ctx, kv, mtp)
+    ram_copy_budget = max(0.0, ram - 6)   # the same 6 GB of headroom low_ram_fits keeps beside the RAM
+    return max(0.0, arena - gpu - ram_copy_budget)
+
+
+def parse_expert_tier(text):
+    """§5.1: `PATH,mib=N[,reserve=M][,verify=header|full]` -> (path, mib, reserve_mib, verify_full), or None and the
+    reason.  The one grammar both engines take (strata_control/expert_tier.py, include/strata/core/expert_tier_spec.hpp):
+    the entries one accepts, all of them accept; setup writes the canonical form (expert_tier.canonical)."""
+    return expert_tier.parse(text)
+
+
+# §6.4's tier header.  The Qwen engine's (magic STRPTIER, layout version 2): 160 bytes, fill_state at byte 152, header_crc at 156
+# over the 156 bytes before it - fill_state included, so a header cannot say "complete" without its crc agreeing (version 1 left
+# fill_state out; such a tier refills once).  The DeepSeek engine's (magic STRPTDS4, src/dsv41/ds4_tier.hpp): 176 bytes, fill_state
+# at byte 88, header_crc at 172 over the first 172.  Both carry the layout version at byte 8.
+TIER_HEADER_BYTES = 160
+TIER_FILL_OFFSET = 152
+TIER_CRC_RANGE = 156
+TIER_CRC_OFFSET = 156
+TIER_HEADERS = {b"STRPTIER": {"bytes": 160, "fill": 152, "crc_range": 156, "crc_at": 156, "version": 2},
+                b"STRPTDS4": {"bytes": 176, "fill": 88, "crc_range": 172, "crc_at": 172, "version": 1}}
+
+
+def expert_tier_device_size(path):
+    """The capacity in bytes of a tier device and what it is: ("file"|"block", bytes), or (None, reason) - the same answer both
+    engines get (include/strata/core/expert_tier_dev.hpp; strata_control/expert_tier.device_size)."""
+    return expert_tier.device_size(path)
+
+
+def expert_tier_device_check(path, mib, pack_dir=None, profile_path=None):
+    """§9.4: can this device be a tier, and does its current header look reusable? A device that cannot be opened, is not a
+    regular file or a Linux block device, or holds less than mib MiB is a refusal with the reason. An existing header is read and
+    reported so the user sees whether the next start will refill. Setup checks what the engine checks about the DEVICE and its
+    header (size, magic, version, checksum, fill_state, and the Qwen header's profile); the model's identity (its files' sizes and
+    times) is judged by the engine at start, which alone computes it the way it stored it. Returns (ok, why, header_note).
+    `pack_dir` is accepted for older callers and not used."""
+    kind, size = expert_tier_device_size(path)
+    if kind is None:
+        return False, f"{path}: {size}", ""
+    if size < mib * 1024 * 1024:
+        return False, (f"{path}: the device is {size / 1073741824:.2f} GiB, smaller than mib={mib} MiB - setup does not "
+                       "silently use less"), ""
+    if kind == "block" and not os.access(str(Path(path).expanduser()), os.W_OK):
+        return False, f"{path}: the block device is not writable by this user (the tier is written to it once)", ""
+    note = ""
+    try:
+        with open(path, "rb") as fh:
+            a = fh.read(176)
+    except OSError:
+        return False, f"{path}: cannot be read", ""
+    layout = TIER_HEADERS.get(bytes(a[:8]))
+    if layout is not None and len(a) >= layout["bytes"]:
+        try:
+            import struct
+            ver = struct.unpack_from("<I", a, 8)[0]
+            fill = struct.unpack_from("<I", a, layout["fill"])[0]
+            crc_ok = (_tier_crc32c(a[:layout["crc_range"]], 0xFFFFFFFF) ^ 0xFFFFFFFF) == struct.unpack_from("<I", a, layout["crc_at"])[0]
+            profile_field = a[52:84]
+        except Exception:
+            return True, "", ""
+        why = ""
+        if ver != layout["version"]:
+            why = f"its header is layout version {ver}; this engine writes {layout['version']} -> refill"
+        elif not crc_ok:
+            why = "its header's checksum does not match -> refill"
+        elif fill != 2:
+            why = f"its header says fill_state {fill} (a fill that did not finish, or never started) -> refill"
+        else:
+            if profile_path is not None and bytes(a[:8]) == b"STRPTIER":   # (the DeepSeek header keeps the profile as information only)
+                cur = expert_tier_profile_id(profile_path)
+                if cur and _tier_id_to_field(cur) != profile_field:
+                    why = "its header is for another expert profile -> refill"
+            if not why:
+                why = "the header is complete; the engine reuses it if the model and the settings are the ones it was filled for"
+        note = f"{path}: {why}"
+    elif any(a):
+        note = f"{path}: no tier header yet -> fill on the first start"
+    return True, "", note
+
+
+_TIER_CONFIRMED: set[str] = set()   # the devices whose data the person confirmed (a yes, or --expert-tier-overwrite); only these are ever cleared
+
+
+def check_expert_tiers(entries, a, protect=(), source="--expert-tier"):
+    """§5.1/§5.4: the tier devices as given -> [(canonical entry, TierSpec)], in order, or setup stops with the reason before
+    anything is downloaded.  Each entry is parsed with the engines' grammar and written back canonical; the devices are checked
+    the way the engines check them (one device given twice under two names, a model file, a block device the system uses, a
+    size under mib); a line says that the first start writes over them; and a device holding data that is not an expert tier is
+    written only after the person says yes - a question in a terminal, else --expert-tier-overwrite (--yes alone is not a yes
+    to losing data).  Saying yes clears the first mib MiB the tier may write (expert_tier.claim), so the engine finds it blank."""
+    specs, bad = expert_tier.parse_all(entries)
+    if bad:
+        fail(bad[0], f"each --expert-tier is {expert_tier.GRAMMAR}, one flag per device")
+    if not specs:
+        return []
+    specs = [expert_tier.absolute(t) for t in specs]    # absolute from this working directory: setup and the engine get the same file
+    probs = expert_tier.problems(specs, protect)
+    if probs:
+        fail(f"{source}: " + probs[0], "give another file or device, or leave --expert-tier out")
+    for s in specs:
+        _ok, _why, note = expert_tier_device_check(s.path, s.mib)
+        if note:
+            ok(f"expert tier {note}")
+    warn(expert_tier.overwrite_warning(specs))
+    held = expert_tier.foreign(specs)
+    if held:
+        text = expert_tier.foreign_message(held)
+        if getattr(a, "expert_tier_overwrite", False):
+            ok(f"expert tier: {text}; --expert-tier-overwrite was given, so it is cleared when the settings are written")
+        elif not CONTROL and not getattr(a, "yes", False) and sys.stdin.isatty():
+            if ask(f"  {text}. Overwrite it? (type yes to overwrite)", ["yes", "no"], "no", False).lower() != "yes":
+                fail("stopped: nothing was written to the expert tier device", "give an empty file or device, or answer yes")
+        else:
+            fail(f"expert tier: {text}. Nothing was written",
+                 "if that data may go, add --expert-tier-overwrite (setup asks in a terminal); otherwise give an empty file or device")
+        _TIER_CONFIRMED.update(held)                    # nothing is written here: check_config_expert_tiers clears them, once the model's files are known
+    return [(expert_tier.canonical(s), s) for s in specs]
+
+
+def check_config_expert_tiers(cfg: dict) -> None:
+    """§5.4, with the model's files known: the final args' --expert-tier devices may not be one of the files those args name
+    (the pack, the GGUF and its shards, the profile) nor lie in the model's folder. Then, and only then, a device that holds data
+    the person confirmed is cleared (expert_tier.claim): the first `mib` MiB, under the device's lock. Nothing to do without a tier."""
+    for key in ("args", "user_args"):                  # the tier paths the config carries are absolute (the engine's working directory is not ours)
+        if isinstance(cfg.get(key), list) and any(str(x) == "--expert-tier" for x in cfg[key]):
+            cfg[key] = expert_tier.absolute_args(cfg[key])
+    args = [str(x) for x in cfg.get("args") or []]
+    entries = [args[i + 1] for i, x in enumerate(args[:-1]) if x == "--expert-tier"]
+    if not entries:
+        return
+    specs, bad = expert_tier.parse_all(entries)
+    if bad:
+        fail(bad[0], f"each --expert-tier is {expert_tier.GRAMMAR}; fix it in the run config's user_args")
+    probs = expert_tier.problems(specs, expert_tier.model_paths_from_args(args), devices=False)
+    if probs:
+        fail("--expert-tier: " + probs[0], "give a file or device outside the model's folder")
+    held = expert_tier.foreign(specs)
+    unconfirmed = [p for p in held if p not in _TIER_CONFIRMED]
+    if unconfirmed:
+        fail(f"expert tier: {expert_tier.foreign_message(unconfirmed)}. Nothing was written",
+             "if that data may go, add --expert-tier-overwrite (setup asks in a terminal); otherwise give an empty file or device")
+    by_path = {s.path: s for s in specs}
+    for path in held:
+        try:
+            expert_tier.claim(path, by_path[path].mib)
+        except OSError as e:
+            fail(f"expert tier: {path} could not be cleared ({e})", "check that this user may write to it, and that no other process uses it")
+
+
+def config_expert_tiers(cfg_path, source=None, explicit=None) -> list[str]:
+    """The --expert-tier entries a run config will carry once written (write_setup_config): this run's own (`explicit`), else the
+    ones the earlier config keeps for the person (user_args, hand edits) - the same carry_user_args the write uses, on copies."""
+    import copy
+    old = None
+    old_path = cfg_path if Path(cfg_path).is_file() else source
+    if old_path is not None and Path(old_path).is_file():
+        try:
+            old = json.loads(Path(old_path).read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            old = None
+    probe = {"args": []}
+    carry_user_args(copy.deepcopy(old) if isinstance(old, dict) else {}, probe, list(explicit or []))
+    args = [str(x) for x in probe.get("args") or []]
+    return [args[i + 1] for i, x in enumerate(args[:-1]) if x == "--expert-tier"]
+
+
+def expert_tier_profile_id(profile_path):
+    """§6.2's profile identity: "sha:" plus the SHA-256 of the profile file's bytes - what the engine hashes."""
+    try:
+        import hashlib
+        return "sha:" + hashlib.sha256(Path(profile_path).expanduser().read_bytes()).hexdigest()
+    except OSError:
+        return ""
+
+
+def _tier_crc32c(data, value):
+    """CRC32C (Castagnoli, reflected 0x82F63B78): the same checksum the engine's header carries (§6.4). Table built once."""
+    global _TIER_CRC_TABLE
+    try:
+        table = _TIER_CRC_TABLE
+    except NameError:
+        table = _TIER_CRC_TABLE = []
+        for i in range(256):
+            r = i
+            for _ in range(8):
+                r = (r >> 1) ^ 0x82F63B78 if r & 1 else r >> 1
+            table.append(r)
+    r = value
+    for b in data:
+        r = table[(r ^ b) & 0xFF] ^ (r >> 8)
+    return r
+
+
+def _tier_id_to_field(identity):
+    """Mimic strata::core::id_to_field() (§6.2): a "sha:" identity is stored as the 4 ASCII bytes "sha:" plus the SHA-256
+    digest's first 28 raw bytes (identity compares on those bytes; 28 bytes of a digest cannot collide). Anything else
+    (the size+mtime fallback, profile:none) is the short string, truncated to 31 bytes and NUL-padded to 32. Compare these
+    raw bytes against the header field; decoding a raw sha: field as text would be garbage."""
+    if identity.startswith("sha:") and len(identity) >= 68:
+        return b"sha:" + bytes.fromhex(identity[4:60])
+    raw = identity.encode("utf-8", "replace")
+    return raw[:31].ljust(32, b"\0")
 
 
 def low_ram_wanted(model, ram, choice="auto") -> bool:
@@ -6568,9 +6785,13 @@ _SETUP_FLAGS = None
 
 
 def explicit_args(a) -> list[str]:
-    """The engine options this run's command line sets that the person keeps from now on (user_args): --vram-reserve-mib."""
+    """The engine options this run's command line sets that the person keeps from now on (user_args): --vram-reserve-mib,
+    --expert-tier (repeatable, in order: the devices the person gave, §5.1)."""
     n = getattr(a, "vram_reserve_mib", None)
-    return ["--vram-reserve-mib", str(n)] if n is not None else []
+    out = ["--vram-reserve-mib", str(n)] if n is not None else []
+    for raw, _t in getattr(a, "_expert_tiers", None) or []:
+        out += ["--expert-tier", raw]
+    return out
 
 
 def carry_user_args(old: dict, cfg: dict, explicit: list[str] | None = None) -> list[str]:
@@ -6592,8 +6813,10 @@ def carry_user_args(old: dict, cfg: dict, explicit: list[str] | None = None) -> 
         vis = isinstance(old.get("vision"), dict)
         if reserve is not None and reserve.isdigit() and not (vis and int(reserve) == VISION["gpu"]["reserve_mib"])                 and "ui_resource_baseline" not in old and "--vram-reserve-mib" not in mine:
             mine += ["--vram-reserve-mib", reserve]
-    for g in user_args.groups(explicit or []):
-        mine = user_args.merge(mine, g)
+    if explicit:
+        # one merge, not one per group: merge drops every group of a flag the person sets, so the loop would leave only
+        # the last of a repeated flag (--expert-tier, one per device: kept whole and in order, §5.1)
+        mine = user_args.merge(mine, user_args.flat(user_args.groups(explicit)))
     if not mine:
         user_args.stamp(cfg, [])
         return []
@@ -6662,6 +6885,7 @@ def write_setup_config(cfg_path: Path, cfg: dict, source: Path | None = None, ex
     kept = carry_over(old, cfg, explicit) if old is not None else []
     if old is None:
         carry_user_args({}, cfg, explicit)              # a first install: only what this run's command line sets (nothing to report as kept)
+    check_config_expert_tiers(cfg)
     user_args.stamp(cfg)                               # args_written: what setup wrote, for the next hand-edit check
     if "images" in cfg and cfg["images"] is None:      # --images no (or not downloaded): no image section
         cfg.pop("images")
@@ -8559,8 +8783,36 @@ def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, 
                for f in [*shards, *shared]) / 1e9
     probe = folder if folder.exists() else (folder.parent if folder.parent.exists() else Path(a.models_dir))
     free = free_gb(probe)
+    # docs/EXPERT_TIER_DSV41_PLAN.md §11: the expert tier devices the user named (--expert-tier, one flag per device, in order) are
+    # one more term of the fit: the plan adds its lines and, when the devices do not cover the experts the cards and RAM leave
+    # over, a warning.  `getattr`: setup.main() parses the flags into a._expert_tiers; a caller without that (a test, an older
+    # Namespace) gets the plain fit, byte-identical to before.  Setup never adds a device of its own.
+    # The tiers are the ones the written config will carry, not only this run's flags: a setup run again without --expert-tier
+    # keeps the devices an earlier run gave (user_args), and the engine then still needs the store size below.  The same
+    # carry_user_args the write uses decides it (config_expert_tiers), and a carried entry is checked like a new one.
+    own = [raw for raw, _t in getattr(a, "_expert_tiers", None) or []]
+    cfg_path0 = home() / f"strata-{tag.lower()}.json"
+    carried = [] if own else config_expert_tiers(cfg_path0, adopted if adopted is not None and adopted.name == cfg_path0.name else None)
+    if carried:
+        ok("expert tier: kept from the earlier settings: " + ", ".join(carried))
+        effective = check_expert_tiers(carried, a, source="the expert tier in the earlier settings")
+    else:
+        effective = getattr(a, "_expert_tiers", None) or []
+    tiers = [{"path": p, "mib": mib, "reserve_mib": res} for _raw, (p, mib, res, _v) in effective]
+    store_gb = None
+    if tiers:
+        # The engine plans the tier against the RAM store's guaranteed slots and stops at the store's auto size ("give --ssd-cache GB"),
+        # so a start with a tier needs an explicit size.  Setup chooses it from the fit (strata_control.dsv41_fit.tier_store_gb) and writes
+        # it below; where there is none it refuses now, before the 130-500 GB download, saying what to do.  A setup without a tier
+        # never gets here: its arguments are exactly what they were.
+        base_plan = dsv41_fit.plan([{**c, "vram_gb": float(c.get("vram_gb") or 0)} for c in cards], ram, None, ctx, model=model, named=True)
+        store_gb, why_not = dsv41_fit.tier_store_gb(base_plan)
+        if store_gb is None:
+            fail("the expert tier cannot be used here: " + why_not,
+                 "run setup again without --expert-tier, or fix what is named above")
     plan = dsv41_fit.plan([{**c, "vram_gb": float(c.get("vram_gb") or 0)} for c in cards], ram, free if left else None, ctx, model=model,
-                         named=True)               # `cards` are decided above (dsv41_auto_cards / the person's): the plan describes them
+                         named=True, expert_tiers=tiers or None,      # `cards` are decided above (dsv41_auto_cards / the person's): the plan describes them
+                         ssd_cache_gb=store_gb)
     say()
     for line in plan["lines"]:
         say("  " + line)
@@ -8742,7 +8994,7 @@ def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, 
     # without it on the M5 Max), and the engine's "auto" would load it on a 128 GB Mac: its 7 GB of experts take memory the trunk's experts need.
     args = ["--pack", str(pack), "--max-context", str(ctx), "--eos", "1", "--vision", ds_vision, "--dspark", "none" if mac else "auto",
             *(["--dspark-conf", "0.65"] if md.get("recipe") == "ista" and not mac else []), *dsv41_prefill_chunk_args(cards, ram),
-            *plan["args"]]
+            *plan["args"], *(["--ssd-cache", str(store_gb)] if store_gb is not None else [])]   # (the tier's store size, §5.2; none without a tier)
     env = dsv41_config_env(cards)
     cfg = {"exe": str(exe), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            "model_name": fam["name"], "arch": fam["arch"], "log": str(home() / f"strata-{tag.lower()}.log"),
@@ -9144,6 +9396,14 @@ def main() -> int:
                          "or the release's (as `strata update --feed`; a folder is a local test feed)")
     ap.add_argument("--gguf-dir", help="use GGUF files you already have (a folder with every shard: "
                                        "<name>-00001-of-0000N.gguf ... -0000N-of-0000N.gguf)")
+    ap.add_argument("--expert-tier", action="append", metavar="PATH,mib=N[,reserve=M][,verify=header|full]",
+                    help="the expert tier (docs/EXPERT_TIER_PLAN.md §5.1): one flag per device you give, repeatable, "
+                         "in order. The experts your GPU and RAM do not hold are written there once and read from "
+                         "there after that. Setup checks each device (its size must cover mib) and reports whether its "
+                         "header will be reused or refilled; setup recommends the fit, it never adds devices by itself (§9.2)")
+    ap.add_argument("--expert-tier-overwrite", action="store_true",
+                    help="a --expert-tier device that holds data that is not an expert tier may be written over: its data is "
+                         "lost. Without it setup asks in a terminal, and stops elsewhere (--yes alone does not say this)")
     ap.add_argument("--yes", action="store_true", help="accept the recommended answers")
     ap.add_argument("--setup", action="store_true", help="install another model or change settings")
     ap.add_argument("--no-start", action="store_true", help="install only, do not start the model")
@@ -9229,6 +9489,11 @@ def main() -> int:
         ap.error("--vision-tokens takes a number of image tokens, 1 or more, e.g. --vision-tokens 768")
     if a.vram_reserve_mib is not None and a.vram_reserve_mib < 0:
         ap.error("--vram-reserve-mib takes a number of MiB, 0 or more, e.g. --vram-reserve-mib 2048")
+    # §5.1 (docs/EXPERT_TIER_PLAN.md): the tier devices as the user gave them: one --expert-tier per device, repeatable,
+    # in order; each entry independent. §9.4: a device that cannot be opened, or is smaller than mib, is a refusal with
+    # the reason; an existing header is read and reported (reusable or not). §9.2: setup recommends, never adds.
+    a._expert_tiers = check_expert_tiers(a.expert_tier or [], a, protect=[a.gguf_dir] if a.gguf_dir else [])
+    tier_gb = expert_tier.capacity_gb([t for _raw, t in a._expert_tiers])   # capacity after every reserve, GB (§9.1)
     if a.gpu is not None:                             # --gpu 0,2 means --gpus 0,2 (a user tried it: issue report)
         if "," in a.gpu:
             a.gpus, a.gpu = a.gpus or a.gpu, None
@@ -9555,7 +9820,7 @@ def main() -> int:
                            f"slow here: {resident_budget_gib(m, ram)} GiB of its "
                            f"{int(d['arena_gb'] / 1.073741824)} GiB of experts in RAM, the rest read from the SSD "
                            "(setup asks first)" if ram >= UNSLOTH_MIN_RAM_GB else "does not fit")
-            elif low_ram_needed(m, ram) and low_ram_fits(m, ram, low_ram_vram(gpu)) and a.low_ram != "off":
+            elif low_ram_needed(m, ram) and low_ram_fits(m, ram, low_ram_vram(gpu), tier_gb=tier_gb) and a.low_ram != "off":
                 verdict = (f"fits in the low-RAM mode (the GPU holds ~{100 * low_ram_gpu_share(m, low_ram_vram(gpu)):.0f}% "
                            "of its experts, " + ("the rest stays in RAM)" if low_ram_resident(m, ram, low_ram_vram(gpu))
                                                  else "the rest is read from the SSD as needed)"))
@@ -9656,7 +9921,7 @@ def main() -> int:
             say(f"  {i}) {m}{size_tag(family, m, installed)} {d['about']}; download {d['download_gb']:.0f} GB, keeps {keeps} of its "
                 f"{d['arena_gb']:.0f} GB of experts in RAM{fit}")
             continue
-        if low_ram_needed(m, ram) and low_ram_fits(m, ram, low_ram_vram(gpu)) and a.low_ram != "off":
+        if low_ram_needed(m, ram) and low_ram_fits(m, ram, low_ram_vram(gpu), tier_gb=tier_gb) and a.low_ram != "off":
             fit = (f"   <- fits in the low-RAM mode (the GPU holds ~{100 * low_ram_gpu_share(m, low_ram_vram(gpu)):.0f}%, "
                    + ("the rest in RAM)" if low_ram_resident(m, ram, low_ram_vram(gpu)) else "the rest from the SSD)"))
         say(f"  {i}) {m:8s}{size_tag(family, m, installed)} {d['about']}; download {d['download_gb']:.0f} GB, uses ~{d['arena_gb']:.0f} GB of RAM{fit}")
@@ -9700,6 +9965,12 @@ def main() -> int:
             q4_split = bool(multi) and not resident_split()   # #498: on several GPUs without the RAM budget (#642: kept)
             if not q4_split:
                 ok(f"RAM budget: {budget:g} GiB of {model}'s experts in RAM, the rest read from the model files on the SSD")
+                if a._expert_tiers:
+                    ok(f"expert tier: the devices you give hold ~{tier_gb:.0f} GB, written once and read from there "
+                       "after the fill")   # §9.2: capacity arithmetic; the fill is a one-time write
+                elif budget < int(MODELS[model]["arena_gb"] / 1.073741824):
+                    say("  Option: an expert tier (--expert-tier PATH,mib=N[,reserve=M], one flag per device) carries "
+                        "part of that SSD load once; setup never adds devices by itself")
         else:
             ok(f"all {MODELS[model]['arena_gb']:.0f} GB of {model}'s experts in RAM (they and "
                f"{UNSLOTH_RESIDENT_BESIDE_GB} GiB more fit this PC's {ram:.0f} GB; --resident-budget-gib N keeps only "
@@ -9834,7 +10105,7 @@ def main() -> int:
             share, rest = held / arena, arena - held
             # #642: the resident variant on a split, by the same rule as on one card - what no card holds fits the RAM
             resident = resident_split() and (a.low_ram == "resident" or
-                                             (a.low_ram != "mmap" and ram >= rest + LOW_RAM_HEADROOM_GB))
+                                             (a.low_ram != "mmap" and ram >= rest + LOW_RAM_HEADROOM_GB))   # (a tier never counts: the copy is every expert no card holds)
             if resident:
                 ok(f"low-RAM mode on {len(chosen)} GPUs: they hold ~{100 * share:.0f}% of {model}'s experts "
                    f"({arena:.0f} GB) and the other ~{rest:.0f} GB stay in RAM ({ram:.0f} GB), read once from a copy "
@@ -9855,6 +10126,21 @@ def main() -> int:
             if share < 0.6:
                 warn("most of the experts are read from the SSD while it answers: expect it to be much slower than "
                      "with enough RAM (a faster SSD and a smaller size help)")
+        # §9.2 (docs/EXPERT_TIER_PLAN.md): report what the given tier devices carry of the rest; §9.5: when the model
+        # does not fit without a tier and none was given, mention it as an option only. Setup never adds devices.
+        _still_ssd = max(0.0, rest - tier_gb - max(0.0, ram - 6))   # what the file tier carries after the tier and RAM
+        if a._expert_tiers:
+            _held = min(tier_gb, rest)
+            if _still_ssd <= 0:
+                ok(f"expert tier: the devices you give hold ~{_held:.0f} GB of the ~{rest:.0f} GB the GPU does not hold; "
+                   "RAM keeps the rest, so after the fill nothing is read from the SSD while it answers")
+            else:
+                ok(f"expert tier: the devices you give hold ~{_held:.0f} of the ~{rest:.0f} GB the GPU does not hold; "
+                   f"about {_still_ssd:.0f} GB are still read from the SSD")
+        elif rest > max(0.0, ram - 6):
+            say("  Option: an expert tier (--expert-tier PATH,mib=N[,reserve=M], one flag per device) holds those "
+                "experts once on a device you give and reads them from there after the fill; setup never adds devices "
+                "by itself")
     # EXPERIMENTAL: the experimental-speed-projection control vector (data/experimental-speed-projection), off unless
     # chosen here; with it loaded, the web app and the API switch it off per request
     esp = None
@@ -10117,6 +10403,9 @@ def main() -> int:
         args += ["--resident-budget-gib", str(rb)]
         ok(f"low-RAM mode: {rb} GiB of {model}'s experts kept in RAM (the most used), the rest read from the pack's "
            "experts.bin on the SSD as needed")
+        if not a._expert_tiers and rb < resident_budget_gib(model, 10_000.0):   # §9.5: mention, where part of the experts read from the SSD
+            say("  Option: an expert tier (--expert-tier PATH,mib=N[,reserve=M], one flag per device) carries part of "
+                "that SSD load once; setup never adds devices by itself")
     elif low_ram:   # the experts from the pack's experts.bin: the ones the GPU does not hold copied into RAM, or mapped
         args += ["--resident-experts" if resident else "--mmap-experts"]
     elif is_gb10(gpu):
@@ -10139,6 +10428,10 @@ def main() -> int:
         # decode on English prompts here (16 samples a cell, 90% interval [1.018, 1.049])
         say("  Tip: for English or code only, --draft-vocab en measured +3.1% decode on this part (the default keeps Chinese, Japanese "
             "and Korean drafts).")
+    if a._expert_tiers and engine_ver < TIER_ENGINE:   # the flag itself reaches the config through the user-args channel (explicit_args:
+        # repeatable, in order); setup only warns when this install's engine predates --expert-tier (§9.4: says, never drops)
+        warn(f"expert tier: the flag is kept in the config's args, but this install's engine {meta.get('version')} does "
+             "not know --expert-tier yet (the first engine with it is 0.1.55): update the engine before the next start")
     disk = None if is_wsl() else rotational_disk(ple)  # #605 (WSL's virtual disk says rotational)
     if disk:
         tensor = None if ready else next((t for t in GGUFFile(ple).tensors if t.name == "per_layer_token_embd.weight"), None)

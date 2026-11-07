@@ -234,6 +234,9 @@ DSV41_FLAGS = {
     "--dspark-block": ("N", "The most words DSpark guesses in one round."),
     "--expert-profile": ("FILE|none", "A table of which experts are used most, to decide what is kept in memory first."),
     "--ssd-cache": ("GB", "How much RAM keeps the most used experts so they are not read from the SSD again (sizes itself when absent)."),
+    "--expert-tier": ("PATH,mib=N[,reserve=M][,verify=header|full]",
+                     "The experts your card and RAM do not keep are written there once and read from that device after the fill "
+                     "(docs/EXPERT_TIER_DSV41_PLAN.md)."),
     "--ssd-policy": ("lru|lfu|lfulru", "Which experts the RAM store drops first."),
     "--prefill-chunk": ("N", "How many prompt words are read at once (the fast prompt path)."),
     "--threads": ("on|off", "Read long prompts layer by layer on all CPU threads."),

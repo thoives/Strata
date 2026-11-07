@@ -1383,9 +1383,14 @@ class StrataEngine:
             self.last.update(offloaded=int(f[15]))
         for tok in f[16:]:                                # key=value fields after the positional ones (the prompt's
             key, eq, value = tok.partition("=")           # first chunk and its streamed expert blobs)
-            if eq and key in ("chunk", "experts_streamed"):
+            if eq and key in ("chunk", "experts_streamed", "tier_reads"):
                 try:
                     self.last[key] = int(value)
+                except ValueError:
+                    pass
+            elif eq and key in ("tier_mb", "tier_ms"):    # the expert tier's share of this request (a tier prints them)
+                try:
+                    self.last[key] = float(value)
                 except ValueError:
                     pass
 
@@ -5914,6 +5919,9 @@ class Service:
                                 if n and (last.get("generated") or 0) >= 2 and last.get("decode_ms") else None,
                                 "hit_rate": hit_rate, "pcie_share": pcie_share, "ram_blobs": last.get("ram_blobs"),
                                 "file_blobs": last.get("file_blobs"), "file_mb": last.get("file_mb"),
+                                # the expert tier's share of this request (None: no tier, or an engine that does not say)
+                                "tier_reads": last.get("tier_reads"), "tier_mb": last.get("tier_mb"),
+                                "tier_ms": last.get("tier_ms"),
                                 # #457: the speculative drafts from the DONE line (None: the engine did not say)
                                 "drafts_offered": last.get("drafts_offered"),
                                 "drafts_accepted": last.get("drafts_accepted")})
@@ -6103,7 +6111,8 @@ def request_stats(segments: list[dict]) -> dict:
         else:
             result.pop(key, None)
     for key in ("prompt_ms", "decode_ms", "generated", "drafts_offered", "drafts_accepted",
-                "hits", "lookups", "offloaded", "ram_blobs", "file_blobs", "file_mb", "experts_streamed"):
+                "hits", "lookups", "offloaded", "ram_blobs", "file_blobs", "file_mb", "experts_streamed",
+                "tier_reads", "tier_mb", "tier_ms"):
         if any(segment.get(key) is not None for segment in segments):
             result[key] = sum(segment.get(key) or 0 for segment in segments)
     return result

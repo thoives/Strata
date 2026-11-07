@@ -155,7 +155,8 @@ Include enough information for someone else to repeat your run:
   profiles, or draft vocabularies, with hashes or reproducible preparation steps.
 - **Settings:** launch command and relevant run configuration, context limit, KV
   type and streaming window, expert cache, low-RAM mode, prefill size, CPU workers,
-  MTP, reasoning effort, sampling, and vision. State whether calibration or
+  MTP, reasoning effort, sampling, and vision. Name `--expert-tier` with its device
+  path, `mib` and `reserve` when it is on. State whether calibration or
   experimental speed projection was enabled; attach the resulting settings.
 - **Workload:** benchmark command or script, shareable prompts or instructions to
   build them, actual prompt and generated token counts, output cap, repetitions,
@@ -204,6 +205,14 @@ report as failures, outside the successful throughput summary.
 When comparing versions or settings, run both on the same machine and workload
 and list every changed setting. Preserve the per-run results: output text and
 draft acceptance can change speed even when the input is identical.
+
+A run with `--expert-tier` is not comparable with the same configuration without
+one. The engine's `expert tiers` line counts RAM blobs and file blobs, and an expert
+read answered by the tier counts in neither (docs/EXPERT_TIER.md). So a read rate,
+or a reading cost, derived from those counters' deltas between requests measures a
+different path once a tier answers some reads, and the tier's own seconds cover only
+its copies. Compare a tier run with another tier run on the same device, and say so
+in the report.
 
 ## Optional correctness checks
 

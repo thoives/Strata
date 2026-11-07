@@ -289,12 +289,67 @@ is left, the drive class and the PCIe link. It prints `chunk 8192 -> 3840, ring 
 and on Windows. `STRATA_PREFILL_HOST_PLAN=0` turns it off; `STRATA_SSD_GBPS` overrides the drive speed;
 `--prefill N` and `STRATA_PREFILL_RING` always win.
 
+### Expert tier (`--expert-tier`, opt-in, off by default)
+
+An expert tier is one file you choose on a disk device of your own (an NVMe, a RAM disk, a second drive): `--expert-tier
+PATH,mib=N[,reserve=M][,verify=header|full]`, one flag per device, repeatable, in the order given. The experts the GPU
+and the RAM copy do not hold are written into the tier once at start (a `strata generate: expert tier: filled ... in ... s`
+line), and every read after that takes the order RAM copy, tier, files. With no `--expert-tier` nothing here is touched:
+the read paths stay byte-identical.
+
+- **Placement.** The tier's contents are fixed for the run. The experts are taken in the profile's rank order (hottest
+  first; unranked experts follow in layer order), and with several devices they are dealt round-robin, hottest first,
+  each device charged the blob's real size; when a device is full the deal skips it, and when every device is full the
+  rest stays on the file tier. The device order is part of the identity: another order means another placement.
+- **Which devices are refused.** Each entry follows one set of rules, shared by both engines, setup and `strata launch`
+  (`include/strata/core/expert_tier_spec.hpp`, `strata_control/expert_tier.py`, cases in `tests/core/expert_tier_spec_cases.txt`).
+  Devices are compared by what they are, not by their path. The start stops, before writing anything, when two entries are one
+  device (a symlink, a hard link, another name, or a partition and its disk), or when a device is a model file, a file in
+  the pack's folder, or the block device that holds them. It also stops for a Linux block device the system is using: it is
+  opened with `O_EXCL`, so the kernel refuses one that is mounted, used as swap or part of a RAID or LVM volume. Last, it stops
+  for a device whose first `mib` MiB are not all zeros and that has no expert tier header (either engine's). Setup and `strata launch`
+  ask before clearing those `mib` MiB (only a typed `yes` counts), or take `--expert-tier-overwrite` where nobody can answer.
+- **The device's own bytes.** A 64 KiB header area at the start (twin headers A and B, each with its CRC32C over every field
+  before it, `fill_state` included, so a torn header falls back to the other), then the placement table and the chunk table
+  (both checksummed), then the blobs at
+  4 KiB-aligned offsets. `reserve=M` keeps that much free on the device: nothing is written there, and a blob's 4 KiB alignment is
+  counted before it is judged to fit. The device is a regular file, or on Linux a block device (a partition, a logical volume, a loop
+  device; its capacity is read with `ioctl BLKGETSIZE64`, since `stat` reports 0 for it). Windows and macOS take a regular file only.
+- **Reuse or refill.** The header names the model pack (a SHA-256 over every file of the pack: its path, size and modification
+  time, so a change to any one file counts; a GGUF read in place from outside the pack counts too) and the expert profile (its SHA-256),
+  plus the layout version (2: version 1 headers left `fill_state` out of the checksum and refill once) and the device count and
+  order. A fill writes `fill_state = 2` only after every device's data and chunk table are flushed and each flush has succeeded.
+  A failed flush leaves `fill_state = 1`, so the next start refills. Same identity, a completed fill (`fill_state = 2`): the tier is
+  reused, nothing is copied. Anything else - another pack or profile, a torn or unreadable header, a changed layout - refills
+  the tier at that start and writes the headers again. A `verify=full` start checks every 4 MiB chunk's checksum: a bad chunk
+  falls back to the file tier for its blobs, says so in the log, and marks the device so the next start refills it.
+- **Reading it.** A tier-held expert is never staged, warmed or claimed for RAM (the tier answers instead); `pin_cache_complement`
+  never picks a tier-held blob. The tier's counters (`tier_reads`, `tier_read_bytes`, `tier_ms`) print beside the file ones:
+  an appended segment on the `expert tiers` line of `--stats`, on the server's `strata serve: expert tiers:` line, and on
+  `DONE` as `tier_reads=` `tier_mb=` `tier_ms=` (`GET /metrics` lists the three per request). Nothing is printed for them
+  with no tier, so a tier-free line is as before. The seconds measure the time spent copying from the tier; a tier lookup
+  that hands back a pointer adds a read and the blob's bytes and no seconds, as the plain-mmap file path does today.
+  A tier-served read counts in neither the RAM nor the file counters, so those two no longer account for every routed
+  lookup. The startup log says one line per device (open, size, registered or not) and the band counts:
+  `strata generate: experts: ... in the GPU cache, ... in RAM, ... in N tier device(s), ... on the file tier`.
+- **Backends.** The CUDA and HIP engine (`strata_engine`, built with `STRATA_TIER_CUDA_REGISTER`) registers the mapped tier
+  for DMA copies. The SYCL and Metal builds, `strata-dsv41` and the host-only tests compile the same file without any CUDA
+  runtime call, even where a CUDA toolkit is installed, and register nothing (the per-device note says which). Windows maps the device with the same semantics. A tier
+  read is a host copy like any other until it is measured on hardware: no speed number is claimed here (the measurement
+  gate is P0-hw in docs/EXPERT_TIER_PLAN.md).
+
 ### Reading the tiers
 
 With `--stats` the engine prints the tiers of the decode (`expert tiers`: blobs from the RAM copy, blobs and MB from the
-files, read time; `routing prefetch`: how many file reads had been warmed). The server log has the same per request, and
-`GET /metrics` lists `ram_blobs`, `file_blobs`, `file_mb`, `drafts_offered` and `drafts_accepted` per recent request, with
-`totals` since the start. `hit_rate` is the VRAM share of the experts looked up; experts the GPU reads over PCIe
+files, read time; `routing prefetch`: how many file reads had been warmed). With a tier the same line ends with its segment:
+the tier's blob reads, its MB, and the MB and ms per round spent copying from it. The server log has the same per request,
+and `GET /metrics` lists `ram_blobs`, `file_blobs`, `file_mb`, `tier_reads`, `tier_mb` and `tier_ms`, `drafts_offered` and
+`drafts_accepted` per recent request, with `totals` since the start. The tier's seconds are its copies: a tier lookup that
+hands back a pointer is counted as a read and as bytes, not as time, and it counts in neither the RAM nor the file figures.
+So `ram_blobs` + `file_blobs` no longer account for every routed lookup once a tier answers some of them, and the
+`ms/round of reading` and `GB/s per reading thread` figures cover the file copies only; compare a run with a tier against
+another run with the same tier, never against one without it. `hit_rate` is the VRAM share of the experts looked up;
+experts the GPU reads over PCIe
 (`--pcie-frac`) are not in it, so a higher `--pcie-frac` raises it even when decoding gets slower. `pcie_share` is their
 share of all routed experts. The Monitor tab shows both. The request list in the Monitor tab also shows the prompt's own speed: what the cache already held is not read
 again, so it is the fresh tokens (`prompt_tokens` minus `reused`) over the prompt time (`prompt_ms`), and a request that read no

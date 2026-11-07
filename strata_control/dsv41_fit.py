@@ -35,6 +35,18 @@ LAYERS = 40
 EXPERTS_PER_LAYER = 384
 EXPERTS = LAYERS * EXPERTS_PER_LAYER  # 15,360
 EXPERT_GB = EXPERT_BYTES / GB / EXPERTS     # 18.8 MB each
+SLOT_SLACK = 8192                   # the gap the store keeps on each side of a blob (src/dsv41/ds4_store.hpp: kSlack)
+SLOT_ALIGN = 4096                   # a slot starts on a 4 KiB boundary (src/dsv41/ds4_os.hpp: kDirectAlign)
+EXPERT_SLOT_BYTES = ((EXPERT_BYTES // EXPERTS + 2 * SLOT_SLACK + SLOT_ALIGN - 1) // SLOT_ALIGN) * SLOT_ALIGN
+                                    # 18,817,024: an expert's bytes, the store's two gaps, rounded up: the tier's slot is the
+                                    # store's slot (docs/EXPERT_TIER_DSV41_PLAN.md §6.1), so a device's capacity is counted in whole slots (§6.2)
+
+
+def slot_bytes(expert_bytes: float = EXPERT_BYTES) -> int:
+    """One tier slot for experts of `expert_bytes`: the store's slot (the blob, its two 8 KiB gaps, rounded up to 4 KiB).
+    An IST-DAS set's experts are smaller than Unsloth's MXFP4 ones, so its slots are: 132.07 GB / 15,360 + the slack (§6.1).
+    A slot always holds one whole expert; a fraction of a slot holds nothing (§6.2: capacity is counted in whole slots)."""
+    return int((float(expert_bytes) + 2 * SLOT_SLACK + SLOT_ALIGN - 1) // SLOT_ALIGN) * SLOT_ALIGN
 WEIGHTS_GB = (MAIN_BYTES - ENGRAM_BYTES) / GB            # 305.6
 EXPERTS_GB = EXPERT_BYTES / GB                           # 288.8
 DENSE_GB = WEIGHTS_GB - EXPERTS_GB                       # 16.8
@@ -405,8 +417,126 @@ def _plan_uma(key: str, model: str, card: dict, ram_gb: float | None, disk_free_
     return out
 
 
+def tier_fit(devices: list[tuple[int, ...]], experts_vram: int, store_slots: int, expert_bytes: float = EXPERT_BYTES) -> dict[str, Any]:
+    """The expert tier as one more home for the experts, said as slots (docs/EXPERT_TIER_DSV41_PLAN.md §11 "Fit"): the experts
+    neither the cards' memory nor the store's guaranteed slots cover, against what the devices the person gave hold.
+
+    `devices`: one entry per --expert-tier device, in the order given; its usable capacity in bytes after that device's own
+    reserve (a plain number, or a pair whose first number is it: the path may travel with it).  `experts_vram`: the experts the
+    plan keeps in graphics memory.  `store_slots`: the slots the RAM store is guaranteed to keep, counted in the same slot unit
+    - the guard rule (§5.2 there): the tier is planned against the least the store keeps, so a store that shrinks later never
+    leaves an expert with no home, and one that stays bigger only copies a few experts it had anyway.  `expert_bytes`: one
+    expert's bytes for the set being fitted (the IST-DAS sets' are smaller than Unsloth's MXFP4); the slot is slot_bytes().
+
+    Keys: slots_needed, slots_given, needed_gb, given_gb, covers (the devices hold them all), lines (plain words, one idea each).
+    Pure: no I/O, no device is ever chosen by the fit, a device under one whole slot holds nothing, and no speed is claimed -
+    what the tier is worth is measured separately, on hardware."""
+    slot = slot_bytes(expert_bytes)
+    caps = [int(d[0]) if isinstance(d, (tuple, list)) else int(d) for d in devices or []]
+    given = sum(max(0, c) // slot for c in caps)
+    needed = max(0, EXPERTS - max(0, int(experts_vram or 0)) - max(0, int(store_slots or 0)))
+    given_gb, needed_gb = given * slot / GB, needed * slot / GB
+    lines = []
+    if caps:
+        lines.append(f"Expert tier: the {len(caps)} device{'s' if len(caps) != 1 else ''} you give "
+                     f"{'holds' if len(caps) == 1 else 'hold'} {given:,} expert slots ({given_gb:.0f} GB).")
+    else:
+        lines.append("Expert tier: no device is given, so the tier holds nothing.")
+    if needed == 0:
+        lines.append("The cards' memory and RAM already cover every expert, so this fit needs none of the tier's slots.")
+    elif given >= needed:
+        lines.append(f"That is enough for the {needed:,} experts ({needed_gb:.0f} GB) the cards' memory and RAM leave over: "
+                     f"each of them is written on the device once and read from there after the fill.")
+    else:
+        lines.append(f"That holds {given:,} of the {needed:,} experts ({needed_gb:.0f} GB) the cards' memory and RAM leave "
+                     f"over; the other {needed - given:,} are read from the SSD.")
+    return {"slots_needed": needed, "slots_given": given, "needed_gb": needed_gb, "given_gb": given_gb,
+            "covers": given >= needed, "lines": lines}
+
+
+def _tier_lane_gb(p: dict[str, Any]) -> float:
+    """The GB of experts neither the cards nor a unified-memory pool's GPU side hold: the CPU lane's experts (a unified-memory
+    plan counts the ones read from the SSD as `streamed_gb` instead)."""
+    return float(p.get("cpu_experts_gb") or p.get("streamed_gb") or 0.0)
+
+
+TIER_STORE_MIN_GB = 4          # the engine's own floor for a RAM store (its auto size is off below it): a tier needs a store to serve through
+
+
+def tier_store_gb(base_plan: dict[str, Any]) -> tuple[int | None, str]:
+    """The explicit `--ssd-cache` GB a DeepSeek start with an expert tier needs, from a plan made WITHOUT the tier, or (None, why).
+
+    The engine plans the tier against the RAM store's guaranteed slots (docs/EXPERT_TIER_DSV41_PLAN.md §5.2), and at the store's
+    auto size there are none: it stops with "give --ssd-cache GB".  So a setup that writes `--expert-tier` must also write a size:
+    the RAM the CPU lane's experts may keep beside REST_RAM_GB, held down to the CPU lane's share (the figure `_tier_plan` counts as
+    the guard), whole GB.  Where there is no such size - a Mac (its engine has no tier), no RAM figure, every expert already on the
+    cards, or less than TIER_STORE_MIN_GB of RAM to spare - the answer is None and the reason, with what the person can do; setup
+    refuses the tier then, before it downloads anything.  Pure; a tier-free setup never calls it, so its arguments stay as they were."""
+    if base_plan.get("mac"):
+        return None, ("a Mac's DeepSeek engine has no expert tier (its memory is one pool): leave --expert-tier out")
+    ram = base_plan.get("ram_gb")
+    if not ram:
+        return None, ("the RAM of this computer could not be measured, so no store size can be planned for the tier: "
+                      "give the size yourself - add \"--ssd-cache\", \"GB\" to \"user_args\" in the run config - or leave --expert-tier out")
+    lane = _tier_lane_gb(base_plan)
+    if lane <= 0.0:
+        return None, "the cards already hold every expert, so a tier would have nothing to carry: leave --expert-tier out"
+    hold = min(lane, max(0.0, float(ram) - REST_RAM_GB))
+    gb = int(hold)
+    if gb < TIER_STORE_MIN_GB:
+        return None, (f"only {max(0.0, float(ram) - REST_RAM_GB):.0f} GB of the {float(ram):.0f} GB of RAM are left for the RAM store beside the "
+                      f"{REST_RAM_GB:.0f} GB the system and the engine keep, and the tier needs a store of at least {TIER_STORE_MIN_GB} GB to serve "
+                      "through: free RAM, add RAM, or leave --expert-tier out")
+    return gb, ""
+
+
+def _tier_plan(out: dict[str, Any], expert_tiers: list[dict] | None,
+               ssd_cache_gb: float | None) -> dict[str, Any]:
+    """The tier term added to a plan plan() has already made (docs/EXPERT_TIER_DSV41_PLAN.md §11 "Fit"): out["tier"], the tier's
+    lines put before the "Measured on" sentence, and a warning when the devices do not cover the experts left over.  With no
+    tier the plan comes back untouched, so every answer without one is as it was.  Setup and the fit never add a device.
+
+    The store's guaranteed slots, from the plan's own numbers: the size pinned by --ssd-cache when the person gave one (that
+    is the guard, §5.2), else the RAM the CPU lane's experts may keep beside REST_RAM_GB, held down to the CPU lane's share.  When
+    RAM is unknown there is no guard: the tier then plans for every expert the cards leave over, which leaves no gap either.  No
+    measured numbers here: this says where the experts live, not how fast they read."""
+    if not expert_tiers:
+        return out
+    caps: list[tuple[int, Any]] = []
+    for t in expert_tiers:
+        usable_mib = max(0, int(t.get("mib") or 0) - int(t.get("reserve_mib") or 0))
+        caps.append((usable_mib * 1024 * 1024, t.get("path")))
+    # the slot of the set this plan is for: an IST-DAS variant's experts are the set's experts_gb / 15,360 (§6.1)
+    v = variant(out.get("variant") or "")
+    expert_bytes = ((v["experts_gb"] if v else EXPERTS_GB) * GB) / EXPERTS
+    slot = slot_bytes(expert_bytes)
+    ram = out.get("ram_gb")
+    if ssd_cache_gb is not None:
+        guard = int(float(ssd_cache_gb) * GB) // slot
+    elif ram:
+        hold = min(_tier_lane_gb(out), max(0.0, float(ram) - REST_RAM_GB))
+        guard = int(hold * GB) // slot
+    else:
+        guard = 0
+    t = tier_fit(caps, int(out.get("experts_in_vram") or 0), guard, expert_bytes)
+    out["tier"] = t
+    lines, warns = out.setdefault("lines", []), out.setdefault("warnings", [])
+    at = next((i for i, l in enumerate(lines) if l.startswith("Measured on ") or l.startswith("Measured on this")), len(lines))
+    lines[at:at] = t["lines"]
+    if out.get("mac"):
+        warns.append("a Mac's DeepSeek engine has no expert tier: it stops when --expert-tier is given, so the tier's experts "
+                     "stay read from the SSD")
+    elif t["slots_needed"] and not t["covers"]:
+        warns.append(f"the expert tier holds {min(t['slots_given'], t['slots_needed']):,} of the {t['slots_needed']:,} experts "
+                     f"the cards' memory and RAM leave over; the rest is read from the SSD")
+    if "words" in out:
+        out["words"] = " ".join(lines)
+    return out
+
+
 def plan(cards: list[dict] | None, ram_gb: float | None, disk_free_gb: float | None = None, context: int = 8192,
-         vendor: str | None = None, model: str | None = None, named: bool = False) -> dict[str, Any]:
+         vendor: str | None = None, model: str | None = None, named: bool = False,
+         expert_tiers: list[dict] | None = None, ssd_cache_gb: float | None = None) -> dict[str, Any]:
     """Where the model goes on this computer.  `cards`: the graphics cards ({"index", "name", "vram_gb", ...}, as gpu_fit takes them),
     `ram_gb` the RAM, `disk_free_gb` the free space where the files go (None: not checked).  `model`: an official IST-DAS set
     (ISTA_SETS: "IST-DAS-2.00bpw" / "IST-DAS-2.25bpw" / "IST-DAS-1.75bpw") gets its own numbers; None or "UD-Q8_K_XL" is Unsloth's 508 GB set.
@@ -415,16 +545,22 @@ def plan(cards: list[dict] | None, ram_gb: float | None, disk_free_gb: float | N
     cpu_experts_gb, ram_needed_gb, spill_gb, spare_ram_gb, verdict (fits / tight / spills / unknown / no_card), tp, args,
     download_gb, engram_gb, disk_need_gb, disk_ok, lines (plain words, one idea each), warnings (the risks, plainly), measured.
     On a unified-memory APU (Ryzen AI Max, gfx1151) the plan counts one pool: also `uma: True` and `streamed_gb` (the experts
-    read from the SSD), tp 1 and no args (nothing to split between cards)."""
+    read from the SSD), tp 1 and no args (nothing to split between cards).
+
+    `expert_tiers`: the devices the person gave with --expert-tier, in order, one entry each {"path", "mib", "reserve_mib"}.  They
+    add one term to the fit (also kept as the key `tier`, from tier_fit): a line about them and, when they do not cover what the
+    cards and RAM leave over, a warning.  `ssd_cache_gb`: the size the person pinned with --ssd-cache, used as the store's guard.
+    With neither the answer is the one before.  A plan never invents devices."""
     if variant(model):
         mac = mac_card(cards)
         if mac is not None and variant_key(model) in MAC_SET_PACK:
-            return _plan_mac(variant_key(model), model, mac, ram_gb, disk_free_gb, context)
+            return _tier_plan(_plan_mac(variant_key(model), model, mac, ram_gb, disk_free_gb, context), expert_tiers, ssd_cache_gb)
         mine = gpu_fit.for_vendor(list(cards or []), vendor)[0] if vendor else list(cards or [])
         card = uma_card(gpu_fit.usable_cards(mine)[0])   # an APU beside a card with memory of its own does not count (setup leaves it out too)
         if card is not None:
-            return _plan_uma(variant_key(model), model, card, ram_gb, disk_free_gb, context)
-        return _plan_ista(variant_key(model), cards, ram_gb, disk_free_gb, context, vendor, named)
+            return _tier_plan(_plan_uma(variant_key(model), model, card, ram_gb, disk_free_gb, context), expert_tiers, ssd_cache_gb)
+        return _tier_plan(_plan_ista(variant_key(model), cards, ram_gb, disk_free_gb, context, vendor, named), expert_tiers,
+                          ssd_cache_gb)
     keep, ignored = run_cards(cards, vendor, named=named)                 # the engine takes the layers in card order
     n = len(keep)
     out: dict[str, Any] = {"cards": [], "experts_total": EXPERTS, "experts_in_vram": 0, "vram_experts_gb": 0.0,
@@ -519,7 +655,7 @@ def plan(cards: list[dict] | None, ram_gb: float | None, disk_free_gb: float | N
         warns.append(f"The download needs about {need_disk:.0f} GB of free disk space and {disk_free_gb:.0f} GB are free where the "
                      "files go. Use --models-dir on a bigger drive, or --gguf-dir for files you already have.")
     out["words"] = " ".join(lines)
-    return out
+    return _tier_plan(out, expert_tiers, ssd_cache_gb)
 
 
 def _option(key: str, cards: list[dict], ram_gb: float | None, ctx: int, vendor: str | None, model: str | None = None) -> dict[str, Any]:

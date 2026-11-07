@@ -43,6 +43,14 @@ struct Options {
     // most (never past the RAM the process can still get less 8 GB); 0: off, the OS page cache as before
     double ssd_cache_gb = -1.0;   // < 0: auto (the RAM the process can get less a floor, at most 48 GB; off below 4 GB), 0: off
     int ssd_policy = 0;
+    // the expert tier (docs/EXPERT_TIER_DSV41_PLAN.md §11): `--expert-tier PATH,mib=N[,reserve=M][,verify=header|full]`,
+    // repeatable, one entry per device in the order given (the order is part of the placement, §7.4).  The experts the
+    // store's guard and the VRAM share do not cover are written there once (the fill, §9) and read from that device after
+    // it, through the store's own slots (§8.1).  --expert-tier-refill writes the tier again.  Absent: every path stays
+    // byte-identical to the release (E4).  With the store at auto the tier is refused: no guaranteed store minimum exists
+    // yet (open item 1).
+    std::vector<std::string> expert_tiers;   // one entry per --expert-tier flag, in the order given (the order is part of the placement, §7.4)
+    bool expert_tier_refill = false;         // --expert-tier-refill: write the tier again whatever its headers say
     // dspark_auto: the drafter is loaded only where the routed experts fit the GPUs (more than 1.5x what they have, the verify rounds
     // read 3.3x the bytes of a token and measured no faster than plain decoding, and the drafter's 7 GB of experts take the VRAM the
     // trunk's hottest would have had); --dspark on / off / none says it outright
@@ -96,6 +104,12 @@ struct Stats {
     // of use (prefetched) of which used / given up unused, slots given up, bytes read, ms the CPU lane waited for the reads
     int64_t store_hits = 0, store_misses = 0, store_prefetched = 0, store_pf_used = 0, store_pf_wasted = 0, store_evictions = 0;
     int64_t store_bytes = 0, store_fails = 0;
+    // the expert tier (ds4_tier.hpp, §8.2): tier_hits counts the experts the CPU lane asked for that were copied from a
+    // tier slot into a store slot; tier_bytes is the bytes copied (kept out of store_bytes: the file-read figure stays
+    // meaningful).  tier_experts / tier_devices describe the placement; tier_fill_s is the fill phase's time (a load
+    // statistic, §9).  With no tier these stay 0 (§7.4/acceptance criterion 1).
+    int64_t tier_hits = 0, tier_bytes = 0, tier_experts = 0, tier_devices = 0;
+    double tier_fill_s = 0.0;
     int64_t store_zc = 0, store_zc_visible = 0;   // experts the GPU computed from the store (zero-copy over PCIe); slots it may read
     double store_wait_ms = 0.0, store_busy_ms = 0.0;
     int64_t store_slots = 0, store_slots_max = 0;

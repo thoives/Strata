@@ -4,6 +4,7 @@
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
 #include "strata/core/expert_source.hpp"
+#include "strata/core/expert_tier.hpp"
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/peer_experts.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
@@ -1410,6 +1411,7 @@ void FileExpertSource::warm(int64_t layer, const int64_t* experts, int64_t n) {
         const int64_t e = experts[j];
         if (e < 0 || e >= n_expert_) continue;
         const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) e;
+        if (tier_ && tier_->has(layer, e)) continue;   // held by the expert tier (§7.5): no read to queue
         if (complement_ready_ && resident_blob(index) != nullptr)
             continue;                                                    // in the RAM copy
         if (warm_stamp_) warm_stamp_[index].store(stamp, std::memory_order_relaxed);
@@ -1551,6 +1553,7 @@ void FileExpertSource::begin_layer(int64_t layer, const int32_t* ids, int64_t k)
 }
 
 bool FileExpertSource::transient(int64_t layer, int64_t expert) const {
+    if (tier_ && tier_->has(layer, expert)) return false;   // §7.6: the tier's pointers are stable while it is open
     if (!staged() || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return false;
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
     if (complement_ready_ && resident_blob(index) != nullptr)
@@ -1569,6 +1572,18 @@ bool FileExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
         if (held == nullptr && !override_.empty()) held = override_[index];
         if (held != nullptr) {
             std::memcpy(dst, held, (size_t) bytes);
+            return true;
+        }
+    }
+    if (tier_) {   // §7.1: the tier sits between the RAM copy and the files
+        const uint8_t* held = tier_->blob(layer, expert);
+        if (held != nullptr) {
+            const auto tt0 = std::chrono::steady_clock::now();
+            std::memcpy(dst, held, (size_t) bytes);
+            tier_us_.fetch_add((uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - tt0).count(),
+                               std::memory_order_relaxed);
+            tier_reads_.fetch_add(1, std::memory_order_relaxed);
+            tier_read_bytes_.fetch_add(bytes, std::memory_order_relaxed);
             return true;
         }
     }
@@ -1596,6 +1611,7 @@ const uint8_t* FileExpertSource::mapped_blob(int64_t layer, int64_t expert) cons
 }
 
 uint64_t FileExpertSource::release(int64_t layer, int64_t expert) {
+    if (tier_ && tier_->has(layer, expert)) return 0;   // §7.6: not in the file mapping's pages: nothing to trim
 #if defined(_WIN32)
     static const bool enabled = [] {
         const char* v = std::getenv("STRATA_FILE_RELEASE");
@@ -2184,6 +2200,10 @@ bool FileExpertSource::has_resident(int64_t layer, int64_t expert) const {
     return resident_blob(index) != nullptr;
 }
 
+bool FileExpertSource::has_tier(int64_t layer, int64_t expert) const {
+    return tier_ != nullptr && tier_->has(layer, expert);   // §7.6: the tier's parallel of has_resident
+}
+
 bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err) {
     err.clear();
     if (n <= xstage_cap_) return true;
@@ -2375,6 +2395,15 @@ const uint8_t* FileExpertSource::blob(int64_t layer, int64_t expert) {
         }
     }
     if (from_files) {
+        if (tier_) {   // §7.1: the lookup order RAM copy, tier, files
+            result = tier_->blob(layer, expert);
+            if (result != nullptr) {
+                tier_reads_.fetch_add(1, std::memory_order_relaxed);
+                tier_read_bytes_.fetch_add(layer_blob_bytes_[(size_t) layer], std::memory_order_relaxed);
+                from_files = false;
+            }
+        }
+        if (from_files)
         if (staged()) {
             result = staged_blob(layer, expert);          // counts its bytes
         } else {
@@ -2382,13 +2411,14 @@ const uint8_t* FileExpertSource::blob(int64_t layer, int64_t expert) {
             if (result != nullptr)
                 file_read_bytes_.fetch_add(layer_blob_bytes_[(size_t) layer], std::memory_order_relaxed);
         }
-        if (complement_ready_ && result != nullptr) file_reads_.fetch_add(1, std::memory_order_relaxed);
+        if (complement_ready_ && from_files && result != nullptr) file_reads_.fetch_add(1, std::memory_order_relaxed);
     }
     if (result != nullptr) ++reads_;
     return result;
 }
 
 bool FileExpertSource::pinned(int64_t layer, int64_t expert) const {
+    if (tier_ && tier_->has(layer, expert)) return tier_->registered_of(layer, expert);   // §7.6: true when the device is registered
     if (!complement_ready_ || !complement_pinned_ || complement_host_ == nullptr || layer < 0 || expert < 0 ||
         layer >= n_layers_ || expert >= n_expert_) return false;
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
@@ -2400,6 +2430,7 @@ bool FileExpertSource::pinned(int64_t layer, int64_t expert) const {
 }
 
 const uint8_t* FileExpertSource::device_alias(int64_t layer, int64_t expert) const {
+    if (tier_ && tier_->has(layer, expert)) return nullptr;   // §7.6: unchanged (null); the tier's link is the tier's own
     if (!pinned(layer, expert) || complement_device_ == nullptr) return nullptr;
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
     if (exchange_storage_.active()) return exchange_storage_.resident(index).device;

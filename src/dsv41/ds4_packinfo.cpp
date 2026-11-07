@@ -4,6 +4,7 @@
 // pack's whole description (tools/dsv41/pack_gguf.py).  The same report is the first line of every benchmark log.
 #include "ds4_packinfo.hpp"
 #include "ds4_iq.cuh"      // iq::supported / iq::name: the device-type list below is derived from the kernels, not copied
+#include "ds4_tier.hpp"    // parse_tier_spec: the --expert-tier grammar for the tier lines below
 
 #include <algorithm>
 #include <cstdio>
@@ -54,7 +55,7 @@ double gb(double b) { return b / 1e9; }
 
 }  // namespace
 
-int pack_info(const std::string& dir, std::FILE* out) {
+int pack_info(const std::string& dir, std::FILE* out, const std::vector<std::string>& expert_tiers) {
     std::map<std::string, std::string> kv;
     {
         std::ifstream f(dir + "/ds4.txt");
@@ -227,6 +228,32 @@ int pack_info(const std::string& dir, std::FILE* out) {
     std::fprintf(out, "  all experts %.1f GB at %.2f bpw (%.0f G parameters), dense %.2f GB (embed %.2f, head %.2f, mtp %.2f, vision %.2f, engram %.2f)\n",
                  gb(experts_bytes), expert_params > 0 ? experts_bytes * 8.0 / expert_params : 0.0, expert_params / 1e9, gb(dense),
                  gb(dense_embed), gb(dense_head), gb(dense_mtp), gb(dense_vision), gb(dense_engram));
+    if (!expert_tiers.empty()) {   // (§11: the configured expert tiers: a slot is the store's slot: the blob (with its 8192 gaps) plus kSlack before and after, 4 KiB aligned)
+        uint64_t blob_max = 0;
+        for (const Role& r : lay) {
+            const uint64_t b = (uint64_t) (r.bytes[0] + r.bytes[1] + r.bytes[2]) + 2ull * ExpertStore::kSlack;
+            blob_max = std::max<uint64_t>(blob_max, b);
+        }
+        const uint64_t slot = (blob_max + 2ull * ExpertStore::kSlack + 4095ull) & ~4095ull;
+        std::fprintf(out, "  expert tier: %zu devices, a slot %.2f MB at this pack's bytes\n", expert_tiers.size(), slot / 1e6);
+        uint64_t slots_tot = 0;
+        for (const std::string& raw : expert_tiers) {
+            TierSpec s;
+            std::string why;
+            if (!parse_tier_spec(raw, s, why)) {   // (the entry will fail at a launch the same way: say it here too)
+                std::fprintf(out, "  expert tier %s: %s\n", raw.c_str(), why.c_str());
+                return 1;
+            }
+            const uint64_t cap = tier_capacity_bytes(s);
+            const uint64_t s_n = cap > (256ull << 10) ? (cap - (256ull << 10)) / slot : 0;   // (less the header and the placement tables: a close figure)
+            slots_tot += s_n;
+            std::fprintf(out, "    %s: %llu MiB, %llu MiB after the reserve -> about %llu slots%s\n", s.path.c_str(),
+                         (unsigned long long) s.mib, (unsigned long long) (cap >> 20), (unsigned long long) s_n,
+                         s.verify_full ? ", verify=full" : "");
+        }
+        std::fprintf(out, "  tier slots together about %llu vs %lld experts: at a start the store's guard and the configured VRAM share cut the hottest ranks out of the placement (§5.2); the placement itself is decided from the profile then\n",
+                     (unsigned long long) slots_tot, nl * ne);
+    }
     std::fprintf(out, "  dense types:");
     for (const auto& d : dense_types) std::fprintf(out, " %s", d.c_str());
     std::fprintf(out, "\n");

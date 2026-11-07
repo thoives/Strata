@@ -1,0 +1,41 @@
+# --expert-tier entries and what every parser must answer: both engines (include/strata/core/expert_tier_spec.hpp, through
+# tests/core/expert_tier_spec_test.cpp) and setup / strata launch (strata_control/expert_tier.py, through
+# tests/terminal/test_expert_tier_spec.py).  One case a line, fields separated by a TAB:
+#   ok<TAB>entry<TAB>canonical form      the entry is accepted and is written back as the canonical form
+#   bad<TAB>entry                        the entry is refused
+ok	/dev/disk10/tier.bin,mib=40960	/dev/disk10/tier.bin,mib=40960
+ok	a.bin,mib=100,reserve=4,verify=full	a.bin,mib=100,reserve=4,verify=full
+ok	a.bin,mib=100,verify=header	a.bin,mib=100
+ok	a.bin,reserve=0,mib=7	a.bin,mib=7
+ok	a.bin,MIB=8,Reserve=2,VERIFY=Full	a.bin,mib=8,reserve=2,verify=full
+ok	a.bin,mib=0008	a.bin,mib=8
+ok	C:\tiers\t1.bin,mib=1	C:\tiers\t1.bin,mib=1
+ok	 spaced name.bin ,mib=1	 spaced name.bin ,mib=1
+ok	a.bin,mib=17592186044415	a.bin,mib=17592186044415
+bad	a.bin
+bad	,mib=10
+bad	a.bin,mib=
+bad	a.bin,mib=0
+bad	a.bin,mib=-1
+bad	a.bin,mib=+5
+bad	a.bin,mib= 5
+bad	a.bin,mib=5 ,verify=full
+bad	a.bin,mib=0x10
+bad	a.bin,mib=1.5
+bad	a.bin,mib=17592186044416
+bad	a.bin,mib=99999999999999999999999
+bad	a.bin,mib=10,reserve=10
+bad	a.bin,mib=10,reserve=20
+bad	a.bin,mib=10,reserve=-1
+bad	a.bin,mib=10,mib=10
+bad	a.bin,mib=10,MIB=10
+bad	a.bin,mib=10,verify=full,verify=full
+bad	a.bin,mib=10,verify=half
+bad	a.bin,mib=10,verify=
+bad	a.bin,mib=10,
+bad	a.bin,,mib=10
+bad	a.bin,mib=10,,verify=full
+bad	a.bin,mib
+bad	a.bin,mib=10,size=4
+bad	a.bin, mib=10
+bad	a.bin,mib=١٠

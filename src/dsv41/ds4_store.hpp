@@ -49,6 +49,9 @@ public:
     struct Stats {
         std::atomic<int64_t> hits{0}, misses{0}, prefetched{0}, prefetch_used{0}, prefetch_wasted{0}, evictions{0}, fails{0};
         std::atomic<int64_t> bytes_read{0}, wait_ns{0}, no_slot{0}, cancelled{0}, put{0};
+        // the expert tier (ds4_tier.hpp, §8.2): copies served from a tier slot into a store slot.  Not counted in bytes_read
+        // (file bytes), so the file-read figure stays meaningful (§8.2 there).
+        std::atomic<int64_t> tier_hits{0}, tier_bytes{0};
     };
     struct Vis {                 // a slot the GPU may read from now on (dev != 0), or no longer (dev == 0)
         int layer = 0, e = 0;
@@ -68,9 +71,66 @@ public:
         std::function<void(void* host)> unmap_chunk;
         size_t reserve = 192;              // slots kept evictable (not visible) for the window's demand and guesses
         int vis_percent = 100;             // the share of experts the GPU may take (by a fixed hash): the rest stay the CPU lane's, so both lanes work
+        // the expert tier (ds4_tier.hpp): four hooks, set after init() once the tier decided (null: no tier).
+        // find gives (device, slot) of an expert the tier holds and has placed (§8.1: store first, tier on a miss);
+        // base is that slot's bytes (the store's slot layout: E2), queue is that device's own IoQueue (E3: a tier copy
+        // runs on its device's queue, never the store's).  fill_read builds the store's own read job builder for a
+        // tier fill (§9): three aligned reads into a tier slot, the same jobs as a store fill, different destination.
+        std::function<bool(int layer, int e, int& dev, uint64_t& slot)> tier_find;
+        std::function<uint8_t*(int dev, uint64_t slot)> tier_base;
+        std::function<IoQueue*(int dev)> tier_queue;
+        // a copy out of a tier device failed (its own read error): the caller marks that device, so the tier refills at
+        // the next start and its experts fall back to the files (ds4_tier.hpp note_refill, §9)
+        std::function<void(int dev)> tier_fail;
+        // run first when the store goes away: every job the store pushed to a tier device's queue holds a pointer into this
+        // store's arena and slots (the destination, `left`, `bad`, `fail`), so those queues must finish them before the arena
+        // is released.  The tier owns the queues; the store only asks for them to be drained.
+        std::function<void()> tier_drain;
     };
 
     void set_pfds(const std::vector<os::fd_t>& pfds) { pfds_ = pfds; }   // (the fallback handles were reopened)
+    void set_tier(std::function<bool(int, int, int&, uint64_t&)> find, std::function<uint8_t*(int, uint64_t)> base,
+                  std::function<IoQueue*(int)> q, std::function<void(int)> fail,
+                  std::function<void()> drain = nullptr) {   // (after the tier decided: reuse or fill placed bytes first, §8.1/§8.5)
+        cfg_.tier_find = std::move(find);
+        cfg_.tier_base = std::move(base);
+        cfg_.tier_queue = std::move(q);
+        cfg_.tier_fail = std::move(fail);
+        cfg_.tier_drain = std::move(drain);
+    }
+    /// §9: a tier fill read: (layer, e)'s three matrices read exactly as a store fill reads them (the same aligned job
+    /// builder, E2), landing inside a tier mapping at `slot_base` on that device's own queue (E3).  The caller owns `left`
+    /// (set to 3 by the caller before this) and `bad`; bytes_out counts what was asked for, not the store's file bytes
+    /// (the fill is a load statistic, §9).  False: the layer/expert is outside the geometry, or the device has no queue.
+    bool tier_fill_read(int layer, int e, uint8_t* slot_base, int dev, std::atomic<int>& left, std::atomic<bool>& bad,
+                        uint64_t& bytes_out) {
+        if (layer < 0 || layer >= (int) geo_.size() || e < 0 || e >= geo_[(size_t) layer].n_exp || !cfg_.tier_queue) return false;
+        IoQueue* tq = cfg_.tier_queue(dev);
+        if (tq == nullptr) return false;
+        const LayerGeo& g = geo_[(size_t) layer];
+        IoQueue::Job jobs[3];
+        for (int r = 0; r < 3; ++r) {
+            const uint64_t off = g.off[r] + (uint64_t) e * g.stride[r];
+            const uint64_t lead = off % os::kDirectAlign;
+            uint8_t* fin = slot_base + g.tr[r];
+            // the same aligned landing as a store fill (dst is fin - lead rounded down to 4096: the tier slot keeps kSlack
+            // on both sides like a store slot, E2), then the matrix moved up to fin
+            uint8_t* dst = (uint8_t*) ((uintptr_t) (fin - lead) & ~(uintptr_t) (os::kDirectAlign - 1));
+            IoQueue::Job& j = jobs[r];
+            j.fd = pfds_[(size_t) g.file[r]];
+            j.dfd = dfds_[(size_t) g.file[r]];
+            j.off = off;
+            j.len = g.bytes[r];
+            j.dst = dst;
+            j.keep = fin;
+            j.left = &left;
+            j.bad = &bad;
+            j.cancel = nullptr;   // (a fill read is never a guess: it is placed once, §9)
+        }
+        bytes_out += (uint64_t) (g.bytes[0] + g.bytes[1] + g.bytes[2]);
+        tq->push(jobs, 3, false);   // (the fill runs in rank order on the device's queue: hottest first, §9)
+        return true;
+    }
     bool init(const Cfg& c, const std::vector<LayerGeo>& layers, const std::vector<os::fd_t>& dfds, const std::vector<os::fd_t>& pfds) {
         cfg_ = c;
         geo_ = layers;
@@ -109,6 +169,9 @@ public:
         return true;
     }
     ~ExpertStore() {
+        // 1. the tier devices' queues finish every job that lands in this arena (and counts down this store's slots);
+        // 2. then the store's own queue; 3. only then the arena goes.  Nothing queued can touch a released slot.
+        if (cfg_.tier_drain) cfg_.tier_drain();
         io_.reset();
         for (size_t i = 0; i < chunks_.size(); ++i)
             if (cfg_.unmap_chunk && chunk_dev_[i] != nullptr) cfg_.unmap_chunk(chunks_[i].first);
@@ -118,6 +181,9 @@ public:
     size_t slot_bytes() const { return slot_bytes_; }
     size_t slots_allocated() const { return nalloc_; }
     size_t slots_max() const { return nmax_; }
+    /// The slots the store has committed now: the most it can promise to hold (a chunk is committed only when the RAM floor allows,
+    /// so the nominal slots_max() can be more than the store can keep). Slots are never given back, so this is a guarantee.
+    size_t committed_slots() const { return nalloc_; }
     const Stats& stats() const { return st_; }
     double busy_ms() const { return io_ ? io_->busy_ms() : 0.0; }
     static constexpr size_t kSlack = 8192;
@@ -279,6 +345,8 @@ public:
         sp.tick = ++clock_;
         sp.bad.store(false);
         sp.cancel.store(false);
+        sp.fail.store(false);
+        sp.src_dev = -1;
         sp.left.store(1, std::memory_order_release);
         sp.state.store(kLoading, std::memory_order_release);
         where_[(size_t) layer][(size_t) e] = s;
@@ -441,9 +509,11 @@ private:
     struct Slot {
         uint8_t* base = nullptr;   // the blob's first byte
         int layer = -1, expert = -1, pin = 0;
+        int src_dev = -1;          // (>= 0: this slot's bytes came from tier device src_dev: a failure marks that device, §9)
         bool prefetch = false, visible = false;
         std::atomic<int> state{kFree}, left{0};
         std::atomic<bool> bad{false}, cancel{false};
+        std::atomic<bool> fail{false};   // a job of this slot RAN and failed (bad alone also means "cancelled")
         uint64_t tick = 0;
     };
 
@@ -479,30 +549,58 @@ private:
         sp.state.store(kLoading, std::memory_order_release);
         sp.bad.store(false);
         sp.cancel.store(false);
+        sp.fail.store(false);
         sp.left.store(3, std::memory_order_release);
         where_[(size_t) layer][(size_t) e] = s;
         const LayerGeo& g = geo_[(size_t) layer];
         IoQueue::Job jobs[3];
+        // §8.1: a store miss checks the tier next.  A tier hit is served by three memory-copy jobs (ds4_pool.hpp's
+        // `mem` form: a copy of len bytes from memory to dst instead of a read) into this store slot, on the tier
+        // device's own queue (E3), with the store's priority rule kept (§8.4: a demand copy at the front, a guess at
+        // the back, and a guess the layer moved past cancelled as today).  A miss in both bands reads the file, as today.
+        int tdev = -1;
+        uint64_t tslot = 0;
+        uint8_t* tbase = nullptr;
+        IoQueue* tq = nullptr;
+        if (cfg_.tier_find && cfg_.tier_find(layer, e, tdev, tslot) && cfg_.tier_base && cfg_.tier_queue) {
+            tbase = cfg_.tier_base(tdev, tslot);
+            tq = cfg_.tier_queue(tdev);
+            if (tbase == nullptr || tq == nullptr) tdev = -1;   // (the device closed: fall back to the file read)
+        }
+        if (tdev >= 0) {
+            st_.tier_hits.fetch_add(1, std::memory_order_relaxed);
+            st_.tier_bytes.fetch_add((int64_t) (g.bytes[0] + g.bytes[1] + g.bytes[2]), std::memory_order_relaxed);
+        }
+        sp.src_dev = tdev;   // (the slot records its source: finish() marks a failed tier's device)
         for (int r = 0; r < 3; ++r) {
-            const uint64_t off = g.off[r] + (uint64_t) e * g.stride[r];
-            const uint64_t lead = off % os::kDirectAlign;
             uint8_t* fin = sp.base + g.tr[r];   // where the matrix belongs
-            // the aligned read lands the file's byte `off` at dst + lead: dst is fin - lead rounded down to 4096 (its span spills
-            // under 4096 bytes either way into the blob's gaps), the matrix is then moved up to fin
-            uint8_t* dst = (uint8_t*) ((uintptr_t) (fin - lead) & ~(uintptr_t) (os::kDirectAlign - 1));
             IoQueue::Job& j = jobs[r];
-            j.fd = pfds_[(size_t) g.file[r]];
-            j.dfd = dfds_[(size_t) g.file[r]];
-            j.off = off;
-            j.len = g.bytes[r];
-            j.dst = dst;
-            j.keep = fin;
             j.left = &sp.left;
             j.bad = &sp.bad;
+            j.fail = &sp.fail;
             j.cancel = demand ? nullptr : &sp.cancel;
+            if (tdev >= 0) {   // (the tier's bytes are already in the store's layout: a copy, no move-up, keep = null)
+                j.mem = tbase + g.tr[r];
+                j.dst = fin;
+                j.len = g.bytes[r];
+                j.off = 0;
+            } else {
+                const uint64_t off = g.off[r] + (uint64_t) e * g.stride[r];
+                const uint64_t lead = off % os::kDirectAlign;
+                // the aligned read lands the file's byte `off` at dst + lead: dst is fin - lead rounded down to 4096 (its span
+                // spills under 4096 bytes either way into the blob's gaps), the matrix is then moved up to fin
+                uint8_t* dst = (uint8_t*) ((uintptr_t) (fin - lead) & ~(uintptr_t) (os::kDirectAlign - 1));
+                j.fd = pfds_[(size_t) g.file[r]];
+                j.dfd = dfds_[(size_t) g.file[r]];
+                j.off = off;
+                j.dst = dst;
+                j.keep = fin;
+                j.len = g.bytes[r];
+                st_.bytes_read.fetch_add((int64_t) g.bytes[r], std::memory_order_relaxed);
+            }
         }
-        st_.bytes_read.fetch_add((int64_t) (g.bytes[0] + g.bytes[1] + g.bytes[2]), std::memory_order_relaxed);
-        io_->push(jobs, 3, !demand);   // (a guess waits behind every demand read)
+        if (tdev >= 0) tq->push(jobs, 3, !demand);   // (the tier device's own queue: demand at the front, guess at the back)
+        else io_->push(jobs, 3, !demand);            // (a guess waits behind every demand read)
         return s;
     }
     // loading -> ready once its reads are done and whole (lock-free; a failed one is cleaned up by finish / take_slot)
@@ -514,6 +612,9 @@ private:
     void finish(Slot& sp) {   // mu_ held; reads done
         if (sp.state.load() != kLoading) return;
         if (sp.bad.load()) {
+            // a copy out of the tier that RAN and failed: its device refills next start (§9).  A guess the layer moved past is
+            // dropped unread (bad set, fail not): that is the store's own housekeeping and says nothing about the device.
+            if (sp.src_dev >= 0 && sp.fail.load(std::memory_order_acquire) && cfg_.tier_fail) cfg_.tier_fail(sp.src_dev);
             where_[(size_t) sp.layer][(size_t) sp.expert] = -1;
             sp.layer = sp.expert = -1;
             sp.state.store(kFree, std::memory_order_release);

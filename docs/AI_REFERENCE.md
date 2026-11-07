@@ -118,6 +118,19 @@ The [connection registry](../strata_cli/launch/harness.py) supplies these adapte
 Do not mistake printed configuration or an older tested version for a successful check of the current setup.
 See [connection instructions and limits](TERMINAL_LAUNCH.md#connect-your-apps-strata-connect).
 
+## Memory tiers and the expert tier
+
+A model's experts can sit in four places at once: the GPU's cache, a copy in RAM, an optional expert tier on a disk device
+the user gives (`--expert-tier PATH,mib=N[,reserve=M][,verify=header|full]`, repeated once per device, in order), and the
+file tier (the model files themselves). Without an expert tier nothing about the tier applies: every path is byte-identical
+to earlier engines. Setup never adds devices by itself: the user chooses them; setup checks each device (its size must cover
+`mib`), reports whether an existing header will be reused or refilled, and recommends tier capacity only as an option
+when the model would otherwise read much of its experts from the SSD. The first start writes over each device. An agent
+must not pass `--expert-tier-overwrite` unless the user has said the data on that device may be lost: without it, a device
+that holds other data stops the launch, and nothing is written. See [DETAILS.md](DETAILS.md#expert-tier-expert-tier
+opt-in-off-by-default) for the flag and its bytes, and [EXPERT_TIER_PLAN.md](EXPERT_TIER_PLAN.md) for the rules.
+No speed, latency or fill-time number is published for this feature yet: those await the P0-hw measurement gate.
+
 ## Evidence and publishing
 
 - Cite the release, commit and relevant guide behind each compatibility claim.

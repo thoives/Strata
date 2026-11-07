@@ -120,6 +120,7 @@ class LaunchSettings:
     api_key: str | None = None                 # never shown whole; stored only in the private preset file
     no_key: bool = False                       # served beyond this computer without a key, on purpose (--no-api-key); a warning, never a refusal
     extra: dict[str, str] = field(default_factory=dict)    # Advanced: --set key=value (flags and STRATA_* variables)
+    expert_tiers: list[str] = field(default_factory=list)   # --expert-tier: one entry per device, kept in order (§5.1)
     # filled in by the run, kept in the preset
     tuned_preset: str | None = None            # id of the tuning preset the tuner saved
     tuned_at: str | None = None
@@ -146,6 +147,10 @@ class LaunchSettings:
             clean["extra"] = {str(k): str(v) for k, v in clean["extra"].items()}
         else:
             clean.pop("extra", None)
+        if isinstance(clean.get("expert_tiers"), list):
+            clean["expert_tiers"] = [str(v) for v in clean["expert_tiers"]]
+        else:
+            clean.pop("expert_tiers", None)
         return cls(**clean)
 
     def copy(self, **changes: Any) -> "LaunchSettings":

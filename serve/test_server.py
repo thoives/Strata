@@ -2954,12 +2954,44 @@ class CancelledRead(unittest.TestCase):
         self.assertNotIn("chunk", e.last)
         self.assertNotIn("other", e.last)
 
+    def test_parse_done_expert_tier_fields(self):
+        """With a tier the engine appends its own key=value trio after the others (docs/DETAILS.md): the reads the tier
+        answered, their MB and the ms spent copying from them. A tier that answers nothing still prints the three; a
+        run without a tier prints none of them, so the row keeps None."""
+        e = SimpleNamespace()
+        StrataEngine._parse_done(e, "DONE 5 12000 900.0 80.0 stop 3 4 0 7 9 0 0 0.0 12000 2 chunk=1536 "
+                                    "experts_streamed=24576 tier_reads=611 tier_mb=807.3 tier_ms=1234.5")
+        self.assertEqual((e.last["tier_reads"], e.last["tier_mb"], e.last["tier_ms"]), (611, 807.3, 1234.5))
+        self.assertEqual((e.last["chunk"], e.last["experts_streamed"]), (1536, 24576))
+        StrataEngine._parse_done(e, "DONE 5 12000 900.0 80.0 stop 3 4 0 7 9 0 0 0.0 12000 2 1 2 3 4 5 chunk=8192 "
+                                    "experts_streamed=0 tier_reads=0 tier_mb=0.0 tier_ms=0.0")
+        self.assertEqual((e.last["tier_reads"], e.last["tier_mb"], e.last["tier_ms"]), (0, 0.0, 0.0))
+        self.assertEqual((e.last["chunk"], e.last["offloaded"]), (8192, 2))
+        StrataEngine._parse_done(e, "DONE 5 12000 900.0 80.0 stop 3 4 0 7 9 0 0 0.0 12000 2")
+        self.assertNotIn("tier_reads", e.last)   # no tier: the engine printed none, the Monitor shows no number
+        self.assertNotIn("tier_mb", e.last)
+        self.assertNotIn("tier_ms", e.last)
+        StrataEngine._parse_done(e, "DONE 5 12000 900.0 80.0 stop 3 4 0 7 9 0 0 0.0 12000 2 tier_reads=x tier_mb=y")
+        self.assertNotIn("tier_reads", e.last)   # a value that is not a number is skipped, as for chunk
+        self.assertNotIn("tier_mb", e.last)
+
     def test_request_stats_chunk_fields(self):
         """Across a request's continuations the streamed blobs add up; the chunk is the request's own read's."""
         stats = request_stats([{"prompt_ms": 10.0, "chunk": 1536, "experts_streamed": 100},
                                {"prompt_ms": 2.0, "chunk": 64, "experts_streamed": 5}])
         self.assertEqual((stats["chunk"], stats["experts_streamed"], stats["prompt_ms"]), (1536, 105, 12.0))
         self.assertNotIn("chunk", request_stats([{"prompt_ms": 1.0}, {"prompt_ms": 1.0, "chunk": 64}]))
+
+    def test_request_stats_expert_tier_fields(self):
+        """Across a request's continuations the tier's reads, MB and ms add up like the file tier's; with none in
+        every segment the keys stay absent."""
+        stats = request_stats([{"prompt_ms": 10.0, "tier_reads": 100, "tier_mb": 132.5, "tier_ms": 90.0},
+                               {"prompt_ms": 2.0, "tier_reads": 3, "tier_mb": 4.0, "tier_ms": 1.5}])
+        self.assertEqual((stats["tier_reads"], stats["tier_mb"], stats["tier_ms"]), (103, 136.5, 91.5))
+        stats = request_stats([{"prompt_ms": 10.0, "tier_reads": 0, "tier_mb": 0.0, "tier_ms": 0.0},
+                               {"prompt_ms": 2.0, "tier_reads": 0, "tier_mb": 0.0, "tier_ms": 0.0}])
+        self.assertEqual((stats["tier_reads"], stats["tier_mb"], stats["tier_ms"]), (0, 0.0, 0.0))
+        self.assertNotIn("tier_reads", request_stats([{"prompt_ms": 1.0}, {"prompt_ms": 1.0}]))
 
     def test_prompt_tokens_seen(self):
         last = {"finish": "cancel", "reused": 1000, "prompt_read": 2000}

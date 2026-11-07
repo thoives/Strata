@@ -37,6 +37,8 @@
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/expert_source.hpp"
+#include "strata/core/expert_tier.hpp"
+#include "strata/core/expert_tier_plan.hpp"
 #include "strata/core/gguf_expert_source.hpp"
 namespace strata::prefill { void set_nonresident_share(double share); }   // SYCL port: prefill.cpp
 #include "strata/kernels/resident_plan_mirror.hpp"
@@ -565,6 +567,11 @@ struct Options {
     /// trace is what the plan's `h = 0.6447` refers to, and compulsory-miss measured 0.4864 because it fills
     /// with whatever the prompt touched FIRST.  Empty means no profile.
     std::string expert_profile;
+    /// Plan v0.3 D5 (docs/EXPERT_TIER_PLAN.md §5.1): `--expert-tier PATH,mib=N[,reserve=M][,verify=header|full]`,
+    /// repeatable, one entry per host-visible device, in the order given (order is part of the placement, §6.3).
+    /// Empty = no tier: every read path below stays byte-identical to the last release (§15.1). The SYCL mirror
+    /// uses no device registration (§13): the tier's copies go through the host; which is logged per device.
+    std::vector<strata::core::TierSpec> expert_tiers;
     /// #477 (--serve, opt-in): where to save what the adaptive tier learned, as a profile `--expert-profile` reads
     /// (the resident experts first, then the routing counted since the start); on QUIT and every
     /// `expert_profile_save_min` minutes between requests.  Empty (the default): nothing is counted or written.
@@ -927,6 +934,11 @@ void usage() {
                  "                       and measured **2.97%%**.  Per-layer, the same routing gives 21.4%% at 8\n"
                  "                       slots/layer and 70.4%% at 64.  On a native pack, N is still the budget of N\n"
                  "                       largest blobs; each layer's slots are that layer's own blob.\n"
+                 "  --expert-tier PATH,mib=N[,reserve=M][,verify=header|full]  (docs/EXPERT_TIER_PLAN.md §5.1)\n"
+                 "                       one persistent expert tier on a disk device you give; repeatable, one per\n"
+                 "                       device, in order.  The experts VRAM and RAM do not hold are written there once\n"
+                 "                       and read over that device from then on; identity, torn or changed headers refill\n"
+                 "                       (verify=full also checks every chunk on start).  No tier by default.\n"
                  "  --no-host-worker     R2.2: the A/B arm.  By default the HOST THREAD joins the drain, so the\n"
                  "                       pool is six threads on six cores instead of five plus an idle core;\n"
                  "                       this flag restores the five-worker form for comparison on `pool phases`.\n"
@@ -1908,6 +1920,19 @@ int main(int argc, char **argv) try {
         else if (a == "--remote-expert-opt") o.remote_expert_opt = true;
         else if (a == "--expert-cache-remote-placement")
             o.expert_cache_remote_placement = next("--expert-cache-remote-placement");
+        else if (a == "--expert-tier") {
+            // §5.1: PATH,mib=N[,reserve=M][,verify=header|full]. Repeatable, one entry per device; the order is kept.
+            // The grammar is the shared one (include/strata/core/expert_tier_spec.hpp): both engines, setup and strata
+            // launch accept and refuse the same entries. A bad entry is an error, not a guess.
+            const std::string v = next("--expert-tier");
+            strata::core::TierSpec s;
+            std::string why;
+            if (!strata::core::parse_tier_spec(v, s, why)) {
+                std::fprintf(stderr, "strata generate: --expert-tier %s: %s\n", v.c_str(), why.c_str());
+                return 2;
+            }
+            o.expert_tiers.push_back(s);
+        }
         else if (a == "--vram-reserve-mib") { o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib")); o.vram_reserve_given = true; }
         else if (a == "--vram-reserve-later-mib")
             o.vram_reserve_later_mib = std::atoi(next("--vram-reserve-later-mib"));
@@ -4383,6 +4408,7 @@ int main(int argc, char **argv) try {
     // CUDA error left set by the failed `cudaHostRegister` and read later by `gr_read`'s launch check.  See the
     // note in `pinned.cu`.
     strata::core::FileExpertSource src;
+    std::unique_ptr<strata::core::ExpertTierSet> tier_set;   // §8.3: the tier, owned here so it outlives the run
     {   // the card, and whether this build has code for it (a binary built for other GPUs fails at its first kernel
         // otherwise, after the whole expert arena has loaded) - before the arena starts loading
         int dev = 0;
@@ -6780,6 +6806,119 @@ int main(int argc, char **argv) try {
                          ub ? "unbuffered" : "through the file cache", ub == was ? "" : " (changed)", why.c_str());
         }
 #endif
+    }
+    // §8.3 (docs/EXPERT_TIER_PLAN.md): the expert tier, after the RAM copy exists so its bands are known. With no
+    // --expert-tier, nothing below runs; every read path stays byte-identical to the last release (§15.1).
+    if (!o.expert_tiers.empty()) {
+        if (srcp != &src) {   // the arena and GGUF-in-place modes have no file tier to read the blobs from (§4.1/§5.4)
+            std::fprintf(stderr, "strata generate: WARNING: --expert-tier is not used with the expert arena (the tier "
+                                 "reads the model through the file tier); the tier is off for this start\n");
+            o.expert_tiers.clear();
+        } else {
+            // §6.2 identity: "sha:" over EVERY file of the pack (relative path, size, modification time) - a change to any one
+            // file refills, which an aggregate size and newest time could miss.  The profile files are identified by their
+            // own hash below, so they are left out of the pack's.  Order of the devices is part of it (§6.3).
+            strata::core::TierIdentity tid;
+            {
+                std::string perr;
+                // the model files read from outside the pack (a GGUF in place) are part of it too: replacing one refills
+                std::vector<std::string> outside;
+                {
+                    const std::vector<std::string> in_pack = strata::core::tier_pack_files(o.pack);
+                    for (const std::string& f : src.model_files()) {
+                        strata::core::TierFileId fid;
+                        bool inside = false;
+                        if (strata::core::tier_path_id(f, fid))
+                            for (const std::string& q : in_pack) {
+                                strata::core::TierFileId qid;
+                                if (strata::core::tier_path_id(q, qid) && strata::core::tier_same_file(fid, qid)) { inside = true; break; }
+                            }
+                        if (!inside) outside.push_back(f);
+                    }
+                }
+                if (!strata::core::tier_pack_identity(o.pack, {o.expert_profile, o.expert_profile_save}, tid.pack_id, perr, outside)) {
+                    std::fprintf(stderr, "strata generate: expert tier: the model files (%s) cannot be read for the pack "
+                                         "identity (§6.2): %s\n", o.pack.c_str(), perr.c_str());
+                    return 1;
+                }
+            }
+            if (o.expert_profile.empty()) tid.profile_id = "profile:none";
+            else {
+                const std::string ph = strata::core::tier_sha256_file(o.expert_profile);
+                if (ph.empty()) {
+                    std::fprintf(stderr, "strata generate: WARNING: expert tier: --expert-profile %s cannot be read; "
+                                         "the tier will refill every start (§6.2)\n", o.expert_profile.c_str());
+                    tid.profile_id = "profile:unreadable";
+                } else tid.profile_id = "sha:" + ph;
+            }
+            tid.n_layers = g.n_layers;
+            tid.n_expert = g.n_expert;
+            tid.layer_blob_bytes.assign((size_t) g.n_layers, 0);
+            for (int64_t l = 0; l < g.n_layers; ++l) tid.layer_blob_bytes[(size_t) l] = src.blob_bytes(l);
+            auto tset = std::make_unique<strata::core::ExpertTierSet>();
+            bool treuse = false;
+            std::string terr;
+            // §5.4: a device that cannot be opened, mapped or sized stops the start with the reason; nothing
+            // half-opens. The SYCL build registers nothing (§13): the notes say so per device.
+            // §5.4: no device may be - or hold - a file the model is read from: every file of the pack (so a tier is never kept
+            // inside the pack's folder, where it would also change the pack's identity at every fill), the GGUF read in place,
+            // and the expert profiles
+            std::vector<std::string> protect = strata::core::tier_pack_files(o.pack);
+            for (const std::string& f : src.model_files()) protect.push_back(f);
+            protect.push_back(o.expert_profile);
+            protect.push_back(o.expert_profile_save);
+            if (!tset->open(o.expert_tiers, tid, terr, treuse, protect)) {
+                std::fprintf(stderr, "strata generate: expert tier: %s\n", terr.c_str());
+                return 1;
+            }
+            // §4.1: the callers bands. GPU first: every stage's cache and the remote tiers, then the RAM copy.
+            auto gpu_holds = [&](int64_t l, int64_t e) {
+                if (xcache.slot_of(l, e) >= 0) return true;
+                for (auto& st : stages)
+                    if (st->cache.slot_of(l, e) >= 0) return true;
+                for (int r = 0; r < 3; ++r)
+                    if (o.expert_cache_remote[(size_t) r] > 0 && remote_experts[(size_t) r].holds(l, (int32_t) e))
+                        return true;
+                return false;
+            };
+            if (!treuse) {
+                // §4.1: the caller's ranked list, hottest first, minus VRAM (every stage's cache and the remote tiers)
+                // and minus the RAM copy: no expert enters the tier the GPU or RAM already holds (§15.4).
+                const std::vector<std::pair<int32_t, int32_t>>& prof = profile_all.empty() ? profile : profile_all;
+                const std::vector<std::pair<int32_t, int32_t>> ranked_rest = strata::core::tier_ranked_rest(
+                    prof, g.n_layers, g.n_expert,
+                    [&](int64_t l, int64_t e) { return gpu_holds(l, e) || src.has_resident(l, e); });
+                const auto tf0 = std::chrono::steady_clock::now();
+                // §8.4: the fill's reads are load stats, not decode statistics; the RAM budget is untouched (§8.4).
+                if (!tset->fill(src, ranked_rest, tid, terr)) {
+                    std::fprintf(stderr, "strata generate: expert tier: %s\n", terr.c_str());
+                    return 1;
+                }
+                std::fprintf(stderr, "strata generate: expert tier: filled %lld experts (%.2f GiB) in %.1f s\n",
+                             (long long) tset->experts_held(), (double) tset->fill_bytes() / 1073741824.0,
+                             std::chrono::duration<double>(std::chrono::steady_clock::now() - tf0).count());
+            } else
+                std::fprintf(stderr, "strata generate: expert tier: reused, nothing copied (§6.3)\n");
+            // §8.5: one line per device (open already logged them into notes(), registered or not per §13), then the
+            // band counts.
+            for (const auto& note : tset->notes()) std::fprintf(stderr, "strata generate: %s\n", note.c_str());
+            {   // per start: how many experts sit in each band (VRAM, RAM, tiers, file) — §8.5.
+                int64_t vram_n = 0, ram_n = 0, file_n = 0;
+                const int64_t tier_n = tset->experts_held();
+                for (int64_t l = 0; l < g.n_layers; ++l)
+                    for (int64_t e = 0; e < g.n_expert; ++e) {
+                        if (gpu_holds(l, e)) ++vram_n;
+                        else if (src.has_resident(l, e)) ++ram_n;
+                        else if (!tset->has(l, e)) ++file_n;
+                    }
+                std::fprintf(stderr, "strata generate: experts: %lld in the GPU cache, %lld in RAM, %lld in %zu tier "
+                                     "device(s), %lld on the file tier\n",
+                             (long long) vram_n, (long long) ram_n, (long long) tier_n, o.expert_tiers.size(),
+                             (long long) file_n);
+            }
+            src.set_tier(tset.get());   // §8.3: reads take RAM copy, tier, files (§7.1)
+            tier_set = std::move(tset);   // outlives the run; its close flushes a refill mark when the run asked (§6.4)
+        }
     }
     if (o.adapt_async && !src.complement_ready()) adapt_async_off("the resident RAM mode is not running");
     if (o.serve) {
@@ -11023,6 +11162,10 @@ int main(int argc, char **argv) try {
             // CS-T: the RAM and file tiers of this request (the mmap source; 0 with the arena)
             const int64_t ram0 = src.ram_reads(), files0 = src.file_reads();
             const uint64_t file_bytes0 = src.file_read_bytes();
+            // §7.4: the tier's trio for this request, printed only when a tier is open
+            const int64_t tier_reads0 = src.tier_reads();
+            const uint64_t tier_bytes0 = src.tier_read_bytes();
+            const double tier_ms0 = src.tier_ms();
             const int64_t decode_look0 = drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused;
             const int64_t offload0 = drive.d.offload_entries;   // #588
             if (cancelled) finish = "cancel";
@@ -12159,18 +12302,26 @@ int main(int argc, char **argv) try {
             //                    not in [lookups])
             //      [lookup-chain accepted] [lookup-chain offered] [suffix accepted] [suffix offered] [windows]
             //      (only with --lookup-chain)
+            //      tier_reads=<reads> tier_mb=<MB> tier_ms=<ms>   (key=value, last: only with a tier, the blob reads this
+            //      request's answered from the tier, their bytes, and the ms spent copying from it; a tier pointer lookup
+            //      adds a read and bytes and no seconds, and counts in neither the RAM nor the file fields)
             char chain_txt[128] = "";
             if (o.lookup_chain > 0)
                 std::snprintf(chain_txt, sizeof(chain_txt), " %lld %lld %lld %lld %lld", (long long) chain_ok,
                               (long long) chain_drafts, (long long) sfx_ok, (long long) sfx_drafts, (long long) dec_windows);
+            char tier_txt[128] = "";   // §7.4: empty with no tier, so DONE is as before for a run without one
+            if (tier_set)
+                std::snprintf(tier_txt, sizeof tier_txt, " tier_reads=%lld tier_mb=%.1f tier_ms=%.1f",
+                              (long long) (src.tier_reads() - tier_reads0),
+                              (double) (src.tier_read_bytes() - tier_bytes0) / 1e6, src.tier_ms() - tier_ms0);
             if (yielded_at >= 0) std::printf("YIELDED %d %lld\n", yielded_slot, (long long) yielded_at);
-            std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld %lld %lld %.1f %lld %lld%s\n",
+            std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld %lld %lld %.1f %lld %lld%s%s\n",
                         (long long) produced_n,
                         (long long) n, prompt_ms, decode_ms, finish, (long long) draft_accepted, (long long) draft_offered,
                         (long long) resume, (long long) req_hits, (long long) req_look,
                         (long long) (src.ram_reads() - ram0), (long long) (src.file_reads() - files0),
                         (double) (src.file_read_bytes() - file_bytes0) / 1e6, (long long) read_n,
-                        (long long) req_offload, chain_txt);
+                        (long long) req_offload, chain_txt, tier_txt);
             std::fflush(stdout);
             if (admit_slot >= 0) {   // --batch: BADM <slot> <1 = continues in the batch windows | 0 = done>
                 bool cont = !cancelled && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
@@ -12260,11 +12411,17 @@ int main(int argc, char **argv) try {
                              (unsigned long long)src.rotated_exchanges(),
                              (unsigned long long)src.avoided_exchange_copy_bytes());
             // CS-T: the tiers, cumulative - GPU cache hits (the decode lookups above), RAM copy, files (SSD / OS cache)
-            if (srcp == &src)
+            if (srcp == &src) {
+                char tier_note[192] = "";   // §7.4: since the start, appended after the existing figures
+                if (tier_set)
+                    std::snprintf(tier_note, sizeof tier_note, "; tier %lld reads, %.1f MB, %.1f ms copied from the tier"
+                                  " (a tier pointer read is not timed)", (long long) src.tier_reads(),
+                                  (double) src.tier_read_bytes() / 1e6, src.tier_ms());
                 std::fprintf(stderr, "strata serve: expert tiers: GPU %lld hits this request; since the start RAM %lld blobs, files %lld blobs "
-                                     "%.1f MB read%s\n", (long long) req_hits, (long long) src.ram_reads(),
+                                     "%.1f MB read%s%s\n", (long long) req_hits, (long long) src.ram_reads(),
                              (long long) src.file_reads(), (double) src.file_read_bytes() / 1e6,
-                             src.gguf_mode() ? " (the GGUF in place)" : "");
+                             src.gguf_mode() ? " (the GGUF in place)" : "", tier_note);
+            }
             // STRATA_SPLIT_TIMING: where each verify stage's host time went, cumulative per window since the start
             // (waiting for its GPU to ring a layer, the CPU pool and plan per layer, staging the window)
             if (static const bool st_timing = std::getenv("STRATA_SPLIT_TIMING") != nullptr; st_timing)
@@ -12807,6 +12964,10 @@ int main(int argc, char **argv) try {
         const int64_t files0 = src.file_reads(), ram0 = src.ram_reads();
         const uint64_t fbytes0 = src.file_blob_bytes(), fall0 = src.file_read_bytes();
         const double fms0 = src.file_ms();
+        // §7.4: the tier's trio since the decode began, printed only when a tier is open
+        const int64_t tiers0 = src.tier_reads();
+        const uint64_t tbytes0 = src.tier_read_bytes();
+        const double tms0 = src.tier_ms();
         if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
         int64_t swaps_total = 0;
         double ms_adapt = 0;
@@ -13273,12 +13434,19 @@ int main(int argc, char **argv) try {
             }
         if (srcp == &src) {  // CS-T: the RAM and file tiers (the GPU cache's share is the hit rate above)
             const double fms = src.file_ms() - fms0, fmb = (double) (src.file_blob_bytes() - fbytes0) / 1e6;
+            char tier_note[256] = "";   // §7.4: the tier's segment, appended after the figures every published run quotes
+            if (tier_set)   // empty with no tier, so the line stays byte-identical to the port's last release
+                std::snprintf(tier_note, sizeof tier_note, "; tier %lld reads, %.1f MB (%.2f MB/round, %.1f ms/round of "
+                              "copies from the tier; a tier pointer read adds a read and bytes, no seconds)",
+                              (long long) (src.tier_reads() - tiers0), (double) (src.tier_read_bytes() - tbytes0) / 1e6,
+                              rounds > 0 ? (double) (src.tier_read_bytes() - tbytes0) / 1e6 / rounds : 0.0,
+                              rounds > 0 ? (src.tier_ms() - tms0) / rounds : 0.0);
             std::printf("%-24s decode: RAM %lld blobs, files %lld blobs, %.1f MB read from the files (%.2f MB/round, "
-                        "%.1f ms/round of reading, %.2f GB/s per reading thread)%s; prompt copies %.1f MB\n",
+                        "%.1f ms/round of reading, %.2f GB/s per reading thread)%s; prompt copies %.1f MB%s\n",
                         "expert tiers", (long long) (src.ram_reads() - ram0), (long long) (src.file_reads() - files0),
                         fmb, rounds > 0 ? fmb / rounds : 0.0, rounds > 0 ? fms / rounds : 0.0,
                         fms > 0 ? fmb / fms : 0.0, src.gguf_mode() ? " (the GGUF in place)" : "",
-                        (double) (fall0 - fbytes0) / 1e6);
+                        (double) (fall0 - fbytes0) / 1e6, tier_note);
             if (drive.d.lookahead != nullptr)
                 std::printf("%-24s %lld experts warmed, %lld of the file tier's %lld blob reads had been warmed (%.1f%%); "
                             "predictor %.1f ms/round on its thread, %lld layers skipped (still busy)\n", "routing prefetch",

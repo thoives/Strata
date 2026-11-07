@@ -154,6 +154,37 @@ class Fit(unittest.TestCase):
         self.assertEqual(o["options"][0]["cards"], [0, 1, 2, 3])
         self.assertTrue(o["options"][0]["recommended"])
 
+    def test_the_fit_without_a_tier_is_the_plan_before(self):
+        """§11 (docs/EXPERT_TIER_DSV41_PLAN.md): with no --expert-tier the fit answers exactly as it did: no tier key, no tier line."""
+        p = dsv41_fit.plan(FOUR, 64.0, None, model="IST-DAS-2.00bpw")
+        self.assertNotIn("tier", p)
+        self.assertFalse(any(l.startswith("Expert tier") for l in p["lines"]))
+
+    def test_the_fit_with_tiers_says_the_slots_it_gives_and_needs(self):
+        """§11: the tier adds one term: a device's capacity is counted in whole slots (§6.2), the experts VRAM and the store's
+        guard slots leave over are what it must hold; a device too small for one expert holds nothing."""
+        one12 = [{"index": 0, "name": "AMD Radeon RX 3060 (12 GB)", "vram_gb": 12.0, "vendor": "amd"}]
+        p = dsv41_fit.plan(one12, 40.0, None, model="IST-DAS-2.00bpw",
+                           expert_tiers=[{"path": "/mnt/big/tier0.bin", "mib": 81920, "reserve_mib": 0}])
+        t = p["tier"]
+        self.assertGreater(t["slots_needed"], t["slots_given"])      # 80 GB of tier: this PC's leftovers are bigger
+        self.assertFalse(t["covers"])
+        self.assertTrue(any(l.startswith("Expert tier") for l in p["lines"]))
+        self.assertTrue(any("expert tier" in w and "read from the SSD" in w for w in p["warnings"]))
+        big = dsv41_fit.plan(one12, 40.0, None, model="IST-DAS-2.00bpw",
+                             expert_tiers=[{"path": "/mnt/big/tier0.bin", "mib": 160 * 1024, "reserve_mib": 0}])
+        self.assertTrue(big["tier"]["covers"])                    # 160 GB holds every expert the card and RAM leave over
+        self.assertFalse(any("expert tier" in w for w in big["warnings"]))
+        slot = dsv41_fit.slot_bytes()                             # one expert plus the store's two gaps, rounded to 4 KiB
+        self.assertEqual(dsv41_fit.tier_fit([], 0, 0)["slots_given"], 0)                       # no device: the tier holds nothing
+        self.assertEqual(dsv41_fit.tier_fit([slot - 1], 0, 0)["slots_given"], 0)               # under one slot: nothing
+        self.assertEqual(dsv41_fit.tier_fit([2 * slot + 7, 0], 0, 0)["slots_given"], 2)        # whole slots only
+        # an IST-DAS expert is smaller than Unsloth's MXFP4 one, so its slots are: the fit counts in the set's own slot.
+        ista = dsv41_fit.plan(one12, 40.0, None, model="IST-DAS-2.00bpw", expert_tiers=[{"path": "/x", "mib": 1024, "reserve_mib": 0}])["tier"]
+        ud = dsv41_fit.plan(one12, 40.0, None, expert_tiers=[{"path": "/x", "mib": 1024, "reserve_mib": 0}])["tier"]
+        self.assertGreater(ista["slots_given"], ud["slots_given"])   # an IST-DAS expert is smaller: more slots per GB
+        self.assertEqual(dsv41_fit.tier_fit([(64 << 20, "/path travels with the capacity")], 0, 0)["slots_given"], (64 << 20) // slot)
+
 
 class Install(unittest.TestCase):
     def setUp(self):
@@ -163,6 +194,7 @@ class Install(unittest.TestCase):
         self.calls = []
         self.github_up = True
         self.cfg = {}
+        self.explicit = []
         self.exe = self.root / "engine" / ("strata-dsv41.exe" if setup.WIN else "strata-dsv41")
         eng = self.root / "engine"
 
@@ -173,6 +205,7 @@ class Install(unittest.TestCase):
 
         def write_cfg(path, cfg, source=None, explicit=None):
             self.cfg = cfg
+            self.explicit = explicit or []        # the user-args channel (explicit_args): --expert-tier, one flag per device, in order
             self.calls.append(("config", path.name))
 
         patches = [mock.patch.object(setup, "download", lambda url, dst, what=None: self.calls.append(("get", url, dst))),
@@ -261,6 +294,123 @@ class Install(unittest.TestCase):
         rc, out = self.install(gguf_dir=str(own))
         self.assertEqual(rc, 1, out)
         self.assertIn("00004-of-00009.gguf is missing", out)
+
+    def test_no_expert_tier_by_default(self):
+        """§12.7 (docs/EXPERT_TIER_DSV41_PLAN.md §11): with no --expert-tier the install is byte-identical: no flag in the
+        config's args or in the user-args channel, and the fit says no tier line."""
+        rc, out = self.install()
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("--expert-tier", self.cfg["args"])
+        self.assertNotIn("--expert-tier", self.explicit)
+        self.assertNotIn("--ssd-cache", self.cfg["args"])           # the RAM store keeps sizing itself: the default is not touched
+        self.assertFalse(any(l.startswith("Expert tier") for l in out.splitlines()))
+
+    def test_expert_tier_flags_kept_in_order(self):
+        """§5.1/§12.7: one --expert-tier per device, kept whole and in the order the person gave them (the user-args
+        channel, explicit_args); the fit's tier term says what the devices hold against the experts the card and RAM leave
+        over (here: 60 GB of tier against 64 GB of RAM: it cannot cover them all, and says so)."""
+        t1, t2 = str(self.root / "tier1.bin"), str(self.root / "tier2.bin")
+        rc, out = self.install(ram=64.0, _expert_tiers=[
+            (f"{t2},mib=40960,verify=full", (t2, 40960, 0, "full")),     # the order typed: device 2 first
+            (f"{t1},mib=20480", (t1, 20480, 0, None))])
+        self.assertEqual(rc, 0, out)
+        pos = [i for i, x in enumerate(self.explicit) if x == "--expert-tier"]
+        self.assertEqual(len(pos), 2)
+        self.assertEqual([self.explicit[i + 1] for i in pos], [f"{t2},mib=40960,verify=full", f"{t1},mib=20480"])
+        self.assertIn("Expert tier:", out)
+        self.assertIn("the expert tier holds", out)   # the partial-coverage warning (§11: setup reports the coverage)
+
+    def test_expert_tier_setup_writes_the_store_size_the_engine_needs(self):
+        """The engine plans the tier against the RAM store's guaranteed slots and refuses the store's auto size, so a setup that
+        writes --expert-tier writes --ssd-cache too, from the fit; the config is then what the engine accepts at its start
+        (setup -> run config -> serve/server.py engine_args() -> the argv): tier devices in order, and a store size above zero."""
+        from serve.server import engine_args
+        t1, t2 = str(self.root / "tier1.bin"), str(self.root / "tier2.bin")
+        rc, out = self.install(ram=64.0, _expert_tiers=[(f"{t2},mib=40960", (t2, 40960, 0, False)),
+                                                        (f"{t1},mib=20480,reserve=1024", (t1, 20480, 1024, False))])
+        self.assertEqual(rc, 0, out)
+        a = self.cfg["args"]
+        self.assertIn("--ssd-cache", a)
+        gb = int(a[a.index("--ssd-cache") + 1])
+        self.assertGreaterEqual(gb, dsv41_fit.TIER_STORE_MIN_GB)
+        self.assertLessEqual(gb, 64 - dsv41_fit.REST_RAM_GB)                       # never more than the RAM leaves beside the system
+        self.assertEqual(a.count("--ssd-cache"), 1)
+        # the same number the fit counted as the store's guard (the tier lines and the argument agree)
+        base = dsv41_fit.plan(FOUR, 64.0, None, 8192, model="UD-Q8_K_XL", named=True)
+        self.assertEqual(dsv41_fit.tier_store_gb(base)[0], gb)
+        cfg = {**self.cfg, "user_args": list(self.explicit)}
+        argv = engine_args(cfg)
+        tiers = [argv[i + 1] for i, x in enumerate(argv) if x == "--expert-tier"]
+        self.assertEqual(tiers, [f"{t2},mib=40960", f"{t1},mib=20480,reserve=1024"])
+        self.assertEqual(argv[argv.index("--ssd-cache") + 1], str(gb))
+        for raw in tiers:                                                           # each entry is one the engine's parser takes
+            self.assertIsNotNone(setup.parse_expert_tier(raw)[0], raw)
+
+    def test_a_person_s_own_store_size_wins_over_the_one_setup_chose(self):
+        from serve.server import engine_args
+        t1 = str(self.root / "tier1.bin")
+        rc, out = self.install(ram=64.0, _expert_tiers=[(f"{t1},mib=20480", (t1, 20480, 0, False))])
+        self.assertEqual(rc, 0, out)
+        argv = engine_args({**self.cfg, "user_args": [*self.explicit, "--ssd-cache", "20"]})
+        self.assertEqual(argv.count("--ssd-cache"), 1)
+        self.assertEqual(argv[argv.index("--ssd-cache") + 1], "20")
+
+    def test_setup_run_again_without_the_flag_keeps_the_tier_and_its_store_size(self):
+        """A tier given once lives on in the config's user_args.  Setup run again WITHOUT --expert-tier (another context, a
+        repair) must still write the store size the engine needs for it: the effective tiers are the carried ones.  The final
+        argv (setup's config -> serve/server.py engine_args()) has both devices in order and one --ssd-cache."""
+        import json
+        from serve.server import engine_args
+        t1, t2 = self.root / "tier1.bin", self.root / "tier2.bin"
+        for t in (t1, t2):
+            with open(t, "wb") as fh:
+                fh.truncate(2 << 30)
+        first = [(f"{t2},mib=2048", (str(t2), 2048, 0, False)), (f"{t1},mib=1024,reserve=8", (str(t1), 1024, 8, False))]
+        rc, out = self.install(ram=64.0, _expert_tiers=first)
+        self.assertEqual(rc, 0, out)
+        name = [c[1] for c in self.calls if c[0] == "config"][-1]
+        old = dict(self.cfg)                              # what write_setup_config makes of it: the tiers in user_args
+        setup.carry_user_args({}, old, self.explicit)
+        setup.user_args.stamp(old)
+        (self.root / name).write_text(json.dumps(old))
+        gb_first = old["args"][old["args"].index("--ssd-cache") + 1]
+        self.calls.clear()
+        rc, out = self.install(ram=64.0)                  # no --expert-tier this time
+        self.assertEqual(rc, 0, out)
+        self.assertIn("kept from the earlier settings", out)
+        a = self.cfg["args"]
+        self.assertIn("--ssd-cache", a)                   # the store size is written although this run named no tier
+        self.assertEqual(a[a.index("--ssd-cache") + 1], gb_first)
+        final = dict(self.cfg)
+        setup.carry_user_args(json.loads((self.root / name).read_text()), final, self.explicit)
+        argv = engine_args(final)
+        self.assertEqual([argv[i + 1] for i, x in enumerate(argv) if x == "--expert-tier"], [f"{t2},mib=2048", f"{t1},mib=1024,reserve=8"])
+        self.assertEqual(argv.count("--ssd-cache"), 1)
+        # the carried device is gone: setup says so before anything is downloaded
+        t1.unlink()
+        self.calls.clear()
+        rc, out = self.install(ram=64.0)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("the expert tier in the earlier settings", out)
+        self.assertFalse([c for c in self.calls if c[0] in ("get", "run", "config")])
+
+    def test_an_expert_tier_with_no_room_for_a_store_is_refused_before_anything_is_downloaded(self):
+        t1 = str(self.root / "tier1.bin")
+        rc, out = self.install(ram=12.0, _expert_tiers=[(f"{t1},mib=20480", (t1, 20480, 0, False))])
+        self.assertEqual(rc, 1, out)
+        self.assertIn("expert tier cannot be used here", out)
+        self.assertIn("--expert-tier", out)                                         # says what to do: leave it out / free RAM
+        self.assertFalse([c for c in self.calls if c[0] in ("get", "run", "config")])
+
+    def test_the_mac_and_an_all_cards_fit_have_no_tier_to_plan(self):
+        card = [{"index": 0, "name": "Apple M5 Max", "vram_gb": 96.0, "vendor": "apple"}]
+        gb, why = dsv41_fit.tier_store_gb(dsv41_fit.plan(card, 128.0, None, 8192, model="IST-DAS-2.00bpw"))
+        self.assertTrue(gb is None or gb >= dsv41_fit.TIER_STORE_MIN_GB, (gb, why))
+        self.assertIsNone(dsv41_fit.tier_store_gb({"mac": True, "ram_gb": 128.0, "cpu_experts_gb": 100.0})[0])
+        self.assertIsNone(dsv41_fit.tier_store_gb({"ram_gb": None, "cpu_experts_gb": 100.0})[0])
+        self.assertIsNone(dsv41_fit.tier_store_gb({"ram_gb": 64.0, "cpu_experts_gb": 0.0})[0])
+        self.assertEqual(dsv41_fit.tier_store_gb({"ram_gb": 64.0, "cpu_experts_gb": 20.5})[0], 20)   # the CPU lane's share, whole GB
+        self.assertEqual(dsv41_fit.tier_store_gb({"ram_gb": 30.0, "cpu_experts_gb": 100.0})[0], 21)  # the RAM left beside REST_RAM_GB
 
     def test_the_repository_layout_is_found(self):
         own = self.root / "repo"
