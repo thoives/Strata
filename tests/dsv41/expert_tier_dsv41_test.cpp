@@ -27,6 +27,9 @@ namespace os = strata::ds4::os;
 using strata::ds4::ExpertStore;
 using strata::ds4::TierSpec;
 using strata::ds4::ExpertTierSet;
+using strata::ds4::TierLayerGeo;
+using strata::ds4::TierGeoShape;
+using strata::ds4::ds4_geometry_text;
 
 static int fails = 0;
 #define CHECK(c)                                                                     \
@@ -72,6 +75,55 @@ static std::vector<ExpertStore::LayerGeo> make_geo() {
         gl.blob = BLOB;
     }
     return g;
+}
+
+// §7.1's geometry, as plain values: a GGUF layer (MXFP4: its matrices read in place, region_* left empty as a GGUF layer
+// leaves them - the input that crashed init_tier before the identity was layout-aware) and an EXL3 layer (regions and pieces).
+// The down matrix sits in the pack's second file, so the file list matters.
+static TierLayerGeo mx_geo(int il) {
+    TierLayerGeo t;
+    t.il = il;
+    t.layout = TierLayerGeo::kMxFp4;
+    t.n_exp = NE;
+    t.fmt = 2;   // gg::kFmtMXFP4
+    t.blob = BLOB;
+    for (int r = 0; r < 3; ++r) {
+        t.file[r] = r == 2 ? 1 : 0;
+        t.off[r] = (uint64_t) (il * 3 + r) * ROLE_B;
+        t.stride[r] = MB4;
+        t.bytes[r] = MB4;
+        t.tr[r] = (uint64_t) r * (MB4 + 8192);
+        t.type[r] = r == 2 ? 14 : 12;
+    }
+    return t;
+}
+static TierLayerGeo region_geo(int il) {
+    TierLayerGeo t;
+    t.il = il;
+    t.layout = TierLayerGeo::kRegion;
+    t.n_exp = 2;
+    t.blob = 1024;
+    for (int e = 0; e < 2; ++e) {
+        t.region_file.push_back(e);
+        t.region_off.push_back(4096ull * (uint64_t) (e + 1));
+        t.region_bytes.push_back(512);
+    }
+    for (int r = 0; r < 3; ++r) {
+        t.type[r] = 3;   // EXL3 bits
+        for (int q = 0; q < 3; ++q) {
+            t.piece_src[r][q] = (uint64_t) (r * 3 + q) * 48;
+            t.piece_bytes[r][q] = 48;
+            t.piece_dst[r][q] = (uint64_t) (r * 3 + q) * 96;
+        }
+    }
+    return t;
+}
+static TierGeoShape geo_shape() {
+    TierGeoShape s;
+    s.dim = 64;
+    s.ff = 32;
+    s.nl = 3;
+    return s;
 }
 
 // Flip one byte of a file (a torn header, a corrupt table byte, a data byte past its chunk crc)
@@ -697,6 +749,188 @@ int main() {
         CHECK(seen.load() > 0);    // (the lookups answered once the fill was published)
         CHECK(wrong.load() == 0);  // (and every byte they saw was the file's)
         t->close();
+    }
+
+    // ---- §7.1 (geometry): the identity's text from either layout. A GGUF layer with empty region_* is described without a crash;
+    // identical geometry gives identical text; a change to a byte's source, its reading, its slot place or the slot layout changes
+    // it; the file list's order does not; a layer that cannot be described in full is refused, with no text ----
+    {
+        const std::vector<std::string> files = {"shard-00001.gguf", "shard-00002.gguf"};
+        const TierGeoShape shape = geo_shape();
+        std::string text, text2, text3, rtext, gerr;
+        const std::vector<TierLayerGeo> mx = {mx_geo(0), mx_geo(1), mx_geo(2)};
+        CHECK(mx[1].region_file.empty() && mx[1].region_off.empty() && mx[1].region_bytes.empty());   // (a GGUF layer: no regions)
+        CHECK(ds4_geometry_text(mx, files, shape, text, gerr) && !text.empty());
+        CHECK(text.rfind("strata-ds4-geometry 1\n", 0) == 0);   // (the format's version leads the text)
+        CHECK(ds4_geometry_text(mx, files, shape, text2, gerr) && text2 == text);   // (identical geometry: identical text)
+        // one change at a time: each must change the text (a changed mutation that is refused would not be a change, so it counts as no)
+        auto mut = [&](auto f) {
+            std::vector<TierLayerGeo> m = mx;
+            f(m);
+            std::string t, e;
+            return ds4_geometry_text(m, files, shape, t, e) && t != text;
+        };
+        CHECK(mut([](auto& m) { m[1].off[2] += 1; }));          // a source offset
+        CHECK(mut([](auto& m) { m[0].stride[1] = 8192; }));     // a stride (still >= the matrix's bytes)
+        CHECK(mut([](auto& m) { m[2].bytes[0] = 2048; }));      // a matrix's bytes
+        CHECK(mut([](auto& m) { m[0].type[2] = 13; }));         // a type: the same bytes, read as another type
+        CHECK(mut([](auto& m) { m[1].tr[0] = 4096; }));         // its place in the slot (no overlap with the others)
+        CHECK(mut([](auto& m) { m[1].blob = 40960; }));         // the slot's blob
+        CHECK(mut([](auto& m) { m[0].fmt = 3; }));              // the expert format
+        CHECK(mut([](auto& m) { m[0].il = 7; }));               // the layer
+        CHECK(mut([](auto& m) { m[0].n_exp = 5; }));            // the expert count
+        CHECK(mut([](auto& m) { m[2].file[2] = 0; }));          // the file a matrix is read from
+        // the file list: the same files listed the other way, with the indices swapped, is the same geometry
+        std::vector<TierLayerGeo> sw = mx;
+        for (auto& l : sw)
+            for (int r = 0; r < 3; ++r) l.file[r] = 1 - l.file[r];
+        CHECK(ds4_geometry_text(sw, {files[1], files[0]}, shape, text3, gerr) && text3 == text);
+        // a file's name, and the model's shape or slot layout, change it
+        CHECK(ds4_geometry_text(mx, {files[0], "shard-00009.gguf"}, shape, text3, gerr) && text3 != text);
+        for (int k = 0; k < 4; ++k) {
+            TierGeoShape s2 = shape;
+            if (k == 0) s2.dim = 65;
+            if (k == 1) s2.ff = 33;
+            if (k == 2) s2.nl = 4;
+            if (k == 3) s2.slot_layout = 2;
+            CHECK(ds4_geometry_text(mx, files, s2, text3, gerr) && text3 != text);
+        }
+        // the EXL3 layout, alone and beside a GGUF layer (a pack of both)
+        const std::vector<TierLayerGeo> rg = {region_geo(4)};
+        CHECK(ds4_geometry_text(rg, files, shape, rtext, gerr) && !rtext.empty() && rtext != text);
+        auto rmut = [&](auto f) {
+            std::vector<TierLayerGeo> m = rg;
+            f(m);
+            std::string t, e;
+            return ds4_geometry_text(m, files, shape, t, e) && t != rtext;
+        };
+        CHECK(rmut([](auto& m) { m[0].region_off[1] += 16; }));     // a region's offset
+        CHECK(rmut([](auto& m) { m[0].region_bytes[0] += 8; }));    // a region's bytes
+        CHECK(rmut([](auto& m) { m[0].region_file[1] = 0; }));      // a region's file
+        CHECK(rmut([](auto& m) { m[0].piece_src[1][2] += 8; }));    // a piece's place in the region
+        CHECK(rmut([](auto& m) { m[0].piece_dst[0][1] = 48; }));    // a piece's place in the slot
+        CHECK(rmut([](auto& m) { m[0].piece_bytes[2][2] = 40; }));  // a piece's size
+        CHECK(rmut([](auto& m) { m[0].type[1] = 4; }));             // a matrix's bits
+        CHECK(rmut([](auto& m) { m[0].blob = 2048; }));             // the slot's blob
+        const std::vector<TierLayerGeo> both = {mx_geo(0), region_geo(1)};
+        CHECK(ds4_geometry_text(both, files, shape, text3, gerr) && text3 != text && text3 != rtext);
+
+        // refusals: an error and no text.  An identity is never made from a geometry the engine cannot read in full.
+        auto refuse = [&](const std::vector<TierLayerGeo>& m, const std::vector<std::string>& fl, const TierGeoShape& sh, const char* must) {
+            std::string t, e;
+            return !ds4_geometry_text(m, fl, sh, t, e) && t.empty() && !e.empty() && e.find(must) != std::string::npos;
+        };
+        auto with = [](std::vector<TierLayerGeo> m, auto f) {   // (a copy of m with f applied to its layers)
+            f(m);
+            return m;
+        };
+        // the input that crashed before: an EXL3 layer whose regions are missing (an empty array, not a field to read)
+        CHECK(refuse(with(rg, [](auto& m) { m[0].region_file.clear(); m[0].region_off.clear(); m[0].region_bytes.clear(); }), files, shape,
+                     "incomplete"));
+        CHECK(refuse(with(rg, [](auto& m) { m[0].region_off.pop_back(); }), files, shape, "incomplete"));
+        CHECK(refuse(with(rg, [](auto& m) { m[0].region_file[0] = 5; }), files, shape, "no file in the pack"));
+        CHECK(refuse(with(rg, [](auto& m) { m[0].region_bytes[1] = 0; }), files, shape, "no bytes"));
+        CHECK(refuse(with(rg, [](auto& m) { m[0].piece_src[0][0] = 500; }), files, shape, "outside its region"));
+        CHECK(refuse(with(rg, [](auto& m) { m[0].piece_dst[2][2] = 1000; }), files, shape, "does not fit"));
+        CHECK(refuse(with(rg, [](auto& m) { m[0].piece_dst[0][1] = 0; }), files, shape, "two pieces overlap"));
+        CHECK(refuse(with(rg, [](auto& m) { m[0].piece_bytes[0][0] = 0; }), files, shape, "no bytes"));
+        CHECK(refuse(with(rg, [](auto& m) { m[0].type[1] = 0; }), files, shape, "EXL3 bits"));
+        CHECK(refuse(with(mx, [](auto& m) { m[0].file[1] = -1; }), files, shape, "no file in the pack"));
+        CHECK(refuse(with(mx, [](auto& m) { m[0].file[1] = 2; }), files, shape, "no file in the pack"));
+        CHECK(refuse(with(mx, [](auto& m) { m[0].bytes[0] = 0; }), files, shape, "no bytes"));
+        CHECK(refuse(with(mx, [](auto& m) { m[0].type[0] = 0; }), files, shape, "no type"));
+        CHECK(refuse(with(mx, [](auto& m) { m[0].tr[2] = 25000; }), files, shape, "does not fit"));
+        CHECK(refuse(with(mx, [](auto& m) { m[0].tr[1] = 0; }), files, shape, "overlap in the blob"));
+        CHECK(refuse(with(mx, [](auto& m) { m[0].stride[0] = 1024; }), files, shape, "overlaps the next expert"));
+        CHECK(refuse(with(mx, [](auto& m) { m[0].blob = 0; }), files, shape, "no size"));
+        CHECK(refuse(with(mx, [](auto& m) { m[0].n_exp = 0; }), files, shape, "no routed experts"));
+        CHECK(refuse(with(mx, [](auto& m) { m[0].il = -1; }), files, shape, "no index"));
+        CHECK(refuse(with(mx, [](auto& m) { m[0].layout = TierLayerGeo::kNone; }), files, shape, "no expert layout was recorded"));
+        CHECK(refuse(with(mx, [](auto& m) { m[0].layout = 9; }), files, shape, "not one the tier knows"));
+        CHECK(refuse({}, files, shape, "no layer"));
+        CHECK(refuse(mx, {}, shape, "no model files"));
+        CHECK(refuse(mx, {"shard 1.gguf", "shard-00002.gguf"}, shape, "cannot be written"));
+        TierGeoShape nodim = shape;
+        nodim.ff = 0;
+        CHECK(refuse(mx, files, nodim, "dimensions"));
+        // (a rejected geometry leaves no half-written text behind either)
+        std::string left = "untouched";
+        CHECK(!ds4_geometry_text({}, files, shape, left, gerr) && left.empty());
+    }
+
+    // ---- §7.1 with §5 and §9: the identity made from the geometry decides reuse or refill of the placement, as init_tier makes
+    // it (the geometry's digest is part of the pack id).  The same geometry reuses; a changed stride or type refills, and a refilled
+    // tier is reused by the next start ----
+    {
+        World w(base, "geo", false);   // (its shards: shard.gguf and, for the down matrix, shard-b.gguf: temp files only)
+        const std::vector<std::string> names = {"shard.gguf", "shard-b.gguf"};
+        const TierGeoShape shape = geo_shape();
+        {
+            std::FILE* fb = std::fopen((w.dir / "shard-b.gguf").string().c_str(), "wb");
+            std::fputs("down-shard", fb);
+            std::fclose(fb);
+        }
+        auto id_of = [&](const std::vector<TierLayerGeo>& g, std::string& id) {
+            std::string text, e;
+            if (!ds4_geometry_text(g, names, shape, text, e)) return false;
+            return strata::ds4::ds4_pack_identity(w.dir.string(), names, strata::core::tier_sha256_hex((const uint8_t*) text.data(), text.size()), id, e);
+        };
+        std::vector<TierLayerGeo> lg = {mx_geo(0), mx_geo(1), mx_geo(2)};
+        std::vector<TierLayerGeo> lgStride = lg;
+        lgStride[1].stride[0] = 8192;   // (a stride: the same files, the bytes read from elsewhere)
+        std::vector<TierLayerGeo> lgType = lg;
+        lgType[0].type[2] = 13;         // (a type: the same bytes, read as another type)
+        std::string idA, idB, idC, err;
+        CHECK(id_of(lg, idA) && idA.compare(0, 4, "sha:") == 0);
+        CHECK(id_of(lgStride, idB) && idB != idA);
+        CHECK(id_of(lgType, idC) && idC != idA && idC != idB);
+        // the first start: nothing on the devices, so the tier is filled
+        bool reused = false;
+        {
+            auto t = std::make_unique<ExpertTierSet>();
+            CHECK(t->open(w.specs, err));
+            tier_hooks(w, t);
+            CHECK(t->decide(SLOT, 2, 4, NL, NE, idA, profA, false, ranked, reused, why, notes));
+            CHECK(!reused);
+            ExpertTierSet::Fill f{};
+            CHECK(do_fill(w, t.get(), f));
+            CHECK(t->readable() && f.placed == (int64_t) ranked.size());
+            t->close();
+        }
+        // the next start, the same geometry: the placement is reused and nothing is copied
+        {
+            auto t = std::make_unique<ExpertTierSet>();
+            CHECK(t->open(w.specs, err));
+            CHECK(t->decide(SLOT, 2, 4, NL, NE, idA, profA, false, ranked, reused, why, notes));
+            CHECK(reused);
+            t->close();
+        }
+        // a changed stride: another pack id, so the start refills; the refill completes and the next start reuses it
+        {
+            auto t = std::make_unique<ExpertTierSet>();
+            CHECK(t->open(w.specs, err));
+            CHECK(t->decide(SLOT, 2, 4, NL, NE, idB, profA, false, ranked, reused, why, notes));
+            CHECK(!reused && why.find("different pack") != std::string::npos);
+            tier_hooks(w, t);
+            ExpertTierSet::Fill f{};
+            CHECK(do_fill(w, t.get(), f));
+            t->close();
+        }
+        {
+            auto t = std::make_unique<ExpertTierSet>();
+            CHECK(t->open(w.specs, err));
+            CHECK(t->decide(SLOT, 2, 4, NL, NE, idB, profA, false, ranked, reused, why, notes));
+            CHECK(reused);
+            t->close();
+        }
+        // a changed type alone (the same bytes): refills too
+        {
+            auto t = std::make_unique<ExpertTierSet>();
+            CHECK(t->open(w.specs, err));
+            CHECK(t->decide(SLOT, 2, 4, NL, NE, idC, profA, false, ranked, reused, why, notes));
+            CHECK(!reused && why.find("different pack") != std::string::npos);
+            t->close();
+        }
     }
 
     fs::remove_all(base);

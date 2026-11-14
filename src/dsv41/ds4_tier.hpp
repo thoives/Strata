@@ -72,8 +72,8 @@ using strata::core::parse_tier_spec;
 using strata::core::tier_capacity_bytes;
 
 /// §7.1: the pack's identity, "sha:" over the sorted (shard name, size, modification time in the file system's own
-/// resolution) list, and the effective expert geometry (`geometry`: a digest of where every expert's bytes sit in the shards -
-/// the file, the offset and the size of each piece, as the loader laid them out). The geometry is in the identity because the
+/// resolution) list, and the effective expert geometry (`geometry`: a digest of ds4_geometry_text, the layout-aware text of where
+/// every expert's bytes sit in the shards and how the engine reads them, as the loader laid them out). The geometry is in the identity because the
 /// same files with moved bytes (a re-packed or re-ordered model that kept the names, sizes and times) would otherwise keep the
 /// old tier's identity and serve the wrong bytes: a change to it refills the tier (§7.1, the metadata case).  The shards are
 /// found exactly where the loader opens them (Pack::load: model_dir + "/" + name), whatever the working directory is; a shard
@@ -111,6 +111,128 @@ constexpr uint32_t kDs4SlotLayoutVersion = 1;   // the store's slot layout (Laye
 constexpr uint64_t kTierHeaderArea = 64ull << 10;   // header A's area at 0, header B's at 64 KiB
 constexpr uint64_t kTierChunk = strata::core::kTierChunk;   // the chunk CRC unit: 4 MiB
 constexpr int kTierHeaderBytes = 176;
+
+// ---- §7.1, the geometry: where each routed expert's bytes sit and how the engine reads them -------------------------
+// Plain values (no model types), so the identity is built and tested without a model or a GPU.  Two layouts exist:
+//   kMxFp4   a GGUF's low-bit experts, read as bytes in place.  Matrix r of expert e is bytes[r] long at off[r] + e stride[r]
+//            in file[r], of GGML type type[r]; the blob holds it at tr[r].
+//   kRegion  the EXL3 trellis experts: one region per expert (its file, offset and bytes).  Piece (r = gate, up, down;
+//            q = trellis, suh, svh) lies at piece_src[r][q] of the region and goes to piece_dst[r][q] of the blob; type[r] is
+//            the matrix's EXL3 bits K.
+// Anything incomplete, unknown or inconsistent is an error (ds4_geometry_text): the tier is not used blind.
+struct TierLayerGeo {
+    enum Layout : int { kNone = 0, kMxFp4 = 1, kRegion = 2 };
+    int il = -1;                  // the layer's index (the drafter's blocks come after the trunk's)
+    int layout = kNone;
+    int n_exp = 0;
+    uint32_t fmt = 0;             // the loader's expert format (lay.fmt)
+    uint64_t blob = 0;            // one expert's blob, in the slot
+    int file[3] = {-1, -1, -1};   // kMxFp4: matrix r's file (an index into the pack's files) ...
+    uint64_t off[3] = {0, 0, 0}, stride[3] = {0, 0, 0}, bytes[3] = {0, 0, 0}, tr[3] = {0, 0, 0};   // ... its offset, stride, bytes and blob place
+    uint32_t type[3] = {0, 0, 0}; // kMxFp4: the GGML type id; kRegion: the EXL3 bits
+    std::vector<int> region_file; // kRegion: one entry per expert: its file, offset and bytes
+    std::vector<uint64_t> region_off, region_bytes;
+    uint64_t piece_src[3][3] = {}, piece_bytes[3][3] = {}, piece_dst[3][3] = {};
+};
+
+// The shape the geometry is read against: the model's dimensions, and the store's slot layout (a change refills).
+struct TierGeoShape {
+    uint64_t dim = 0, ff = 0, nl = 0;
+    uint32_t slot_layout = kDs4SlotLayoutVersion;
+};
+
+// The geometry's canonical text, one fact per line, whose digest is the identity's geometry (ds4_model.cu's init_tier).
+// The first line carries this format's version: a change to the text changes every identity.  Files are written by name,
+// so the order of the pack's file list does not matter.  Returns false with `err` on any layer it cannot describe in full.
+constexpr int kTierGeoVersion = 1;
+inline std::string tier_geo_u(uint64_t v) { return std::to_string((unsigned long long) v); }
+inline bool ds4_geometry_text(const std::vector<TierLayerGeo>& layers, const std::vector<std::string>& files, const TierGeoShape& shape,
+                              std::string& out, std::string& err) {
+    out.clear();
+    auto fail = [&](const std::string& why) {
+        err = why;
+        out.clear();
+        return false;
+    };
+    // [off, off + len) lies inside [0, total)
+    auto inside = [](uint64_t off, uint64_t len, uint64_t total) { return off <= total && len <= total - off; };
+    if (files.empty()) return fail("the pack names no model files");
+    for (const std::string& f : files)
+        if (f.empty() || f.find_first_of(" \t\r\n") != std::string::npos) return fail("file name '" + f + "' cannot be written into the geometry");
+    if (shape.dim == 0 || shape.ff == 0 || shape.nl == 0) return fail("the model's dimensions are not known");
+    if (layers.empty()) return fail("no layer has routed experts: nothing to place in a tier");
+    std::string s = "strata-ds4-geometry " + std::to_string(kTierGeoVersion) + "\n";
+    s += "slot_layout=" + tier_geo_u(shape.slot_layout) + " dim=" + tier_geo_u(shape.dim) + " ff=" + tier_geo_u(shape.ff) +
+         " nl=" + tier_geo_u(shape.nl) + "\n";
+    for (const TierLayerGeo& l : layers) {
+        const std::string who = "layer " + std::to_string(l.il) + ": ";
+        if (l.il < 0) return fail("a layer has no index");
+        if (l.n_exp <= 0) return fail(who + "no routed experts");
+        if (l.blob == 0) return fail(who + "the expert blob has no size");
+        const uint64_t n = (uint64_t) l.n_exp;
+        s += "layer il=" + std::to_string(l.il) + " layout=" + std::to_string(l.layout) + " n_exp=" + tier_geo_u(n) +
+             " fmt=" + tier_geo_u(l.fmt) + " blob=" + tier_geo_u(l.blob) + "\n";
+        if (l.layout == TierLayerGeo::kMxFp4) {
+            for (int r = 0; r < 3; ++r) {
+                const std::string m = who + "matrix " + std::to_string(r) + ": ";
+                if (l.file[r] < 0 || (size_t) l.file[r] >= files.size()) return fail(m + "no file in the pack");
+                if (l.bytes[r] == 0) return fail(m + "no bytes");
+                if (l.type[r] == 0) return fail(m + "no type");
+                if (!inside(l.tr[r], l.bytes[r], l.blob)) return fail(m + "does not fit in the expert's blob");
+                if (n > 1 && l.stride[r] < l.bytes[r]) return fail(m + "overlaps the next expert's");
+                s += "mx r=" + std::to_string(r) + " file=" + files[(size_t) l.file[r]] + " off=" + tier_geo_u(l.off[r]) +
+                     " stride=" + tier_geo_u(l.stride[r]) + " bytes=" + tier_geo_u(l.bytes[r]) + " type=" + tier_geo_u(l.type[r]) +
+                     " tr=" + tier_geo_u(l.tr[r]) + "\n";
+            }
+            for (int a = 0; a < 3; ++a)
+                for (int b = a + 1; b < 3; ++b)
+                    if (l.tr[a] < l.tr[b] + l.bytes[b] && l.tr[b] < l.tr[a] + l.bytes[a])
+                        return fail(who + "matrices " + std::to_string(a) + " and " + std::to_string(b) + " overlap in the blob");
+        } else if (l.layout == TierLayerGeo::kRegion) {
+            if (l.region_file.size() != n || l.region_off.size() != n || l.region_bytes.size() != n)
+                return fail(who + "its regions are incomplete (" + std::to_string(l.region_file.size()) + " of " + std::to_string(n) +
+                            " experts)");
+            for (int r = 0; r < 3; ++r)
+                if (l.type[r] == 0) return fail(who + "matrix " + std::to_string(r) + " has no EXL3 bits");
+            for (int r = 0; r < 3; ++r)
+                for (int q = 0; q < 3; ++q) {
+                    const std::string p = who + "piece " + std::to_string(r) + "," + std::to_string(q) + ": ";
+                    if (l.piece_bytes[r][q] == 0) return fail(p + "no bytes");
+                    if (!inside(l.piece_dst[r][q], l.piece_bytes[r][q], l.blob)) return fail(p + "does not fit in the expert's blob");
+                }
+            for (int a = 0; a < 9; ++a)
+                for (int b = a + 1; b < 9; ++b) {
+                    const uint64_t da = l.piece_dst[a / 3][a % 3], db = l.piece_dst[b / 3][b % 3];
+                    const uint64_t na = l.piece_bytes[a / 3][a % 3], nb = l.piece_bytes[b / 3][b % 3];
+                    if (da < db + nb && db < da + na) return fail(who + "two pieces overlap in the blob");
+                }
+            for (uint64_t e = 0; e < n; ++e) {
+                const std::string x = who + "expert " + std::to_string(e) + ": ";
+                if (l.region_file[e] < 0 || (size_t) l.region_file[e] >= files.size()) return fail(x + "no file in the pack");
+                if (l.region_bytes[e] == 0) return fail(x + "no bytes");
+                for (int r = 0; r < 3; ++r)
+                    for (int q = 0; q < 3; ++q)
+                        if (!inside(l.piece_src[r][q], l.piece_bytes[r][q], l.region_bytes[e]))
+                            return fail(x + "a piece lies outside its region");
+            }
+            for (int r = 0; r < 3; ++r) {
+                s += "matrix r=" + std::to_string(r) + " bits=" + tier_geo_u(l.type[r]) + "\n";
+                for (int q = 0; q < 3; ++q)
+                    s += "piece r=" + std::to_string(r) + " q=" + std::to_string(q) + " src=" + tier_geo_u(l.piece_src[r][q]) +
+                         " bytes=" + tier_geo_u(l.piece_bytes[r][q]) + " dst=" + tier_geo_u(l.piece_dst[r][q]) + "\n";
+            }
+            for (uint64_t e = 0; e < n; ++e)
+                s += "region e=" + tier_geo_u(e) + " file=" + files[(size_t) l.region_file[e]] + " off=" + tier_geo_u(l.region_off[e]) +
+                     " bytes=" + tier_geo_u(l.region_bytes[e]) + "\n";
+        } else if (l.layout == TierLayerGeo::kNone) {
+            return fail(who + "no expert layout was recorded (neither a GGUF's matrices nor a region's pieces): the layer is incomplete");
+        } else {
+            return fail(who + "its expert layout is not one the tier knows (" + std::to_string(l.layout) + ")");
+        }
+    }
+    out = s;
+    return true;
+}
 
 struct TierHdr {
     char magic[8];

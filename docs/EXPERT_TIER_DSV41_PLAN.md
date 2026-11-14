@@ -172,6 +172,13 @@ identity is:
 - If setup recorded the hashes: the SHA-256 of the sorted list of (file name, file SHA-256). No file is re-hashed.
 - Otherwise: the list of (file name, size, modification time).
 
+The identity also carries a digest of the expert geometry: where each expert's bytes sit in the files and how the engine
+reads them. For a GGUF's low-bit experts that is each matrix's file, offset, stride, bytes, type and place in the slot.
+For the EXL3 layout it is each expert's region and each piece's place. The text starts with a format version, and it
+also holds the model's dimensions and the slot layout. A layer whose geometry cannot be described in full stops the
+start, so no identity is made from it. A change to any of these refills the tier, even when the file names, sizes and
+times are the same.
+
 ### 7.2 Profile is not part of identity
 
 The Strata plan put the profile in the identity. For this engine that is wrong, for two reasons:

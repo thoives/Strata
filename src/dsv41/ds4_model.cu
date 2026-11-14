@@ -808,8 +808,8 @@ struct Layer {
     std::vector<uint64_t> region_off;           // expert -> file region (offset, bytes, file)
     std::vector<uint64_t> region_bytes;
     std::vector<int> region_file;
-    size_t piece_src[3][3];                     // part (gate, up, down) x (trellis, suh, svh): offset in the region
-    size_t piece_bytes[3][3];
+    size_t piece_src[3][3] = {};                // part (gate, up, down) x (trellis, suh, svh): offset in the region (an EXL3 layer's only)
+    size_t piece_bytes[3][3] = {};
     size_t dense_bytes = 0;
     // a GGUF's MXFP4 experts (lay.fmt == gg::kFmtMXFP4): matrix r (gate, up, down) of expert e lies at mx_off[r] +
     // e mx_stride[r] in file mx_file[r] - loaded from there, and read in place (the file's mapping) by the CPU lane
@@ -2139,6 +2139,42 @@ struct Model::Impl {
                 }
         }
         return true;
+    }
+    // a layer's geometry for the tier's identity (ds4_tier.hpp's TierLayerGeo): a GGUF's MXFP4 layer from its mx_* fields (the
+    // store's own LayerGeo, init_store), an EXL3 layer from its regions (expert_layout).  A layer with neither keeps layout
+    // kNone, and ds4_geometry_text refuses it: no field is read from an empty array.
+    TierLayerGeo tier_layer_geo(const Layer& l) const {
+        TierLayerGeo t;
+        t.il = l.il;
+        t.n_exp = l.n_exp;
+        t.fmt = (uint32_t) l.lay.fmt;
+        t.blob = (uint64_t) l.blob;
+        if (l.lay.fmt == gg::kFmtMXFP4) {
+            t.layout = TierLayerGeo::kMxFp4;
+            for (int r = 0; r < 3; ++r) {
+                t.file[r] = l.mx_file[r];
+                t.off[r] = l.mx_off[r];
+                t.stride[r] = l.mx_stride[r];
+                t.bytes[r] = (uint64_t) mx_part_bytes(l, r);
+                t.type[r] = (uint32_t) gg::expert_type(l.lay, r);
+                t.tr[r] = (uint64_t) l.lay.trellis[r];
+            }
+        } else if (!l.region_file.empty()) {
+            t.layout = TierLayerGeo::kRegion;
+            t.region_file = l.region_file;
+            t.region_off = l.region_off;
+            t.region_bytes = l.region_bytes;
+            for (int r = 0; r < 3; ++r) {
+                t.type[r] = (uint32_t) l.lay.K[r];
+                const uint64_t dst[3] = {(uint64_t) l.lay.trellis[r], (uint64_t) l.lay.suh[r], (uint64_t) l.lay.svh[r]};
+                for (int q = 0; q < 3; ++q) {
+                    t.piece_src[r][q] = (uint64_t) l.piece_src[r][q];
+                    t.piece_bytes[r][q] = (uint64_t) l.piece_bytes[r][q];
+                    t.piece_dst[r][q] = dst[q];
+                }
+            }
+        }
+        return t;
     }
     // the region of expert e (read from the file) -> its blob
     void repack(const Layer& l, const uint8_t* region, uint8_t* blob) const {
@@ -5633,18 +5669,21 @@ struct Model::Impl {
         // §7.1: the pack's identity.  Setup verified the shards and could keep a SHA-256 per file, but the GGUF carries
         // none, so this engine takes §7.1's fallback: the sorted (name, size, mtime) list, hashed once - no shard re-read.
         // The shards are looked at where the loader opened them (model_dir/name), and one that cannot be read stops the start.
-        // The effective expert geometry (the loader's layout): every routed expert's file, offset and bytes, and each piece's size, per
-        // layer. It is part of the identity, so bytes that moved inside the same files refill the tier (ds4_tier.hpp, §7.1).
-        std::string geometry;
-        for (const Layer& l : L) {
-            if (l.n_exp <= 0) continue;
-            geometry += std::to_string(l.il) + ' ' + std::to_string(l.n_exp) + ' ' + std::to_string((unsigned long long) l.blob) + '\n';
-            for (int e = 0; e < l.n_exp; ++e)
-                geometry += std::to_string(l.region_file[(size_t) e]) + ' ' + std::to_string((unsigned long long) l.region_off[(size_t) e]) + ' ' +
-                            std::to_string((unsigned long long) l.region_bytes[(size_t) e]) + '\n';
-            for (int r = 0; r < 3; ++r)
-                for (int q = 0; q < 3; ++q) geometry += std::to_string((unsigned long long) l.piece_bytes[r][q]) + ' ';
-            geometry += '\n';
+        // The effective expert geometry, layer by layer, in the layout the loader gave each one (ds4_tier.hpp's TierLayerGeo): where
+        // every matrix or region sits, its type, and its place in the slot, with the model's dimensions and the slot layout. It is part
+        // of the identity, so bytes that moved - or that the engine now reads another way - refill the tier (§7.1). A layer it cannot
+        // describe in full stops the start: no identity is made from it.
+        std::vector<TierLayerGeo> lg;
+        for (const Layer& l : L)
+            if (l.n_exp > 0) lg.push_back(tier_layer_geo(l));
+        TierGeoShape shape;
+        shape.dim = (uint64_t) g.dim;
+        shape.ff = (uint64_t) g.ff;
+        shape.nl = (uint64_t) g.nl;
+        std::string geometry, geo_err;
+        if (!ds4_geometry_text(lg, pk.files, shape, geometry, geo_err)) {
+            std::fprintf(stderr, "ds4: expert tier: the expert geometry cannot be described (%s): the tier is not used blind\n", geo_err.c_str());
+            std::exit(2);
         }
         const std::string geometry_id = strata::core::tier_sha256_hex((const uint8_t*) geometry.data(), geometry.size());
         std::string pack_id, err;
