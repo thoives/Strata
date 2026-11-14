@@ -27,6 +27,7 @@
 #include "ds4_store.hpp"
 #include "ds4_tier.hpp"
 #include "ds4_vision.cuh"
+#include "strata/core/expert_tier.hpp"
 #include "strata/dsv41/exl3_cpu.hpp"
 #include "strata/dsv41/exl3.hpp"
 #include "strata/kernels/f16_bits.hpp"
