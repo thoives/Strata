@@ -79,6 +79,10 @@ public:
         std::function<bool(int layer, int e, int& dev, uint64_t& slot)> tier_find;
         std::function<uint8_t*(int dev, uint64_t slot)> tier_base;
         std::function<IoQueue*(int dev)> tier_queue;
+        // DS4_TIER_LOG: a tier copy started (bytes, demand vs guess) and the time a caller actually waited for one.
+        // Both are null unless DS4_TIER_LOG is set; the normal path pays no counters.
+        std::function<void(int dev, uint64_t bytes, bool demand)> tier_note_start;
+        std::function<void(int dev, uint64_t ns)> tier_note_wait;
         // a copy out of a tier device failed (its own read error): the caller marks that device, so the tier refills at
         // the next start and its experts fall back to the files (ds4_tier.hpp note_refill, §9)
         std::function<void(int dev)> tier_fail;
@@ -97,6 +101,10 @@ public:
         cfg_.tier_queue = std::move(q);
         cfg_.tier_fail = std::move(fail);
         cfg_.tier_drain = std::move(drain);
+    }
+    void set_tier_trace(std::function<void(int, uint64_t, bool)> start, std::function<void(int, uint64_t)> wait) {
+        cfg_.tier_note_start = std::move(start);
+        cfg_.tier_note_wait = std::move(wait);
     }
     /// §9: a tier fill read: (layer, e)'s three matrices read exactly as a store fill reads them (the same aligned job
     /// builder, E2), landing inside a tier mapping at `slot_base` on that device's own queue (E3).  The caller owns `left`
@@ -253,7 +261,16 @@ public:
                 continue;
             }
             Slot& sp = slots_[(size_t) s];
-            while (sp.left.load(std::memory_order_acquire) > 0) io_->wait_any(2000);
+            // (only a slot this batch must still wait for counts: a store hit is already done (left 0), and its old
+            //  src_dev would otherwise look like a tier wait that never happened)
+            if (sp.left.load(std::memory_order_acquire) > 0) {
+                const int tdev = sp.src_dev;
+                const auto tw0 = std::chrono::steady_clock::now();
+                while (sp.left.load(std::memory_order_acquire) > 0) io_->wait_any(2000);
+                if (tdev >= 0 && cfg_.tier_note_wait)
+                    cfg_.tier_note_wait(tdev, (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - tw0).count());
+            }
             std::lock_guard<std::mutex> lk(mu_);
             finish(sp);
             if (sp.state.load() == kReady) ok[(size_t) i] = 1;
@@ -568,8 +585,10 @@ private:
             if (tbase == nullptr || tq == nullptr) tdev = -1;   // (the device closed: fall back to the file read)
         }
         if (tdev >= 0) {
+            const uint64_t nb = g.bytes[0] + g.bytes[1] + g.bytes[2];
             st_.tier_hits.fetch_add(1, std::memory_order_relaxed);
-            st_.tier_bytes.fetch_add((int64_t) (g.bytes[0] + g.bytes[1] + g.bytes[2]), std::memory_order_relaxed);
+            st_.tier_bytes.fetch_add((int64_t) nb, std::memory_order_relaxed);
+            if (cfg_.tier_note_start) cfg_.tier_note_start(tdev, nb, demand);
         }
         sp.src_dev = tdev;   // (the slot records its source: finish() marks a failed tier's device)
         for (int r = 0; r < 3; ++r) {
@@ -579,6 +598,8 @@ private:
             j.bad = &sp.bad;
             j.fail = &sp.fail;
             j.cancel = demand ? nullptr : &sp.cancel;
+            j.tier_copy = tdev >= 0;
+            j.demand = demand;
             if (tdev >= 0) {   // (the tier's bytes are already in the store's layout: a copy, no move-up, keep = null)
                 j.mem = tbase + g.tr[r];
                 j.dst = fin;

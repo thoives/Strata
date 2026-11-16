@@ -247,6 +247,19 @@ like a read does.
 Statistics: a tier copy adds to `tier_hits` and `tier_bytes` (new counters next to `hits`, `misses` and `bytes_read` in
 `Stats`). It does not add to `bytes_read` (file bytes), so the file-read figure stays meaningful.
 
+`DS4_TIER_LOG=1` (off by default; unset or `0` disables) prints one line per tier device at the end of a decode: experts and MB copied per
+token, demand and lookahead copies, the queue wait from push to the worker's start, the copy time itself, the CPU
+lane's actual wait for a tier copy, and the cold share. A copy is cold when four sampled pages of its mapped range are
+not resident just before the copy, so its time includes the device read; a warm copy is a RAM-to-RAM `memcpy`. The
+probe runs only under `DS4_TIER_LOG`, so the normal path has no counters and no extra residency check (Linux
+`mincore`; Windows, the process's working set). The queue and
+copy p50/p95 are since the process start, not just the last request; the per-request figures are deltas from the
+snapshot taken before it.
+
+Only `wait_slots` records the CPU lane's wait, so a `preload` at start (`ds4_model.cu:7387`) and its warm-up waits
+are not counted. The depth is the device queue's size when a tier copy is pushed: a fill read is a model-file read,
+not a tier read, and adds no counter (§9).
+
 ### 8.3 GPU
 
 The copies land in store slots. Store chunks are GPU-mapped as they are today, so the device kernels read tier-served

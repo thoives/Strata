@@ -90,6 +90,9 @@ Differences from the Qwen engine, in plain words:
   was reused and nothing was copied. The decode report's `tier:` line says how many experts sit on how many tier
   devices and how many of the answers' expert reads were copies from the tier instead of reads from the files. As with the
   Qwen engine, a read the tier answered counts in neither the RAM figure nor the file figure.
+- **A per-device breakdown.** `DS4_TIER_LOG=1` (off by default; unset or `0` disables) makes `strata-dsv41` print one line per tier device at
+  the end of a decode: copies and MB a token, the queue and copy times, the cold share, and the CPU lane's wait for
+  that device. It is a diagnostic; the residency probe it adds runs only when the variable is set.
 
 This engine's plan is [EXPERT_TIER_DSV41_PLAN.md](EXPERT_TIER_DSV41_PLAN.md).
 

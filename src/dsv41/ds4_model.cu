@@ -5749,6 +5749,11 @@ struct Model::Impl {
                         [this](int dev) { return tier->queue(dev); },
                         [this](int dev) { tier->note_refill(dev); },
                         [this]() { if (tier) tier->drain(); });   // (the store's destructor: every queued tier copy lands before the arena is released)
+        if (tier->tracing()) {
+            store->set_tier_trace(
+                [this](int dev, uint64_t bytes, bool demand) { tier->note_copy_start(dev, bytes, demand); },
+                [this](int dev, uint64_t ns) { tier->note_copy_wait(dev, ns); });
+        }
     }
     // §9: the fill reads every tier-held expert once from the model's files onto its device: rank order, on the
     // device's own queue, so the devices fill at once and each link keeps its own workers busy (§8.6).  Bytes are
@@ -10978,6 +10983,40 @@ const Stats& Model::stats() const {
         st.tier_experts = p_->tier->experts_held();
         st.tier_devices = (int64_t) p_->tier->device_count();
         st.tier_fill_s = p_->tier_fill_s;
+        st.tier_dev_stats.clear();
+        if (p_->tier->tracing()) {   // (the normal path allocates nothing: these counters exist only under DS4_TIER_LOG)
+            for (const ExpertTierSet::DeviceStats& d : p_->tier->stats()) {
+                TierDeviceStats x;
+                x.path = d.path;
+                x.started_experts = (int64_t) d.started_experts;
+                x.started_bytes = (int64_t) d.started_bytes;
+                x.demand_experts = (int64_t) d.demand_experts;
+                x.demand_bytes = (int64_t) d.demand_bytes;
+                x.prefetch_experts = (int64_t) d.prefetch_experts;
+                x.prefetch_bytes = (int64_t) d.prefetch_bytes;
+                x.completed_jobs = (int64_t) d.completed_jobs;
+                x.completed_bytes = (int64_t) d.completed_bytes;
+                x.demand_jobs = (int64_t) d.demand_jobs;
+                x.demand_completed_bytes = (int64_t) d.demand_completed_bytes;
+                x.prefetch_jobs = (int64_t) d.prefetch_jobs;
+                x.prefetch_completed_bytes = (int64_t) d.prefetch_completed_bytes;
+                x.cold_jobs = (int64_t) d.cold_jobs;
+                x.cold_bytes = (int64_t) d.cold_bytes;
+                x.queue_depth_max = (int64_t) d.queue_depth_max;
+                x.cold_queue_ms = (double) d.cold_queue_ns / 1e6;
+                x.cold_service_ms = (double) d.cold_service_ns / 1e6;
+                x.queue_ms = (double) d.queue_ns / 1e6;
+                x.service_ms = (double) d.service_ns / 1e6;
+                x.wait_ms = (double) d.wait_ns / 1e6;
+                x.queue_p50_ms = (double) d.queue_p50_ns / 1e6;
+                x.queue_p95_ms = (double) d.queue_p95_ns / 1e6;
+                x.service_p50_ms = (double) d.service_p50_ns / 1e6;
+                x.service_p95_ms = (double) d.service_p95_ns / 1e6;
+                x.cold_service_p50_ms = (double) d.cold_service_p50_ns / 1e6;
+                x.cold_service_p95_ms = (double) d.cold_service_p95_ns / 1e6;
+                st.tier_dev_stats.push_back(std::move(x));
+            }
+        }
     }
     return st;
 }

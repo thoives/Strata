@@ -84,6 +84,41 @@ long long io_read_bytes() {
 #endif
 }
 
+// DS4_TIER_LOG: one line per tier device, from the stats snapshot taken at the end of a request and the one taken
+// before it.  The latency p50/p95 are the device queue's since process start; the per-request figures are deltas.
+void print_tier_io(const strata::ds4::Stats& s, const strata::ds4::Stats& base, double nt) {
+    const char* tl = std::getenv("DS4_TIER_LOG");
+    if (tl == nullptr || std::atoi(tl) == 0 || s.tier_dev_stats.empty()) return;
+    nt = std::max(1.0, nt);
+    std::fprintf(stderr, "tier io per token (DS4_TIER_LOG; counts and means are this request, p50/p95 since start):\n");
+    for (size_t i = 0; i < s.tier_dev_stats.size(); ++i) {
+        const strata::ds4::TierDeviceStats& a = s.tier_dev_stats[i];
+        const strata::ds4::TierDeviceStats b = i < base.tier_dev_stats.size()
+            ? base.tier_dev_stats[i] : strata::ds4::TierDeviceStats{};
+        const double experts = (double) (a.started_experts - b.started_experts) / nt;
+        const double demand = (double) (a.demand_experts - b.demand_experts) / nt;
+        const double prefetch = (double) (a.prefetch_experts - b.prefetch_experts) / nt;
+        const double mb = (double) (a.completed_bytes - b.completed_bytes) / 1e6 / nt;
+        const double jobs = (double) (a.completed_jobs - b.completed_jobs);
+        const double demand_jobs = (double) (a.demand_jobs - b.demand_jobs);
+        const double cold_pct = a.completed_bytes > 0 ? 100.0 * (double) a.cold_bytes / (double) a.completed_bytes : 0.0;
+        const double cold_jobs = (double) (a.cold_jobs - b.cold_jobs);
+        const double q_mean = jobs > 0 ? (a.queue_ms - b.queue_ms) / jobs : 0.0;
+        const double s_mean = jobs > 0 ? (a.service_ms - b.service_ms) / jobs : 0.0;
+        const double cold_s_mean = cold_jobs > 0 ? (a.cold_service_ms - b.cold_service_ms) / cold_jobs : 0.0;
+        std::fprintf(stderr,
+                     "  %s: %.1f experts/token (demand %.1f, prefetch %.1f), %.1f MB/token; jobs/token %.1f (demand %.1f); "
+                     "queue mean %.3f ms, max depth %lld (sampled at tier pushes), session p50/p95 %.3f/%.3f ms; "
+                     "service mean %.3f ms, session p50/p95 %.3f/%.3f ms; cold %.1f%% of session bytes, %.1f MB/token "
+                     "this request, cold service mean %.3f ms, session p95 %.3f ms; CPU lane wait %.2f ms/token\n",
+                     a.path.c_str(), experts, demand, prefetch, mb, jobs / nt, demand_jobs / nt,
+                     q_mean, (long long) a.queue_depth_max, a.queue_p50_ms, a.queue_p95_ms, s_mean,
+                     a.service_p50_ms, a.service_p95_ms, cold_pct,
+                     (double) (a.cold_bytes - b.cold_bytes) / 1e6 / nt, cold_s_mean, a.cold_service_p95_ms,
+                     (a.wait_ms - b.wait_ms) / nt);
+    }
+}
+
 std::vector<int> parse_ids(const std::string& s) {
     std::vector<int> v;
     const char* p = s.c_str();
@@ -1007,6 +1042,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         // (a stop within accepted drafts leaves the state past it: the next prompt shares less with it, and goes back to
         //  the checkpoint at this prompt's end)
         stat_line();
+        print_tier_io(m.stats(), s_dec, (double) std::max(1LL, produced));
         const double t2 = now_ms();
         std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu 0 0\n", produced, r.ids.size(), t1 - t0, t2 - t1, finish,
                     d_acc, d_off, from);
@@ -1609,6 +1645,7 @@ int main(int argc, char** argv) {
                      (long long) s.tier_experts, (long long) s.tier_devices,
                      (double) (s.tier_hits - s0.tier_hits) / nt, (double) (s.tier_bytes - s0.tier_bytes) / 1e6 / nt,
                      s.tier_fill_s > 0.0 ? "the fill read them once at start" : "the placement was reused");
+        print_tier_io(s, s0, nt);
     }
     if (s.ahead_picks > s0.ahead_picks) {   // lookahead
         const double p = (double) (s.ahead_picks - s0.ahead_picks), c = (double) (s.ahead_cold - s0.ahead_cold);

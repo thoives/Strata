@@ -933,6 +933,64 @@ int main() {
         }
     }
 
+    // ---- DS4_TIER_LOG: the per-device runtime counters (§8.2's line): a demand copy, a guess, and the CPU lane's wait ----
+    {
+        set_env("DS4_TIER_LOG", "1");
+        set_env("DS4_TIER_THREADS", "1");   // (one worker: a long copy ahead deterministically holds the tier copy)
+        auto t = std::make_unique<ExpertTierSet>();   // (declared before the world: destroyed after the store, as in Model::Impl)
+        auto w = std::make_unique<World>(base, "tierlog", false);
+        std::string err;
+        CHECK(t->open(w->specs, err));
+        CHECK(t->tracing());
+        tier_hooks(*w, t);
+        w->st.set_tier_trace([&](int dev, uint64_t bytes, bool demand) { t->note_copy_start(dev, bytes, demand); },
+                             [&](int dev, uint64_t ns) { t->note_copy_wait(dev, ns); });
+        bool reused = true;
+        CHECK(t->decide(SLOT, 2, 4, NL, NE, packA, profA, false, ranked, reused, why, notes));
+        ExpertTierSet::Fill f{};
+        CHECK(do_fill(*w, t.get(), f));
+        for (const ExpertTierSet::DeviceStats& d : t->stats())
+            CHECK(d.started_experts == 0 && d.completed_jobs == 0);   // (a fill read is a model-file read, not a tier read)
+        int dev = -1;
+        uint64_t k = 0;
+        CHECK(t->find(2, 5, dev, k));
+        // A demand read queued behind a long copy on the device's queue: ensure() waits, and the wait is counted.
+        BigCopy big;
+        big.push(t->queue(dev));
+        const int es[1] = {5};
+        std::vector<char> ok;
+        CHECK(w->st.ensure(2, es, 1, ok) && ok[0] == 1);
+        while (big.left.load() > 0) t->queue(dev)->wait_any(1000);
+        {
+            const std::vector<ExpertTierSet::DeviceStats> ds = t->stats();
+            const ExpertTierSet::DeviceStats& a = ds[(size_t) dev];
+            CHECK(a.started_experts == 1 && a.demand_experts == 1 && a.prefetch_experts == 0);
+            CHECK(a.started_bytes == (uint64_t) 3 * MB4);
+            CHECK(a.completed_jobs == 3 && a.demand_jobs == 3);
+            CHECK(a.completed_bytes == (uint64_t) 3 * MB4);
+            CHECK(a.service_ns > 0 && a.queue_depth_max >= 1);
+            CHECK(a.wait_ns > 0);            // (the copy sat behind the long one)
+            CHECK(a.cold_jobs <= a.completed_jobs && a.cold_bytes <= a.completed_bytes);
+        }
+        // A guess is counted as prefetch, not demand.
+        w->st.prefetch(2, 4);
+        const int es2[1] = {4};
+        std::vector<char> ok2;
+        CHECK(w->st.ensure(2, es2, 1, ok2) && ok2[0] == 1);
+        uint64_t pe = 0, pj = 0;
+        for (const ExpertTierSet::DeviceStats& d : t->stats()) {
+            pe += d.prefetch_experts;
+            pj += d.prefetch_jobs;
+        }
+        CHECK(pe == 1 && pj == 3);
+        w->st.set_tier(nullptr, nullptr, nullptr, nullptr);   // (the world outlives this set's close: no hook may reach it)
+        w->st.set_tier_trace(nullptr, nullptr);
+        t->close();
+        w.reset();
+        set_env("DS4_TIER_LOG", nullptr);
+        set_env("DS4_TIER_THREADS", nullptr);
+    }
+
     fs::remove_all(base);
     if (fails) {
         std::printf("%d expert tier checks failed\n", fails);

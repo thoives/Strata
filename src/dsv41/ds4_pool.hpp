@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
@@ -134,6 +135,96 @@ private:
 /// not all in the page cache already (the disk straight into dst, the cache neither used nor disturbed), buffered
 /// otherwise or when the unbuffered read fails - the bytes land at dst + off % os::kDirectAlign either way.  A job's `left` is
 /// counted down when it is done (`bad` set if it failed); wait_any() sleeps until some job finished or the timeout.
+// DS4_TIER_LOG: one tier device's runtime copy counters.  The tier's runtime reads are memcpy's from its
+// mapping (ds4_store.hpp's tier hit), not pread() calls, so DS4_IO_STATS does not see them.  The histograms
+// are fixed-size and updated with relaxed atomics: one job is three matrices, so the overhead is per expert,
+// not per row.
+struct IoLatencyHist {
+    static constexpr uint64_t kBinNs = 50000;   // 50 us a bin: p50/p95 to within 50 us below the cap
+    static constexpr size_t kBins = 2048;       // up to 102.4 ms; longer samples make a percentile report max
+    std::atomic<uint64_t> bins[kBins] = {};
+    std::atomic<uint64_t> count{0};
+    std::atomic<uint64_t> over{0};              // (counted in count; p95 then reports max, not a cap)
+    std::atomic<uint64_t> max_ns{0};
+    void add(uint64_t ns) {
+        uint64_t m = max_ns.load(std::memory_order_relaxed);
+        while (m < ns && !max_ns.compare_exchange_weak(m, ns, std::memory_order_relaxed)) {}
+        const size_t b = (size_t) (ns / kBinNs);
+        if (b >= kBins) over.fetch_add(1, std::memory_order_relaxed);
+        else bins[b].fetch_add(1, std::memory_order_relaxed);
+        count.fetch_add(1, std::memory_order_relaxed);
+    }
+    uint64_t percentile(double p) const {
+        const uint64_t n = count.load(std::memory_order_relaxed);
+        if (n == 0) return 0;
+        uint64_t target = (uint64_t) (p * (double) n);
+        if (target < 1) target = 1;
+        if (target > n) target = n;
+        uint64_t cum = 0;
+        for (size_t i = 0; i < kBins; ++i) {
+            cum += bins[i].load(std::memory_order_relaxed);
+            if (cum >= target) return (uint64_t) (i + 1) * kBinNs;
+        }
+        return max_ns.load(std::memory_order_relaxed);
+    }
+};
+struct TierIoStats {
+    std::atomic<uint64_t> started_experts{0}, started_bytes{0};
+    std::atomic<uint64_t> demand_experts{0}, demand_bytes{0};
+    std::atomic<uint64_t> prefetch_experts{0}, prefetch_bytes{0};
+    std::atomic<uint64_t> completed_jobs{0}, completed_bytes{0};
+    std::atomic<uint64_t> queue_ns{0}, service_ns{0}, wait_ns{0};
+    std::atomic<uint64_t> demand_jobs{0}, demand_completed_bytes{0}, demand_queue_ns{0}, demand_service_ns{0};
+    std::atomic<uint64_t> prefetch_jobs{0}, prefetch_completed_bytes{0}, prefetch_queue_ns{0}, prefetch_service_ns{0};
+    std::atomic<uint64_t> cold_jobs{0}, cold_bytes{0};
+    std::atomic<uint64_t> cold_queue_ns{0}, cold_service_ns{0};
+    std::atomic<uint64_t> queue_depth_max{0};
+    IoLatencyHist queue_hist, service_hist, cold_service_hist;
+
+    void note_start(uint64_t bytes, bool demand) {
+        started_experts.fetch_add(1, std::memory_order_relaxed);
+        started_bytes.fetch_add(bytes, std::memory_order_relaxed);
+        if (demand) {
+            demand_experts.fetch_add(1, std::memory_order_relaxed);
+            demand_bytes.fetch_add(bytes, std::memory_order_relaxed);
+        } else {
+            prefetch_experts.fetch_add(1, std::memory_order_relaxed);
+            prefetch_bytes.fetch_add(bytes, std::memory_order_relaxed);
+        }
+    }
+    void note_copy(uint64_t bytes, uint64_t q_ns, uint64_t s_ns, bool demand, bool cold) {
+        completed_jobs.fetch_add(1, std::memory_order_relaxed);
+        completed_bytes.fetch_add(bytes, std::memory_order_relaxed);
+        queue_ns.fetch_add(q_ns, std::memory_order_relaxed);
+        service_ns.fetch_add(s_ns, std::memory_order_relaxed);
+        queue_hist.add(q_ns);
+        service_hist.add(s_ns);
+        if (demand) {
+            demand_jobs.fetch_add(1, std::memory_order_relaxed);
+            demand_completed_bytes.fetch_add(bytes, std::memory_order_relaxed);
+            demand_queue_ns.fetch_add(q_ns, std::memory_order_relaxed);
+            demand_service_ns.fetch_add(s_ns, std::memory_order_relaxed);
+        } else {
+            prefetch_jobs.fetch_add(1, std::memory_order_relaxed);
+            prefetch_completed_bytes.fetch_add(bytes, std::memory_order_relaxed);
+            prefetch_queue_ns.fetch_add(q_ns, std::memory_order_relaxed);
+            prefetch_service_ns.fetch_add(s_ns, std::memory_order_relaxed);
+        }
+        if (cold) {
+            cold_jobs.fetch_add(1, std::memory_order_relaxed);
+            cold_bytes.fetch_add(bytes, std::memory_order_relaxed);
+            cold_queue_ns.fetch_add(q_ns, std::memory_order_relaxed);
+            cold_service_ns.fetch_add(s_ns, std::memory_order_relaxed);
+            cold_service_hist.add(s_ns);
+        }
+    }
+    void note_wait(uint64_t ns) { wait_ns.fetch_add(ns, std::memory_order_relaxed); }
+    void note_depth(uint64_t depth) {
+        uint64_t cur = queue_depth_max.load(std::memory_order_relaxed);
+        while (cur < depth && !queue_depth_max.compare_exchange_weak(cur, depth, std::memory_order_relaxed)) {}
+    }
+};
+
 class IoQueue {
 public:
     struct Job {
@@ -150,8 +241,10 @@ public:
         std::atomic<bool>* fail = nullptr;     // non-null: set when the job RAN and did not succeed (bad is set too).  A cancelled
                                                // job sets bad and never this: "dropped on purpose" and "went wrong" differ (the tier marks a device only for the latter)
         std::chrono::steady_clock::time_point pushed{};   // (DS4_IO_STATS: when it was queued)
+        bool tier_copy = false;   // DS4_TIER_LOG: a runtime copy from a tier device's mapping
+        bool demand = false;      // ... and it is a demand copy, not a lookahead guess
     };
-    explicit IoQueue(int n) {
+    explicit IoQueue(int n, TierIoStats* trace = nullptr) : trace_(trace) {
         for (int i = 0; i < n; ++i) th_.emplace_back([this] { loop(); });
     }
     ~IoQueue() {
@@ -171,10 +264,13 @@ public:
     void push(const Job* jobs, int n, bool low = false) {
         {
             std::lock_guard<std::mutex> lk(mu_);
+            bool traced = false;
             for (int i = 0; i < n; ++i) {
                 (low ? ql_ : q_).push_back(jobs[i]);
                 (low ? ql_ : q_).back().pushed = std::chrono::steady_clock::now();
+                traced = traced || jobs[i].tier_copy;
             }
+            if (trace_ && traced) trace_->note_depth((uint64_t) (q_.size() + ql_.size()));
         }
         if (n == 1) cv_.notify_one();
         else cv_.notify_all();
@@ -217,7 +313,17 @@ private:
             const uint64_t lead = j.off % os::kDirectAlign;
             bool ok = false;
             if (j.mem != nullptr) {
+                const bool traced = trace_ != nullptr && j.tier_copy;
+                const auto tc0 = traced ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                const bool cold = traced && !os::resident_sampled(j.mem, (size_t) j.len, 4);   // (a cold mapped tier range faults from the drive)
                 std::memcpy(j.dst, j.mem, (size_t) j.len);
+                if (traced) {
+                    using ns = std::chrono::nanoseconds;
+                    const auto tc1 = std::chrono::steady_clock::now();
+                    trace_->note_copy(j.len,
+                                      (uint64_t) std::chrono::duration_cast<ns>(tc0 - j.pushed).count(),
+                                      (uint64_t) std::chrono::duration_cast<ns>(tc1 - tc0).count(), j.demand, cold);
+                }
                 ok = true;
             } else if (j.exact) {
                 // unbuffered through a bounce buffer (the disk reads aligned spans), then the bytes to where they belong
@@ -277,6 +383,7 @@ private:
     bool quit_ = false;
     std::atomic<uint64_t> busy_us_{0}, direct_{0}, buffered_{0};
     std::atomic<uint64_t> st_n_{0}, st_q_{0}, st_r_{0}, st_m_{0}, st_b_{0};   // DS4_IO_STATS: jobs, queue wait / read / copy us, bytes
+    TierIoStats* trace_ = nullptr;   // (DS4_TIER_LOG: the tier queue's counters; null on the store's queue)
 };
 
 }  // namespace strata::ds4

@@ -81,6 +81,24 @@ struct Image {
     std::shared_ptr<const std::vector<uint16_t>> rows;
 };
 
+// DS4_TIER_LOG: the per-device tier counters copied into Stats (plain values, no atomics or locks).
+struct TierDeviceStats {
+    std::string path;
+    int64_t started_experts = 0, started_bytes = 0;
+    int64_t demand_experts = 0, demand_bytes = 0;
+    int64_t prefetch_experts = 0, prefetch_bytes = 0;
+    int64_t completed_jobs = 0, completed_bytes = 0;
+    int64_t demand_jobs = 0, demand_completed_bytes = 0;
+    int64_t prefetch_jobs = 0, prefetch_completed_bytes = 0;
+    int64_t cold_jobs = 0, cold_bytes = 0;
+    int64_t queue_depth_max = 0;
+    double queue_ms = 0.0, service_ms = 0.0, wait_ms = 0.0;
+    double cold_queue_ms = 0.0, cold_service_ms = 0.0;
+    double queue_p50_ms = 0.0, queue_p95_ms = 0.0;
+    double service_p50_ms = 0.0, service_p95_ms = 0.0;
+    double cold_service_p50_ms = 0.0, cold_service_p95_ms = 0.0;
+};
+
 struct Stats {
     int64_t tokens = 0;
     int64_t experts = 0, cpu_experts = 0;   // routed experts run, and how many of them on the CPU lane
@@ -110,6 +128,7 @@ struct Stats {
     // statistic, §9).  With no tier these stay 0 (§7.4/acceptance criterion 1).
     int64_t tier_hits = 0, tier_bytes = 0, tier_experts = 0, tier_devices = 0;
     double tier_fill_s = 0.0;
+    std::vector<TierDeviceStats> tier_dev_stats;   // (DS4_TIER_LOG: one snapshot per device)
     int64_t store_zc = 0, store_zc_visible = 0;   // experts the GPU computed from the store (zero-copy over PCIe); slots it may read
     double store_wait_ms = 0.0, store_busy_ms = 0.0;
     int64_t store_slots = 0, store_slots_max = 0;

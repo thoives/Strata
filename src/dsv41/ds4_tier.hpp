@@ -332,6 +332,27 @@ public:
         int64_t placed = 0;
         std::vector<int64_t> per_dev;   // (the experts each device took: §9's per-device progress line)
     };
+    // DS4_TIER_LOG: a plain snapshot of one device's runtime reads.  The tier's bytes are copied from its mapping,
+    // so a hit is a memcpy; a cold range faults from the device during it.  `cold_*` count the copies whose sampled
+    // pages were not resident when the copy began (Linux mincore; Windows, the process's working set).
+    struct DeviceStats {
+        std::string path;
+        uint64_t started_experts = 0, started_bytes = 0;
+        uint64_t demand_experts = 0, demand_bytes = 0;
+        uint64_t prefetch_experts = 0, prefetch_bytes = 0;
+        uint64_t completed_jobs = 0, completed_bytes = 0;
+        uint64_t demand_jobs = 0, demand_completed_bytes = 0;
+        uint64_t prefetch_jobs = 0, prefetch_completed_bytes = 0;
+        uint64_t queue_ns = 0, service_ns = 0, wait_ns = 0;
+        uint64_t demand_queue_ns = 0, demand_service_ns = 0;
+        uint64_t prefetch_queue_ns = 0, prefetch_service_ns = 0;
+        uint64_t cold_jobs = 0, cold_bytes = 0;
+        uint64_t cold_queue_ns = 0, cold_service_ns = 0;
+        uint64_t queue_depth_max = 0;
+        uint64_t queue_p50_ns = 0, queue_p95_ns = 0;
+        uint64_t service_p50_ns = 0, service_p95_ns = 0;
+        uint64_t cold_service_p50_ns = 0, cold_service_p95_ns = 0;
+    };
 
     ExpertTierSet() = default;
     ~ExpertTierSet() { close(); }
@@ -390,6 +411,11 @@ public:
     /// A chunk the store's reads of tier bytes hit that does not match (verify=full at a later start cannot catch a
     /// read-time EIO): mark the device, its expert falls back to the file (the caller's) and the tier refills next start.
     void note_refill(int dev);
+    // DS4_TIER_LOG hooks: the store calls these when a tier copy starts and when it actually waits for one.
+    bool tracing() const { return tracing_; }
+    void note_copy_start(int dev, uint64_t bytes, bool demand);
+    void note_copy_wait(int dev, uint64_t ns);
+    std::vector<DeviceStats> stats() const;
 
     bool readable() const { return readable_.load(std::memory_order_acquire); }   // lookups answer only after a reuse or a completed fill
     // Tests only: `f(device)` true makes that device's next flush fail (a full disk, an I/O error).
@@ -409,6 +435,8 @@ private:
         TierSpec spec;
         uint8_t* base = nullptr;
         uint64_t size = 0;
+        std::unique_ptr<TierIoStats> trace;   // (DS4_TIER_LOG: the device's queue updates it; declared before io, so it
+                                              //  is destroyed after the queue's workers have been joined)
         std::unique_ptr<IoQueue> io;
         TierHdr hdr{};
         bool opened = false;
@@ -431,6 +459,7 @@ private:
     std::vector<strata::core::TierPlacementEntry> entries_;   // the plan (fill path) in rank order: fill iterates this
     std::atomic<bool> readable_{false};   // published (release) after a reuse or a completed, flushed fill
     std::function<bool(size_t)> flush_fault_;   // tests only
+    bool tracing_ = false;
     int64_t held_ = 0;
     std::vector<std::string> notes_;
 
@@ -465,6 +494,8 @@ inline bool ExpertTierSet::open(const std::vector<TierSpec>& specs, std::string&
         if (!strata::core::tier_check_overlaps(pp, pid, protect, err)) return false;
     }
     devs_.clear();
+    const char* tl = std::getenv("DS4_TIER_LOG");
+    tracing_ = tl != nullptr && std::atoi(tl) != 0;   // (0 or unset: off)
     const int th = std::getenv("DS4_TIER_THREADS") ? std::max(1, std::atoi(std::getenv("DS4_TIER_THREADS"))) : 2;
     for (const TierSpec& s : specs) {
         Dev d;
@@ -475,7 +506,8 @@ inline bool ExpertTierSet::open(const std::vector<TierSpec>& specs, std::string&
             devs_.clear();
             return false;
         }
-        d.io = std::make_unique<IoQueue>(th);
+        if (tracing_) d.trace = std::make_unique<TierIoStats>();
+        d.io = std::make_unique<IoQueue>(th, d.trace.get());
         d.index = devs_.size();
         devs_.push_back(std::move(d));
     }
@@ -916,6 +948,57 @@ inline bool ExpertTierSet::fill(const std::function<bool(int, int, uint8_t*, int
 
 inline void ExpertTierSet::note_refill(int dev) {
     if (dev >= 0 && dev < (int)devs_.size()) devs_[(size_t)dev].mark->store(true, std::memory_order_release);
+}
+inline void ExpertTierSet::note_copy_start(int dev, uint64_t bytes, bool demand) {
+    if (dev >= 0 && dev < (int)devs_.size() && devs_[(size_t)dev].trace)
+        devs_[(size_t)dev].trace->note_start(bytes, demand);
+}
+inline void ExpertTierSet::note_copy_wait(int dev, uint64_t ns) {
+    if (dev >= 0 && dev < (int)devs_.size() && devs_[(size_t)dev].trace && ns > 0)
+        devs_[(size_t)dev].trace->note_wait(ns);
+}
+inline std::vector<ExpertTierSet::DeviceStats> ExpertTierSet::stats() const {
+    std::vector<DeviceStats> out;
+    out.reserve(devs_.size());
+    for (const Dev& d : devs_) {
+        DeviceStats s;
+        s.path = d.spec.path;
+        if (d.trace) {
+            const TierIoStats& t = *d.trace;
+            s.started_experts = t.started_experts.load(std::memory_order_relaxed);
+            s.started_bytes = t.started_bytes.load(std::memory_order_relaxed);
+            s.demand_experts = t.demand_experts.load(std::memory_order_relaxed);
+            s.demand_bytes = t.demand_bytes.load(std::memory_order_relaxed);
+            s.prefetch_experts = t.prefetch_experts.load(std::memory_order_relaxed);
+            s.prefetch_bytes = t.prefetch_bytes.load(std::memory_order_relaxed);
+            s.completed_jobs = t.completed_jobs.load(std::memory_order_relaxed);
+            s.completed_bytes = t.completed_bytes.load(std::memory_order_relaxed);
+            s.demand_jobs = t.demand_jobs.load(std::memory_order_relaxed);
+            s.demand_completed_bytes = t.demand_completed_bytes.load(std::memory_order_relaxed);
+            s.prefetch_jobs = t.prefetch_jobs.load(std::memory_order_relaxed);
+            s.prefetch_completed_bytes = t.prefetch_completed_bytes.load(std::memory_order_relaxed);
+            s.queue_ns = t.queue_ns.load(std::memory_order_relaxed);
+            s.service_ns = t.service_ns.load(std::memory_order_relaxed);
+            s.wait_ns = t.wait_ns.load(std::memory_order_relaxed);
+            s.demand_queue_ns = t.demand_queue_ns.load(std::memory_order_relaxed);
+            s.demand_service_ns = t.demand_service_ns.load(std::memory_order_relaxed);
+            s.prefetch_queue_ns = t.prefetch_queue_ns.load(std::memory_order_relaxed);
+            s.prefetch_service_ns = t.prefetch_service_ns.load(std::memory_order_relaxed);
+            s.cold_jobs = t.cold_jobs.load(std::memory_order_relaxed);
+            s.cold_bytes = t.cold_bytes.load(std::memory_order_relaxed);
+            s.cold_queue_ns = t.cold_queue_ns.load(std::memory_order_relaxed);
+            s.cold_service_ns = t.cold_service_ns.load(std::memory_order_relaxed);
+            s.queue_depth_max = t.queue_depth_max.load(std::memory_order_relaxed);
+            s.queue_p50_ns = t.queue_hist.percentile(0.50);
+            s.queue_p95_ns = t.queue_hist.percentile(0.95);
+            s.service_p50_ns = t.service_hist.percentile(0.50);
+            s.service_p95_ns = t.service_hist.percentile(0.95);
+            s.cold_service_p50_ns = t.cold_service_hist.percentile(0.50);
+            s.cold_service_p95_ns = t.cold_service_hist.percentile(0.95);
+        }
+        out.push_back(std::move(s));
+    }
+    return out;
 }
 
 inline void ExpertTierSet::drain() {
