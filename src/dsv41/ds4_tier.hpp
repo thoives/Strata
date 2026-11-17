@@ -44,6 +44,7 @@
 #include <vector>
 
 #if !defined(_WIN32)
+#include <cerrno>
 #include <fcntl.h>
 #include <sys/mman.h>
 #if !defined(_WIN32)
@@ -52,6 +53,11 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <linux/fs.h>        // BLKSSZGET: a block device's logical block size (DS4_TIER_DIRECT)
+#include <sys/ioctl.h>
+#include <sys/syscall.h>     // statx(2) by number: the unbuffered alignments, without a newer libc's header
+#endif
 #else
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -352,6 +358,14 @@ public:
         uint64_t queue_p50_ns = 0, queue_p95_ns = 0;
         uint64_t service_p50_ns = 0, service_p95_ns = 0;
         uint64_t cold_service_p50_ns = 0, cold_service_p95_ns = 0;
+        // DS4_TIER_DIRECT: "" with the mode off; else "mapped" (no direct descriptor for this device), "direct", or "fallback"
+        // (the device refused an unbuffered read at run time: its later hits are mapped copies).  Whole-slot jobs, counted apart:
+        // one direct job is a whole slot (padding included), not three matrix copies.
+        std::string direct_mode;
+        uint64_t direct_jobs = 0, direct_ok = 0, direct_fallbacks = 0, direct_failed = 0;
+        uint64_t direct_slot_bytes = 0, direct_slot_ok_bytes = 0, direct_payload_ok_bytes = 0;
+        uint64_t direct_queue_ns = 0, direct_service_ns = 0;
+        uint64_t direct_service_p50_ns = 0, direct_service_p95_ns = 0;
     };
 
     ExpertTierSet() = default;
@@ -417,6 +431,24 @@ public:
     void note_copy_wait(int dev, uint64_t ns);
     std::vector<DeviceStats> stats() const;
 
+    /// DS4_TIER_DIRECT (opt-in, Linux; read when the tier opens): false = mapped copies, the default and the fallback; true =
+    /// a tier hit may be one whole-slot unbuffered read into the store's slot, on the device that holds it, where its
+    /// descriptor checked out at open.  A device that refuses such a read falls back to mapped copies for the rest of the run.
+    bool direct_mode() const { return direct_mode_; }
+    /// True when at least one device opened a direct descriptor (the store then makes its arena not inherited by a fork).
+    bool direct_active() const {
+        for (const Dev& d : devs_) if (d.direct_capable) return true;
+        return false;
+    }
+    /// The whole slot k of device dev as one direct read, when that device can take one now: its descriptor is open and not
+    /// refused, and the slot lies inside the device at the device's alignments.  False: the store copies the slot from the
+    /// mapping, as before.  Called by the store under its lock; the descriptor stays open until the device's queue has drained.
+    bool direct_slot(int dev, uint64_t k, ExpertStore::TierDirect& out) const;
+    /// Tests only: treat each device as direct-capable through an ordinary (buffered) descriptor of the same file, aligned to 4 KiB,
+    /// so the queue's retry and failure policy can be exercised on a file system that does not support O_DIRECT.  Must be set
+    /// before open().  Never set by the engine.
+    void set_direct_test_force(bool f) { direct_force_ = f; }
+
     bool readable() const { return readable_.load(std::memory_order_acquire); }   // lookups answer only after a reuse or a completed fill
     // Tests only: `f(device)` true makes that device's next flush fail (a full disk, an I/O error).
     void set_flush_fault(std::function<bool(size_t)> f) { flush_fault_ = std::move(f); }
@@ -445,6 +477,14 @@ private:
         // it (note_refill) and read it (find) while the main thread may be filling
         std::unique_ptr<std::atomic<bool>> mark{new std::atomic<bool>(false)};
         size_t index = 0;       // the device's place in the configuration (the flush fault's argument)
+        bool block = false;     // a Linux block device (not a regular file)
+        // DS4_TIER_DIRECT: a second, unbuffered descriptor of the same device, opened and checked at open (direct_open_one).
+        // `direct_capable` is fixed then; `direct_refused` is set by the queue when a read is refused (thread-safe: read by the
+        // store's threads and written by the device's workers).  The descriptor is closed by close_one, after the queue drains.
+        bool direct_capable = false;
+        int dfd = -1;
+        uint64_t dalign = 0, dmem_align = 0;   // the unbuffered alignments: offset and length; memory
+        std::unique_ptr<std::atomic<bool>> direct_refused{new std::atomic<bool>(false)};
 #if !defined(_WIN32)
         int fd = -1;
 #else
@@ -462,8 +502,13 @@ private:
     bool tracing_ = false;
     int64_t held_ = 0;
     std::vector<std::string> notes_;
+    bool direct_mode_ = false;    // DS4_TIER_DIRECT=1 (read at open)
+    bool direct_force_ = false;   // tests only (set_direct_test_force)
 
     static uint64_t align_up(uint64_t v, uint64_t a) { return (v + a - 1) & ~(a - 1); }
+    void direct_open_all();                       // DS4_TIER_DIRECT: each device's descriptor, and the one line that says which mode it runs
+    bool direct_open_one(Dev& d, std::string& why);   // Linux: false with `why` leaves the device mapped
+    std::string direct_state(const Dev& d) const;     // "", "mapped", "direct" or "fallback" (DeviceStats::direct_mode)
     bool open_one(Dev& d, std::string& err);
     void close_one(Dev& d);
     bool flush(Dev& d);   // false: the bytes may not be on the disk (msync / FlushViewOfFile / FlushFileBuffers failed)
@@ -475,6 +520,18 @@ private:
 
 inline bool ExpertTierSet::open(const std::vector<TierSpec>& specs, std::string& err, const std::vector<std::string>& protect) {
     close();   // (a set opened again: the previous devices' handles and mappings are released first - and their marks make the next decide write fill_state 1, §6.4)
+    // DS4_TIER_DIRECT (opt-in): unset or 0 = mapped copies (the default, nothing extra); 1 = direct reads where a device allows
+    // them.  Read here, at open, from the engine's own environment: a later change does not reach a running engine.  Any other
+    // value is refused before a device is touched, so a typo never selects a mode silently.
+    direct_mode_ = false;
+    if (const char* dv = std::getenv("DS4_TIER_DIRECT")) {
+        if (std::strcmp(dv, "0") == 0) direct_mode_ = false;
+        else if (std::strcmp(dv, "1") == 0) direct_mode_ = true;
+        else {
+            err = std::string("DS4_TIER_DIRECT=") + dv + ": expected 0 (mapped copies, the default) or 1 (direct reads, experimental, Linux)";
+            return false;
+        }
+    }
     if (specs.empty()) { err = "expert tier: no --expert-tier entries"; return false; }
     for (size_t i = 0; i < specs.size(); ++i)
         for (size_t j = i + 1; j < specs.size(); ++j)
@@ -540,6 +597,8 @@ inline bool ExpertTierSet::open(const std::vector<TierSpec>& specs, std::string&
         devs_.clear();
         return false;
     }
+    // DS4_TIER_DIRECT: only now - every check above has passed - does a device get its unbuffered descriptor
+    if (direct_mode_) direct_open_all();
     return true;
 }
 
@@ -575,7 +634,7 @@ inline bool ExpertTierSet::open_one(Dev& d, std::string& err) {
         ::close(fd);
         return false;
     }
-    d.fd = fd; d.base = (uint8_t*)m; d.size = dev_size; d.opened = true;
+    d.fd = fd; d.base = (uint8_t*)m; d.size = dev_size; d.opened = true; d.block = is_block;
     return true;
 }
 inline bool ExpertTierSet::flush(Dev& d) {
@@ -595,6 +654,9 @@ inline void ExpertTierSet::close_one(Dev& d) {
         flush(d);
     }
     ::munmap((void*)d.base, (size_t)d.size);
+    if (d.dfd >= 0) ::close(d.dfd);   // (the unbuffered descriptor: after the queue has drained, so no read is in flight on it)
+    d.dfd = -1;
+    d.direct_capable = false;
     if (d.fd >= 0) ::close(d.fd);
     d.base = nullptr; d.fd = -1; d.opened = false;
 }
@@ -963,6 +1025,7 @@ inline std::vector<ExpertTierSet::DeviceStats> ExpertTierSet::stats() const {
     for (const Dev& d : devs_) {
         DeviceStats s;
         s.path = d.spec.path;
+        s.direct_mode = direct_state(d);
         if (d.trace) {
             const TierIoStats& t = *d.trace;
             s.started_experts = t.started_experts.load(std::memory_order_relaxed);
@@ -995,10 +1058,146 @@ inline std::vector<ExpertTierSet::DeviceStats> ExpertTierSet::stats() const {
             s.service_p95_ns = t.service_hist.percentile(0.95);
             s.cold_service_p50_ns = t.cold_service_hist.percentile(0.50);
             s.cold_service_p95_ns = t.cold_service_hist.percentile(0.95);
+            s.direct_jobs = t.direct_jobs.load(std::memory_order_relaxed);
+            s.direct_ok = t.direct_ok.load(std::memory_order_relaxed);
+            s.direct_fallbacks = t.direct_fallbacks.load(std::memory_order_relaxed);
+            s.direct_failed = t.direct_failed.load(std::memory_order_relaxed);
+            s.direct_slot_bytes = t.direct_slot_bytes.load(std::memory_order_relaxed);
+            s.direct_slot_ok_bytes = t.direct_slot_ok_bytes.load(std::memory_order_relaxed);
+            s.direct_payload_ok_bytes = t.direct_payload_ok_bytes.load(std::memory_order_relaxed);
+            s.direct_queue_ns = t.direct_queue_ns.load(std::memory_order_relaxed);
+            s.direct_service_ns = t.direct_service_ns.load(std::memory_order_relaxed);
+            s.direct_service_p50_ns = t.direct_service_hist.percentile(0.50);
+            s.direct_service_p95_ns = t.direct_service_hist.percentile(0.95);
         }
         out.push_back(std::move(s));
     }
     return out;
+}
+
+// ---- DS4_TIER_DIRECT (opt-in, Linux): the device's second, unbuffered descriptor -------------------------------------------
+// O_DIRECT belongs to an open file description, not to a descriptor: a dup() shares the buffered one, and a flag set on the
+// tier's own descriptor would change every read of the mapping's neighbours while workers run.  So the device is opened a second
+// time (through /proc/self/fd: the same open file, no path looked up again), and that descriptor is checked to be the tier's own
+// file or device, of the tier's size, before a read is ever sent to it.  A block device's second open is a plain open (the
+// tier's exclusive O_EXCL open is not repeated); the kernel refuses that only for a device held exclusively by someone else,
+// which the identity check already excludes.
+
+#if defined(__linux__)
+/// The unbuffered alignments of an open file or device: the offset and length (`off_align`) and the memory (`mem_align`), from
+/// statx(STATX_DIOALIGN): the file system's or the device's own answer (Linux 6.1+).  A block device also answers with its
+/// logical block size (BLKSSZGET) when statx says nothing.  False when neither answers, or the values are not powers of two
+/// that divide the store's 4 KiB slot alignment (so one slot's offset, length and memory satisfy both).
+inline bool tier_dio_alignment(int fd, bool block, uint64_t& off_align, uint64_t& mem_align) {
+    struct StatxOut {   // the kernel's struct statx (256 bytes); the fields read here are at their kernel offsets
+        uint32_t mask, blksize;
+        uint64_t attributes;
+        uint32_t nlink, uid, gid;
+        uint16_t mode, spare0;
+        uint64_t ino, size, blocks, attributes_mask;
+        uint64_t times[8];
+        uint32_t rdev_major, rdev_minor, dev_major, dev_minor;
+        uint64_t mnt_id;
+        uint32_t dio_mem_align, dio_offset_align;
+        uint64_t spare3[12];
+    };
+    static_assert(sizeof(StatxOut) == 256, "struct statx is 256 bytes");
+    constexpr unsigned kStatxDioAlign = 0x2000u;   // STATX_DIOALIGN
+    off_align = mem_align = 0;
+#if defined(SYS_statx)
+    StatxOut sx{};
+    if (syscall(SYS_statx, fd, "", AT_EMPTY_PATH, kStatxDioAlign, &sx) == 0 && (sx.mask & kStatxDioAlign) != 0) {
+        off_align = sx.dio_offset_align;
+        mem_align = sx.dio_mem_align;
+    }
+#endif
+    if (block && off_align == 0) {
+        int ss = 0;
+        if (ioctl(fd, BLKSSZGET, &ss) == 0 && ss > 0) off_align = (uint64_t) ss;
+    }
+    if (off_align == 0) return false;
+    if (mem_align == 0) mem_align = off_align;
+    auto good = [](uint64_t v) { return v != 0 && (v & (v - 1)) == 0 && os::kDirectAlign % v == 0; };
+    return good(off_align) && good(mem_align);
+}
+
+inline bool ExpertTierSet::direct_open_one(Dev& d, std::string& why) {
+    char via[64];
+    std::snprintf(via, sizeof via, "/proc/self/fd/%d", d.fd);
+    const int dfd = ::open(via, O_RDONLY | O_CLOEXEC | (direct_force_ ? 0 : O_DIRECT));
+    if (dfd < 0) {
+        why = std::string("the file system refuses unbuffered reads (") + std::strerror(errno) + ")";
+        return false;
+    }
+    // the same file or device as the tier's own descriptor (a path swapped meanwhile names another file: refused here)
+    strata::core::TierFileId a, b;
+    uint64_t sz = 0;
+    bool blk = false;
+    std::string sw;
+    const bool same = strata::core::tier_fd_id(d.fd, a) && strata::core::tier_fd_id(dfd, b) && a.valid && b.valid &&
+                      a.dev == b.dev && a.ino == b.ino && a.rdev == b.rdev && a.block == b.block;
+    if (!same) {
+        ::close(dfd);
+        why = "the unbuffered descriptor is not the tier's own file or device";
+        return false;
+    }
+    if (!strata::core::tier_fd_size(dfd, sz, blk, sw) || sz != d.size) {
+        ::close(dfd);
+        why = "the unbuffered descriptor's size is not the tier's";
+        return false;
+    }
+    uint64_t off_al = 0, mem_al = 0;
+    if (direct_force_) {
+        off_al = mem_al = os::kDirectAlign;   // (tests: the buffered descriptor, aligned as the store's slots are)
+    } else if (!tier_dio_alignment(dfd, d.block, off_al, mem_al)) {
+        ::close(dfd);
+        why = "the device does not say what alignment unbuffered reads need";
+        return false;
+    }
+    d.dfd = dfd;
+    d.dalign = off_al;
+    d.dmem_align = mem_al;
+    d.direct_capable = true;
+    return true;
+}
+#else
+inline bool ExpertTierSet::direct_open_one(Dev&, std::string& why) {
+    why = "unbuffered tier reads are built for Linux only (this build keeps the mapped copies)";
+    return false;
+}
+#endif
+
+inline void ExpertTierSet::direct_open_all() {
+    for (Dev& d : devs_) {
+        std::string why;
+        if (direct_open_one(d, why)) {
+            std::fprintf(stderr, "expert tier %s: DS4_TIER_DIRECT=1: direct reads (one whole slot a read, unbuffered; alignment %llu, memory %llu)\n",
+                         d.spec.path.c_str(), (unsigned long long) d.dalign, (unsigned long long) d.dmem_align);
+        } else {
+            std::fprintf(stderr, "expert tier %s: DS4_TIER_DIRECT=1: mapped copies (%s)\n", d.spec.path.c_str(), why.c_str());
+        }
+    }
+}
+
+inline std::string ExpertTierSet::direct_state(const Dev& d) const {
+    if (!direct_mode_) return "";
+    if (!d.direct_capable) return "mapped";
+    return d.direct_refused->load(std::memory_order_acquire) ? "fallback" : "direct";
+}
+
+inline bool ExpertTierSet::direct_slot(int dev, uint64_t k, ExpertStore::TierDirect& out) const {
+    if (dev < 0 || dev >= (int) devs_.size() || slot_bytes_ == 0) return false;
+    const Dev& d = devs_[(size_t) dev];
+    if (!d.direct_capable || d.dfd < 0 || d.direct_refused->load(std::memory_order_acquire)) return false;
+    // the slot lies inside the device: k is below the device's whole slots, so k * slot_bytes_ cannot overflow
+    if (d.size < data_off_ || k >= (d.size - data_off_) / slot_bytes_) return false;
+    out.fd = (os::fd_t) d.dfd;
+    out.off = data_off_ + k * slot_bytes_;   // (the tier's slot k starts here: the store's slot starts at the same layout)
+    out.len = slot_bytes_;
+    out.align = d.dalign;
+    out.mem_align = d.dmem_align;
+    out.refused = d.direct_refused.get();
+    return true;
 }
 
 inline void ExpertTierSet::drain() {

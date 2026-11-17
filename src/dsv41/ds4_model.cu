@@ -5749,6 +5749,15 @@ struct Model::Impl {
                         [this](int dev) { return tier->queue(dev); },
                         [this](int dev) { tier->note_refill(dev); },
                         [this]() { if (tier) tier->drain(); });   // (the store's destructor: every queued tier copy lands before the arena is released)
+        // DS4_TIER_DIRECT (opt-in, Linux; ds4_tier.hpp): a tier hit may be one whole-slot unbuffered read into the store's slot.
+        // The arena is then not inherited by a fork (MADV_DONTFORK): a direct read into private memory that a fork shares can
+        // land in the wrong copy.  Set here, before any read: the tier's devices are open and known to be direct or mapped.
+        if (tier->direct_active()) {   // (mode off, or no device direct: no hook, the path is the mapped one as before)
+            if (store->no_fork_arena())
+                store->set_tier_direct([this](int dev, uint64_t slot, ExpertStore::TierDirect& out) { return tier->direct_slot(dev, slot, out); });
+            else
+                std::fprintf(stderr, "ds4: expert tier: DS4_TIER_DIRECT: the RAM store's arena could not be kept from forks: every tier hit stays a mapped copy\n");
+        }
         if (tier->tracing()) {
             store->set_tier_trace(
                 [this](int dev, uint64_t bytes, bool demand) { tier->note_copy_start(dev, bytes, demand); },
@@ -11014,6 +11023,18 @@ const Stats& Model::stats() const {
                 x.service_p95_ms = (double) d.service_p95_ns / 1e6;
                 x.cold_service_p50_ms = (double) d.cold_service_p50_ns / 1e6;
                 x.cold_service_p95_ms = (double) d.cold_service_p95_ns / 1e6;
+                x.direct_mode = d.direct_mode;
+                x.direct_jobs = (int64_t) d.direct_jobs;
+                x.direct_ok = (int64_t) d.direct_ok;
+                x.direct_fallbacks = (int64_t) d.direct_fallbacks;
+                x.direct_failed = (int64_t) d.direct_failed;
+                x.direct_slot_bytes = (int64_t) d.direct_slot_bytes;
+                x.direct_slot_ok_bytes = (int64_t) d.direct_slot_ok_bytes;
+                x.direct_payload_ok_bytes = (int64_t) d.direct_payload_ok_bytes;
+                x.direct_queue_ms = (double) d.direct_queue_ns / 1e6;
+                x.direct_service_ms = (double) d.direct_service_ns / 1e6;
+                x.direct_service_p50_ms = (double) d.direct_service_p50_ns / 1e6;
+                x.direct_service_p95_ms = (double) d.direct_service_p95_ns / 1e6;
                 st.tier_dev_stats.push_back(std::move(x));
             }
         }

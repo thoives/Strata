@@ -52,6 +52,16 @@ public:
         // the expert tier (ds4_tier.hpp, §8.2): copies served from a tier slot into a store slot.  Not counted in bytes_read
         // (file bytes), so the file-read figure stays meaningful (§8.2 there).
         std::atomic<int64_t> tier_hits{0}, tier_bytes{0};
+        std::atomic<int64_t> tier_direct{0};   // (DS4_TIER_DIRECT: tier hits submitted as one whole-slot direct read; the rest are mapped copies)
+    };
+    /// DS4_TIER_DIRECT (ds4_tier.hpp): a tier slot's whole read, if its device can take one now.  `fd` is the device's unbuffered
+    /// descriptor (kept open until the device's queue has drained); [off, off + len) is the slot in that device; `align` and
+    /// `mem_align` are its unbuffered requirements (offset and length; memory); `refused` is set by the queue when the device
+    /// refuses unbuffered reads (then no more direct reads from it).
+    struct TierDirect {
+        os::fd_t fd = os::kBadFd;
+        uint64_t off = 0, len = 0, align = 0, mem_align = 0;
+        std::atomic<bool>* refused = nullptr;
     };
     struct Vis {                 // a slot the GPU may read from now on (dev != 0), or no longer (dev == 0)
         int layer = 0, e = 0;
@@ -90,9 +100,23 @@ public:
         // store's arena and slots (the destination, `left`, `bad`, `fail`), so those queues must finish them before the arena
         // is released.  The tier owns the queues; the store only asks for them to be drained.
         std::function<void()> tier_drain;
+        // DS4_TIER_DIRECT (null: every tier hit is a mapped copy, as before): the whole slot of a tier hit as one direct read,
+        // when the device can take it now (false: the mapped copies, as before)
+        std::function<bool(int dev, uint64_t slot, TierDirect& out)> tier_direct;
     };
 
     void set_pfds(const std::vector<os::fd_t>& pfds) { pfds_ = pfds; }   // (the fallback handles were reopened)
+    void set_tier_direct(std::function<bool(int, uint64_t, TierDirect&)> f) { cfg_.tier_direct = std::move(f); }
+    /// DS4_TIER_DIRECT: the arena is not inherited by a fork.  A direct read into private memory that a fork shares copy-on-write
+    /// can land in the wrong copy (the kernel's O_DIRECT and fork hazard), so the arena's range is MADV_DONTFORK.  Call it before
+    /// the first direct read (the tier does, when a device is direct).  False: the advice was refused (the caller stays mapped).
+    bool no_fork_arena() {
+#if defined(__linux__)
+        return arena_ != nullptr && ::madvise(arena_, arena_bytes_, MADV_DONTFORK) == 0;
+#else
+        return false;
+#endif
+    }
     void set_tier(std::function<bool(int, int, int&, uint64_t&)> find, std::function<uint8_t*(int, uint64_t)> base,
                   std::function<IoQueue*(int)> q, std::function<void(int)> fail,
                   std::function<void()> drain = nullptr) {   // (after the tier decided: reuse or fill placed bytes first, §8.1/§8.5)
@@ -544,6 +568,15 @@ private:
         if (cfg_.policy != kLru && ++hits_in_layer_[(size_t) layer] % (uint64_t) cfg_.decay_every == 0)
             for (float& h : heat_[(size_t) layer]) h *= cfg_.decay;   // (a linear pass over 384 floats every 240 accesses of that layer)
     }
+    // DS4_TIER_DIRECT: the checks before a direct read lands in this slot (mu_ held).  The read is the store's whole slot, the
+    // device's alignments hold for the offset, the length and the memory, and the destination is inside the committed arena.
+    bool direct_fits(const TierDirect& td, const Slot& sp) const {
+        if (td.fd == os::kBadFd || sp.base == nullptr || td.len != slot_bytes_) return false;
+        if (td.align == 0 || td.mem_align == 0 || (td.align & (td.align - 1)) != 0 || (td.mem_align & (td.mem_align - 1)) != 0) return false;
+        const uintptr_t dst = (uintptr_t) (sp.base - kSlack), lo = (uintptr_t) arena_, hi = lo + arena_bytes_;
+        if (dst < lo || dst > hi || slot_bytes_ > hi - dst) return false;
+        return td.off % td.align == 0 && td.len % td.align == 0 && dst % td.mem_align == 0 && td.len % td.mem_align == 0;
+    }
     // a slot for (layer, e) and its reads started; -1 if there is none to be had.  mu_ held.
     int start_fill(int layer, int e, bool demand) {
         int s = take_slot(demand);
@@ -567,8 +600,6 @@ private:
         sp.bad.store(false);
         sp.cancel.store(false);
         sp.fail.store(false);
-        sp.left.store(3, std::memory_order_release);
-        where_[(size_t) layer][(size_t) e] = s;
         const LayerGeo& g = geo_[(size_t) layer];
         IoQueue::Job jobs[3];
         // §8.1: a store miss checks the tier next.  A tier hit is served by three memory-copy jobs (ds4_pool.hpp's
@@ -591,6 +622,35 @@ private:
             if (cfg_.tier_note_start) cfg_.tier_note_start(tdev, nb, demand);
         }
         sp.src_dev = tdev;   // (the slot records its source: finish() marks a failed tier's device)
+        // DS4_TIER_DIRECT (§3/§4): a tier hit whose device can take the whole slot now is ONE direct read into this slot, on the
+        // device's queue, with the same priority.  Anything the checks refuse is the three mapped copies below, as before.  The
+        // count is set before the slot is findable (where_ is published after it).
+        TierDirect td;
+        const bool direct = tdev >= 0 && cfg_.tier_direct && cfg_.tier_direct(tdev, tslot, td) && direct_fits(td, sp);
+        sp.left.store(direct ? 1 : 3, std::memory_order_release);
+        where_[(size_t) layer][(size_t) e] = s;
+        if (direct) {
+            IoQueue::Job dj;
+            dj.dfd = td.fd;
+            dj.off = td.off;
+            dj.len = td.len;
+            dj.dst = sp.base - kSlack;   // (the store's slot starts kSlack before its blob: the tier's slot has the same layout, E2)
+            dj.align = td.align;
+            dj.mem_align = td.mem_align;
+            dj.payload = g.bytes[0] + g.bytes[1] + g.bytes[2];
+            dj.fallback = tbase - kSlack;   // (the same slot in the tier's mapping: copied if the device refuses the direct read)
+            dj.refused = td.refused;
+            dj.tier_direct = true;
+            dj.left = &sp.left;
+            dj.bad = &sp.bad;
+            dj.fail = &sp.fail;
+            dj.cancel = demand ? nullptr : &sp.cancel;
+            dj.tier_copy = true;
+            dj.demand = demand;
+            st_.tier_direct.fetch_add(1, std::memory_order_relaxed);
+            tq->push(&dj, 1, !demand);
+            return s;
+        }
         for (int r = 0; r < 3; ++r) {
             uint8_t* fin = sp.base + g.tr[r];   // where the matrix belongs
             IoQueue::Job& j = jobs[r];

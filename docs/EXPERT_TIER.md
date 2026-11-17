@@ -93,6 +93,12 @@ Differences from the Qwen engine, in plain words:
 - **A per-device breakdown.** `DS4_TIER_LOG=1` (off by default; unset or `0` disables) makes `strata-dsv41` print one line per tier device at
   the end of a decode: copies and MB a token, the queue and copy times, the cold share, and the CPU lane's wait for
   that device. It is a diagnostic; the residency probe it adds runs only when the variable is set.
+- **Direct reads (experimental, Linux, off by default).** `DS4_TIER_DIRECT=1` lets a tier hit read its whole slot straight
+  into the RAM store with one unbuffered read, instead of three memory copies from the tier's mapping. Unset or `0` keeps
+  the copies, as before. Any other value stops the start with a message. The variable is read when the engine starts, so
+  it must be set in that process's environment. A device that cannot do unbuffered reads, or that refuses one while it
+  runs, keeps (or goes back to) the copies, and the log says which. Its output has not been compared with the copies on
+  real hardware yet: no speed claim is made, and the tier format is unchanged.
 
 This engine's plan is [EXPERT_TIER_DSV41_PLAN.md](EXPERT_TIER_DSV41_PLAN.md).
 

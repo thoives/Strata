@@ -97,6 +97,12 @@ struct TierDeviceStats {
     double queue_p50_ms = 0.0, queue_p95_ms = 0.0;
     double service_p50_ms = 0.0, service_p95_ms = 0.0;
     double cold_service_p50_ms = 0.0, cold_service_p95_ms = 0.0;
+    // DS4_TIER_DIRECT (empty: the mode is off): "mapped", "direct" or "fallback"; whole-slot jobs, apart from the copies above
+    std::string direct_mode;
+    int64_t direct_jobs = 0, direct_ok = 0, direct_fallbacks = 0, direct_failed = 0;
+    int64_t direct_slot_bytes = 0, direct_slot_ok_bytes = 0, direct_payload_ok_bytes = 0;
+    double direct_queue_ms = 0.0, direct_service_ms = 0.0;
+    double direct_service_p50_ms = 0.0, direct_service_p95_ms = 0.0;
 };
 
 struct Stats {

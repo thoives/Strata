@@ -3,7 +3,10 @@
 // experts come off the tier and are the same bytes (§8.1/§8.2), a start reuses the placement and copies nothing (5), a
 // profile change does not refill (6), while a pack, guard, torn-header, corrupt-table, abandoned-fill or verify=full
 // mismatch refills (7), and a failed copy marks its device (§9).
-//   ds4_expert_tier_test   exit 0: all passed
+// DS4_TIER_DIRECT (opt-in, Linux): the read policy with injected errno values and short reads, the store and queue on a forced
+// direct tier (any filesystem), and a real O_DIRECT read of the tier's slots.  The real read is SKIPPED (reported, not counted)
+// where the test directory refuses O_DIRECT reads or the device gives no alignment; set DS4_TIER_TEST_DIR to one that does.
+//   ds4_expert_tier_test   exit 0: all passed (a skip is reported in the last line)
 #include "ds4_tier.hpp"
 
 #include <algorithm>
@@ -15,10 +18,13 @@
 #include <map>
 #include <memory>
 #include <cstdlib>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
 #if !defined(_WIN32)
+#include <cerrno>
+#include <fcntl.h>
 #include <unistd.h>
 #endif
 
@@ -248,6 +254,630 @@ struct BigCopy {
         q->push(&j, 1, false);
     }
 };
+
+static int skips = 0;   // (direct-I/O checks that could not run here: reported, never counted as passed)
+#if !defined(_WIN32)
+// ---- DS4_TIER_DIRECT (opt-in, Linux): one whole-slot direct read into a store slot (ds4_tier.hpp, ds4_store.hpp) --------------
+// Three kinds of check.  (1) The read policy on its own (os::pread_exact_direct, with injected errno values and short reads):
+// any filesystem.  (2) The store and the tier's queue on a FORCED direct tier (set_direct_test_force: an ordinary buffered
+// descriptor, aligned as the slots are, so the retry, refusal and failure paths run on any filesystem).  (3) A real O_DIRECT
+// read of the tier's slots, which SKIPS (and is not counted as a pass) where the test directory refuses O_DIRECT reads; set
+// DS4_TIER_TEST_DIR to a directory that takes them.
+enum Inject { kPass, kEintr, kShort4k, kShortOdd, kEinval, kEio, kZero };
+static std::mutex g_inj_mu;
+static std::vector<int> g_inj;   // the next injected outcomes of the direct path's reads, front first (empty: pass-through)
+static int g_inj_calls = 0;      // direct reads that reached the injected read
+
+static ssize_t inject_pread(int fd, void* buf, size_t n, off_t off) {
+    int code = kPass;
+    {
+        std::lock_guard<std::mutex> lk(g_inj_mu);
+        ++g_inj_calls;
+        if (!g_inj.empty()) {
+            code = g_inj.front();
+            g_inj.erase(g_inj.begin());
+        }
+    }
+    switch (code) {
+        case kEintr: errno = EINTR; return -1;
+        case kShort4k: return ::pread(fd, buf, n > 4096 ? 4096 : n, off);   // a short read at an aligned point
+        case kShortOdd: return ::pread(fd, buf, n > 512 ? 512 : n, off);    // a short read that leaves an unaligned remainder
+        case kEinval: errno = EINVAL; return -1;
+        case kEio: errno = EIO; return -1;
+        case kZero: return 0;
+        default: return ::pread(fd, buf, n, off);
+    }
+}
+static void inject_plan(const std::vector<int>& plan) {
+    std::lock_guard<std::mutex> lk(g_inj_mu);
+    g_inj = plan;
+}
+static int inject_calls() {
+    std::lock_guard<std::mutex> lk(g_inj_mu);
+    return g_inj_calls;
+}
+
+// The read policy alone: the outcome, the bytes, the retries, and what is refused without any read being sent.
+static void direct_policy_checks(const fs::path& dir) {
+    const std::string p = (dir / "policy.bin").string();
+    std::vector<uint8_t> data(3 * MB4);
+    for (size_t i = 0; i < data.size(); ++i) data[i] = shard_byte(i);
+    {
+        std::FILE* f = std::fopen(p.c_str(), "wb");
+        std::fwrite(data.data(), 1, data.size(), f);
+        std::fclose(f);
+    }
+    const int fd = ::open(p.c_str(), O_RDONLY);
+    CHECK(fd >= 0);
+    void* raw = nullptr;
+    CHECK(posix_memalign(&raw, 4096, 2 * MB4) == 0);
+    uint8_t* buf = (uint8_t*) raw;
+    const os::DirectPreadFn saved = os::direct_pread_hook();
+    os::direct_pread_hook() = inject_pread;
+    // one read of n bytes at off under `plan`: the outcome must be `want`, and for kOk the bytes must be the file's
+    auto run = [&](const std::vector<int>& plan, uint64_t off, uint64_t n, os::DirectRead want) {
+        inject_plan(plan);
+        std::memset(buf, 0, 2 * MB4);
+        const os::DirectRead r = os::pread_exact_direct((os::fd_t) fd, buf, n, off, 4096, 4096);
+        CHECK(r == want);
+        if (r == os::DirectRead::kOk) CHECK(std::memcmp(buf, data.data() + off, (size_t) n) == 0);
+    };
+    run({}, MB4, MB4, os::DirectRead::kOk);                             // (pass-through)
+    run({kEintr}, 0, 2 * MB4, os::DirectRead::kOk);                     // EINTR: retried
+    run({kShort4k}, 0, 2 * MB4, os::DirectRead::kOk);                   // a short aligned read: continued
+    run({kShortOdd}, 0, 2 * MB4, os::DirectRead::kFailed);              // a short unaligned read: cannot continue
+    run({kZero}, 0, 2 * MB4, os::DirectRead::kFailed);                  // the device ends before the slot does
+    run({kEio}, 0, 2 * MB4, os::DirectRead::kFailed);                   // a genuine I/O error: a device failure
+    run({kEinval}, 0, 2 * MB4, os::DirectRead::kUnsupported);           // refused: the device does not do direct reads
+    run({kShort4k, kEinval}, 0, 2 * MB4, os::DirectRead::kUnsupported); // refused after a partial read: still refused
+    // misaligned requests are refused before any read is sent
+    int before = inject_calls();
+    run({}, 512, MB4, os::DirectRead::kUnsupported);                    // offset
+    run({}, 0, MB4 + 512, os::DirectRead::kUnsupported);                // length
+    CHECK(inject_calls() == before);
+    {
+        const os::DirectRead r = os::pread_exact_direct((os::fd_t) fd, buf + 512, MB4, 0, 4096, 4096);   // memory
+        CHECK(r == os::DirectRead::kUnsupported);
+        CHECK(inject_calls() == before);
+    }
+    os::direct_pread_hook() = saved;
+    CHECK(::close(fd) == 0);
+    std::free(raw);
+    fs::remove(p);
+}
+
+#if defined(__linux__)
+// Linux: whether the mapping that holds `addr` carries the kernel flag `flag` (/proc/self/smaps VmFlags: "dc" = not copied on fork).
+static bool vma_has_flag(uintptr_t addr, const std::string& flag) {
+    std::FILE* f = std::fopen("/proc/self/smaps", "r");
+    if (f == nullptr) return false;
+    char line[512];
+    bool inside = false, found = false;
+    while (std::fgets(line, sizeof line, f) != nullptr) {
+        unsigned long long lo = 0, hi = 0;
+        if (std::sscanf(line, "%llx-%llx ", &lo, &hi) == 2) {   // a mapping's header line
+            inside = addr >= (uintptr_t) lo && addr < (uintptr_t) hi;
+            continue;
+        }
+        if (inside && std::strncmp(line, "VmFlags:", 8) == 0) {
+            std::string s(line + 8);
+            size_t p = 0;
+            while (p < s.size()) {
+                const size_t q = s.find_first_of(" \n", p);
+                const std::string tok = s.substr(p, q == std::string::npos ? std::string::npos : q - p);
+                if (tok == flag) found = true;
+                if (q == std::string::npos) break;
+                p = q + 1;
+            }
+            break;
+        }
+    }
+    std::fclose(f);
+    return found;
+}
+#endif
+
+// A tier's test world: the World (its shard and devices in `base`), the store wired the way init_tier wires it (the drain,
+// and the direct hook when `direct` is set), and the tier.  The tier is closed (or dropped) by the caller, after unhook().
+struct Forced {
+    std::atomic<int> fails{0};   // the device failures the store reported (its tier_fail hook)
+    std::unique_ptr<ExpertTierSet> t;
+    std::unique_ptr<World> w;
+};
+
+static void unhook(Forced& f) {   // the store lets go of the tier before the tier closes (no hook may reach a closed tier)
+    f.w->st.set_tier(nullptr, nullptr, nullptr, nullptr);
+    f.w->st.set_tier_direct(nullptr);
+    f.w->st.set_tier_trace(nullptr, nullptr);
+}
+
+// (as ds4_model.cu's init_tier: the drain, the direct hook, and the trace hooks when DS4_TIER_LOG is set)
+static void wire(Forced& f) {
+    tier_hooks_drain(*f.w, f.t.get(), &f.fails);
+    f.w->st.set_tier_direct([&f](int dev, uint64_t s, ExpertStore::TierDirect& o) { return f.t->direct_slot(dev, s, o); });
+    if (f.t->tracing())
+        f.w->st.set_tier_trace([&f](int dev, uint64_t bytes, bool demand) { f.t->note_copy_start(dev, bytes, demand); },
+                               [&f](int dev, uint64_t ns) { f.t->note_copy_wait(dev, ns); });
+}
+
+// Opens the tier over a new world (its devices forced direct), decides, and fills it (unless `fill` is false: the caller fills).
+static bool open_forced(const fs::path& base, const std::string& name, const std::vector<std::pair<int32_t, int32_t>>& ranked,
+                        const std::string& pack, const std::string& prof, Forced& f, bool fill = true) {
+    f.t = std::make_unique<ExpertTierSet>();
+    f.w = std::make_unique<World>(base, name, false);
+    f.t->set_direct_test_force(true);
+    std::string err;
+    if (!f.t->open(f.w->specs, err)) { std::printf("FAIL open %s: %s\n", name.c_str(), err.c_str()); ++fails; return false; }
+    wire(f);
+    bool reused = true;
+    std::string why;
+    std::vector<std::string> notes;
+    CHECK(f.t->decide(SLOT, 2, 4, NL, NE, pack, prof, false, ranked, reused, why, notes));
+    CHECK(!reused);
+    if (fill) {
+        ExpertTierSet::Fill fl{};
+        CHECK(do_fill(*f.w, f.t.get(), fl));
+    }
+    return true;
+}
+
+// The three matrices of (l, e) in its store slot, which must be ready: the file's bytes.
+static bool store_ok(World& w, int l, int e) {
+    const int s = w.st.find(l, e);
+    if (s < 0) return false;
+    for (int r = 0; r < 3; ++r)
+        if (!same_matrix(w.st.mat(s, r), l, e, r)) return false;
+    return true;
+}
+
+// Ensures (l, e) through the store (a tier copy, or the file when the tier cannot serve it), checks its bytes, and releases it.
+static bool fetch_ok(World& w, int l, int e) {
+    const int es[1] = {e};
+    std::vector<char> ok;
+    const bool got = w.st.ensure(l, es, 1, ok) && ok[0] == 1;
+    const bool same = got && store_ok(w, l, e);
+    w.st.release(l, es, 1, ok);
+    return same;
+}
+
+static bool odirect_reads_ok(const fs::path& dir) {   // a file here that takes an O_DIRECT read of one aligned block
+#if !defined(__linux__)
+    (void) dir;
+    return false;   // (O_DIRECT is Linux's flag here: the real-device check is skipped)
+#else
+    std::error_code ec;
+    fs::create_directories(dir, ec);   // (a directory that cannot be made is a skip, not an exception)
+    if (ec) return false;
+    const std::string p = (dir / "odirect_probe.bin").string();
+    {
+        std::FILE* f = std::fopen(p.c_str(), "wb");
+        if (f == nullptr) return false;
+        std::vector<uint8_t> z(MB4, 0);
+        std::fwrite(z.data(), 1, z.size(), f);
+        std::fclose(f);
+    }
+    bool ok = false;
+    const int fd = ::open(p.c_str(), O_RDONLY | O_DIRECT);
+    if (fd >= 0) {
+        void* m = nullptr;
+        if (posix_memalign(&m, 4096, MB4) == 0) {
+            ok = ::pread(fd, m, MB4, 0) == (ssize_t) MB4;
+            std::free(m);
+        }
+        ::close(fd);
+    }
+    fs::remove(p);
+    return ok;
+#endif
+}
+
+static void direct_checks(const fs::path& base, const std::vector<std::pair<int32_t, int32_t>>& ranked,
+                          const std::string& pack, const std::string& prof) {
+    const int L = 2, E = 5;   // the expert the existing checks place on the tier
+    fs::create_directories(base);
+    set_env("DS4_TIER_LOG", "1");       // (the per-device counters these checks read)
+    set_env("DS4_TIER_THREADS", "1");   // (one worker a device: the injected reads are consumed in a known order)
+    direct_policy_checks(base);
+    // the queues' direct reads go through the injected read from here on (restored at the end of this function)
+    const os::DirectPreadFn saved_read = os::direct_pread_hook();
+    os::direct_pread_hook() = inject_pread;
+
+    // ---- the mode: unset and 0 are the mapped path (no direct descriptor, no mode in the stats); other values are refused ----
+    const char* off_values[] = {nullptr, "0"};
+    for (size_t i = 0; i < 2; ++i) {
+        set_env("DS4_TIER_DIRECT", off_values[i]);
+        auto t = std::make_unique<ExpertTierSet>();
+        auto w = std::make_unique<World>(base, "direct_off_" + std::to_string(i), false);
+        std::string err;
+        CHECK(t->open(w->specs, err));
+        CHECK(!t->direct_mode() && !t->direct_active());
+        for (const ExpertTierSet::DeviceStats& d : t->stats()) CHECK(d.direct_mode.empty());
+        ExpertStore::TierDirect o;
+        CHECK(!t->direct_slot(0, 0, o) && !t->direct_slot(1, 0, o));
+        t->close();
+        w.reset();
+    }
+    const char* bad_values[] = {"2", "yes", "", "01"};
+    for (size_t i = 0; i < 4; ++i) {
+        set_env("DS4_TIER_DIRECT", bad_values[i]);
+        auto t = std::make_unique<ExpertTierSet>();
+        auto w = std::make_unique<World>(base, "direct_bad_" + std::to_string(i), false);
+        std::string err;
+        CHECK(!t->open(w->specs, err));
+        CHECK(err.find("DS4_TIER_DIRECT") != std::string::npos);
+        CHECK(t->device_count() == 0);   // (refused before any device is touched)
+        w.reset();
+    }
+    set_env("DS4_TIER_DIRECT", "1");
+
+    // ---- a real O_DIRECT read of the tier's slots: skipped where the directory refuses O_DIRECT reads or a device refuses it ----
+    {
+        const fs::path odir = std::getenv("DS4_TIER_TEST_DIR") ? fs::path(std::getenv("DS4_TIER_TEST_DIR")) : base;
+        if (!odirect_reads_ok(odir)) {
+            std::printf("SKIP real O_DIRECT tier reads: %s does not take O_DIRECT reads (set DS4_TIER_TEST_DIR)\n", odir.c_str());
+            ++skips;
+        } else {
+            Forced f;
+            f.t = std::make_unique<ExpertTierSet>();
+            f.w = std::make_unique<World>(odir, "direct_real", false);
+            std::string err;
+            CHECK(f.t->open(f.w->specs, err));
+            if (!f.t->direct_active()) {
+                std::printf("SKIP real O_DIRECT tier reads: no device opened a direct descriptor here (see the DS4_TIER_DIRECT lines)\n");
+                ++skips;
+            } else {
+                wire(f);
+                bool reused = true;
+                std::string why;
+                std::vector<std::string> notes;
+                CHECK(f.t->decide(SLOT, 2, 4, NL, NE, pack, prof, false, ranked, reused, why, notes) && !reused);
+                ExpertTierSet::Fill fl{};
+                CHECK(do_fill(*f.w, f.t.get(), fl));
+                std::map<std::pair<int, int>, std::pair<int, uint64_t>> homes;
+                CHECK(check_bytes(*f.w, f.t.get(), ranked, homes) == 0);   // the placed bytes are the file's (the fill's own path)
+                int got = 0;
+                for (const auto& x : ranked) got += fetch_ok(*f.w, x.first, x.second) ? 1 : 0;
+                CHECK(got == (int) ranked.size());
+                const int64_t submitted = f.w->st.stats().tier_direct.load();
+                CHECK(submitted == (int64_t) ranked.size());   // every expert was a tier miss, and every one went direct
+                uint64_t ok_total = 0;
+                for (const ExpertTierSet::DeviceStats& d : f.t->stats()) {
+                    CHECK(d.direct_mode == "direct");
+                    CHECK(d.direct_failed == 0 && d.direct_fallbacks == 0);
+                    CHECK(d.direct_slot_ok_bytes == d.direct_ok * SLOT);
+                    CHECK(d.direct_payload_ok_bytes == d.direct_ok * 3 * MB4);
+                    CHECK(d.completed_jobs == 0);   // (no mapped copy ran: the copies' counters stay the mapped path's)
+                    ok_total += d.direct_ok;
+                }
+                CHECK(ok_total == (uint64_t) submitted);
+                unhook(f);
+                f.t->close();
+            }
+        }
+    }
+
+    // ---- the store and the queue on a forced direct tier (any filesystem): the injected outcomes of one direct read ----
+    set_env("DS4_TIER_DIRECT", "1");
+    struct Fault { const char* name; std::vector<int> plan; bool want_ok; int want_fails; };
+    // (plan, outcome) : kOk recovers in place; a device failure refills at the next start and the expert is read from the file
+    const std::vector<Fault> faults = {
+        {"EINTR then a short aligned read: recovered", {kEintr, kShort4k}, true, 0},
+        {"a short unaligned read: device failed", {kShortOdd}, false, 1},
+        {"a genuine I/O error: device failed", {kEio}, false, 1},
+        {"the device ends early: device failed", {kZero}, false, 1},
+    };
+    for (const Fault& fc : faults) {
+        Forced f;
+        CHECK(open_forced(base, std::string("direct_fault_") + std::to_string(&fc - faults.data()), ranked, pack, prof, f));
+        int d = -1;
+        uint64_t k = 0;
+        CHECK(f.t->find(L, E, d, k));
+        inject_plan(fc.plan);
+        const bool got = fetch_ok(*f.w, L, E);
+        CHECK(got == fc.want_ok);
+        CHECK(f.fails.load() == fc.want_fails);
+        int d2 = -1;
+        uint64_t k2 = 0;
+        CHECK(f.t->find(L, E, d2, k2) == (fc.want_fails == 0));   // a failed device is not served until it refills
+        if (!fc.want_ok) CHECK(fetch_ok(*f.w, L, E));              // the expert comes from the file now (the caller's fallback)
+        if (fc.want_fails == 1) {
+            const std::vector<ExpertTierSet::DeviceStats> ds = f.t->stats();
+            CHECK(ds[(size_t) d].direct_failed == 1 && ds[(size_t) d].direct_ok == 0 && ds[(size_t) d].direct_fallbacks == 0);
+        }
+        unhook(f);
+        f.t->close();
+    }
+    CHECK(inject_calls() > 0);   // (the injected reads did run: the outcomes above are the direct path's, not a mapped copy's)
+    inject_plan({});
+
+    // A refused unbuffered read (EINVAL): the slot is copied the mapped way, the device stops asking, and the device is not failed.
+    {
+        Forced f;
+        CHECK(open_forced(base, "direct_refused", ranked, pack, prof, f));
+        int d = -1;
+        uint64_t k = 0;
+        CHECK(f.t->find(L, E, d, k));
+        inject_plan({kShort4k, kEinval});   // (a partial read, then the refusal: the whole slot is copied, not the rest of it)
+        CHECK(fetch_ok(*f.w, L, E));
+        CHECK(f.fails.load() == 0);
+        CHECK(f.t->find(L, E, d, k));       // (the device still serves its experts: mapped now)
+        ExpertStore::TierDirect o;
+        CHECK(!f.t->direct_slot(d, k, o));  // (the refusal is recorded: no more direct reads from this device)
+        {
+            const std::vector<ExpertTierSet::DeviceStats> ds = f.t->stats();
+            CHECK(ds[(size_t) d].direct_mode == "fallback" && ds[(size_t) d].direct_fallbacks == 1 && ds[(size_t) d].direct_ok == 0);
+        }
+        // another expert of the same device: a mapped copy, not a direct read
+        int other = -1;
+        for (const auto& x : ranked) {
+            int dx = -1;
+            uint64_t kx = 0;
+            if (x != std::make_pair((int32_t) L, (int32_t) E) && f.t->find(x.first, x.second, dx, kx) && dx == d) {
+                other = 1;
+                const int64_t before = f.w->st.stats().tier_direct.load();
+                CHECK(fetch_ok(*f.w, x.first, x.second));
+                CHECK(f.w->st.stats().tier_direct.load() == before);
+                break;
+            }
+        }
+        CHECK(other == 1);   // (the uniform deal puts more than one expert on each device)
+        unhook(f);
+        f.t->close();
+    }
+    inject_plan({});
+
+    // A clean direct read: one job a slot (padding included), the matrix bytes counted apart, and no mapped copy ran.
+    {
+        Forced f;
+        CHECK(open_forced(base, "direct_clean", ranked, pack, prof, f));
+        int d = -1;
+        uint64_t k = 0;
+        CHECK(f.t->find(L, E, d, k));
+        const uint64_t before_direct = (uint64_t) f.w->st.stats().tier_direct.load();
+        CHECK(fetch_ok(*f.w, L, E));
+        CHECK(f.w->st.stats().tier_direct.load() == (int64_t) before_direct + 1);
+        const std::vector<ExpertTierSet::DeviceStats> ds = f.t->stats();
+        const ExpertTierSet::DeviceStats& a = ds[(size_t) d];
+        CHECK(a.direct_mode == "direct");
+        CHECK(a.direct_jobs == 1 && a.direct_ok == 1 && a.direct_fallbacks == 0 && a.direct_failed == 0);
+        CHECK(a.direct_slot_bytes == SLOT && a.direct_slot_ok_bytes == SLOT);
+        CHECK(a.direct_payload_ok_bytes == 3 * MB4);                       // the matrices, not the slot
+        CHECK(a.started_bytes == 3 * MB4 && a.demand_experts == 1);        // the logical payload, as the mapped path counts it
+        CHECK(a.completed_jobs == 0 && a.completed_bytes == 0);            // (no mapped copy: nothing counted as one)
+        CHECK(a.direct_service_ns > 0);
+        unhook(f);
+        f.t->close();
+    }
+
+    // The arena is not inherited by a fork once a device is direct (MADV_DONTFORK: kernel flag "dc" on its mapping).
+#if defined(__linux__)
+    {
+        Forced f;
+        CHECK(open_forced(base, "direct_fork", ranked, pack, prof, f));
+        CHECK(f.t->direct_active());
+        const uintptr_t arena = (uintptr_t) (f.w->st.blob(0) - ExpertStore::kSlack);
+        CHECK(!vma_has_flag(arena, "dc"));   // (before: an ordinary private mapping)
+        CHECK(f.w->st.no_fork_arena());
+        CHECK(vma_has_flag(arena, "dc"));
+        unhook(f);
+        f.t->close();
+    }
+#endif
+
+    // Canaries around the destination: the whole-slot read writes its own slot and nothing beside it.
+    {
+        Forced f;
+        CHECK(open_forced(base, "direct_canary", ranked, pack, prof, f));
+        for (int s = 0; s < (int) f.w->st.committed_slots(); ++s) {
+            uint8_t* b = const_cast<uint8_t*>(f.w->st.blob(s)) - ExpertStore::kSlack;
+            std::memset(b, 0xCC, SLOT);
+        }
+        const int es[1] = {E};
+        std::vector<char> ok;
+        CHECK(f.w->st.ensure(L, es, 1, ok) && ok[0] == 1);
+        const int s = f.w->st.find(L, E);
+        CHECK(s >= 0 && store_ok(*f.w, L, E));
+        auto canary = [&](int slot) {
+            const uint8_t* b = f.w->st.blob(slot) - ExpertStore::kSlack;
+            for (uint64_t i = 0; i < SLOT; ++i)
+                if (b[i] != 0xCC) return false;
+            return true;
+        };
+        if (s > 0) CHECK(canary(s - 1));
+        if (s + 1 < (int) f.w->st.committed_slots()) CHECK(canary(s + 1));
+        f.w->st.release(L, es, 1, ok);
+        unhook(f);
+        f.t->close();
+    }
+
+    // The slot is not findable while its read is in flight, and a cancelled guess does not fail the device.
+    {
+        Forced f;
+        CHECK(open_forced(base, "direct_inflight", ranked, pack, prof, f));
+        int d = -1;
+        uint64_t k = 0;
+        CHECK(f.t->find(L, E, d, k));
+        BigCopy big;   // holds the device's one worker while the guess waits behind it
+        big.push(f.t->queue(d));
+        f.w->st.prefetch(L, E);
+        CHECK(f.w->st.find(L, E) < 0);          // (in flight: not a slot anyone can read)
+        CHECK(f.w->st.shrink_chunks(1) == 0);   // (a chunk with a read in flight is not given back)
+        f.w->st.cancel_stale(L);                // the layer moved past: the queued guess is dropped unread
+        const int es[1] = {E};
+        std::vector<char> ok;
+        CHECK(!f.w->st.ensure(L, es, 1, ok) || ok[0] == 0);
+        while (big.left.load() > 0) f.t->queue(d)->wait_any(1000);
+        CHECK(f.fails.load() == 0);             // a cancelled copy says nothing about the device (§9)
+        CHECK(f.t->find(L, E, d, k));
+        ExpertStore::TierDirect o;
+        CHECK(f.t->direct_slot(d, k, o));
+        CHECK(f.w->st.stats().cancelled.load() >= 1);
+        CHECK(fetch_ok(*f.w, L, E));            // then read directly as a demand read
+        unhook(f);
+        f.t->close();
+    }
+
+    // Shutdown with direct jobs queued behind a long copy: the queue finishes them before the arena goes.
+    {
+        Forced f;
+        CHECK(open_forced(base, "direct_shutdown", ranked, pack, prof, f));
+        int d = -1;
+        uint64_t k = 0;
+        CHECK(f.t->find(L, E, d, k));
+        std::vector<std::pair<int, int>> same_dev;
+        for (const auto& x : ranked) {
+            int dx = -1;
+            uint64_t kx = 0;
+            if (f.t->find(x.first, x.second, dx, kx) && dx == d && same_dev.size() < 2) same_dev.push_back({x.first, x.second});
+        }
+        CHECK(same_dev.size() == 2);
+        BigCopy big;
+        big.push(f.t->queue(d));
+        for (const auto& x : same_dev) f.w->st.prefetch(x.first, x.second);
+        f.w.reset();   // the store goes: its destructor drains the tier's queues first, then releases the arena
+        CHECK(big.left.load() == 0);
+        {
+            const std::vector<ExpertTierSet::DeviceStats> ds = f.t->stats();
+            CHECK(ds[(size_t) d].direct_ok == same_dev.size());   // both queued direct reads finished, into live memory
+            CHECK(ds[(size_t) d].direct_failed == 0);
+        }
+        f.t->close();
+    }
+
+    // Concurrency: speculative and demand reads on both devices, two workers each.
+    set_env("DS4_TIER_THREADS", "2");
+    {
+        Forced f;
+        CHECK(open_forced(base, "direct_concurrent", ranked, pack, prof, f));
+        int round_ok = 0;
+        for (int round = 0; round < 2; ++round) {   // (round 2 brings six experts the store has not seen: fresh tier reads, evictions)
+            const size_t base_i = (size_t) round * 6;
+            for (size_t i = base_i; i < base_i + 6; ++i) f.w->st.prefetch(ranked[i].first, ranked[i].second);
+            for (size_t i = base_i; i < base_i + 6; ++i) round_ok += fetch_ok(*f.w, ranked[i].first, ranked[i].second) ? 1 : 0;
+        }
+        CHECK(round_ok == 12);
+        CHECK(f.fails.load() == 0);
+        uint64_t ok_total = 0, failed = 0;
+        for (const ExpertTierSet::DeviceStats& d : f.t->stats()) {
+            ok_total += d.direct_ok;
+            failed += d.direct_failed + d.direct_fallbacks;
+        }
+        CHECK(failed == 0);
+        CHECK(ok_total == (uint64_t) f.w->st.stats().tier_direct.load());
+        unhook(f);
+        f.t->close();
+    }
+    set_env("DS4_TIER_THREADS", "1");
+
+    // The tier's slots, by device: the last slot of each device is the last whole slot, and nothing past it is offered.
+    {
+        Forced f;
+        CHECK(open_forced(base, "direct_bounds", ranked, pack, prof, f));
+        for (size_t dv = 0; dv < f.t->device_count(); ++dv) {
+            const uint64_t size = f.t->spec_at(dv).mib << 20;
+            const uint64_t n = (size - f.t->data_off()) / SLOT;
+            ExpertStore::TierDirect o;
+            CHECK(n > 0 && f.t->direct_slot((int) dv, n - 1, o));
+            CHECK(o.off == f.t->data_off() + (n - 1) * SLOT && o.len == SLOT && o.off + o.len <= size);
+            CHECK(!f.t->direct_slot((int) dv, n, o));
+            CHECK(f.t->slot_base((int) dv, 1) - f.t->slot_base((int) dv, 0) == (ptrdiff_t) SLOT);
+        }
+        ExpertStore::TierDirect none;
+        CHECK(!f.t->direct_slot(-1, 0, none));   // (no such device)
+        unhook(f);
+        f.t->close();
+    }
+
+    // A value that is not a slot of this device is refused, and a closed set serves no direct read.
+    {
+        Forced f;
+        CHECK(open_forced(base, "direct_closed", ranked, pack, prof, f));
+        ExpertStore::TierDirect o;
+        CHECK(!f.t->direct_slot(7, 0, o));
+        unhook(f);
+        f.t->close();
+        CHECK(!f.t->direct_slot(0, 0, o));
+    }
+
+    // Fill and read visibility: no slot of a tier that is still filling answers, and the first answer comes after the fill.
+    {
+        Forced f;
+        CHECK(open_forced(base, "direct_visible", ranked, pack, prof, f, false));
+        bool early = false;
+        ExpertTierSet::Fill fl{};
+        std::string err;
+        CHECK(f.t->fill(
+            [&](int l, int e, uint8_t* sb, int dev, std::atomic<int>& left, std::atomic<bool>& bad, uint64_t& bytes) {
+                int d2 = -1;
+                uint64_t k2 = 0;
+                if (f.t->find(l, e, d2, k2)) early = true;   // (must not happen: the fill has not published)
+                return f.w->st.tier_fill_read(l, e, sb, dev, left, bad, bytes);
+            },
+            fl, err));
+        CHECK(!early);
+        CHECK(f.t->readable());
+        int d = -1;
+        uint64_t k = 0;
+        CHECK(f.t->find(L, E, d, k));
+        CHECK(fetch_ok(*f.w, L, E));
+        unhook(f);
+        f.t->close();
+    }
+
+    // Persistence: a tier filled with the mode off is reused with it on, and the other way round, with no refill.
+    {
+        Forced f;
+        // (1) filled with the mode off (the mapped path's fill is the same bytes either way)
+        set_env("DS4_TIER_DIRECT", nullptr);
+        f.t = std::make_unique<ExpertTierSet>();
+        f.w = std::make_unique<World>(base, "direct_persist", false);
+        std::string err;
+        CHECK(f.t->open(f.w->specs, err));
+        wire(f);
+        bool reused = true;
+        std::string why;
+        std::vector<std::string> notes;
+        CHECK(f.t->decide(SLOT, 2, 4, NL, NE, pack, prof, false, ranked, reused, why, notes) && !reused);
+        ExpertTierSet::Fill fl{};
+        CHECK(do_fill(*f.w, f.t.get(), fl));
+        unhook(f);
+        f.t->close();
+        // (2) reused with the mode on (forced direct): nothing copied, and the reads go direct
+        set_env("DS4_TIER_DIRECT", "1");
+        f.t = std::make_unique<ExpertTierSet>();
+        f.t->set_direct_test_force(true);
+        CHECK(f.t->open(f.w->specs, err));
+        wire(f);
+        CHECK(f.t->decide(SLOT, 2, 4, NL, NE, pack, prof, false, ranked, reused, why, notes) && reused);
+        CHECK(fetch_ok(*f.w, L, E));
+        {
+            int d = -1;
+            uint64_t k = 0;
+            CHECK(f.t->find(L, E, d, k));
+            CHECK(f.t->stats()[(size_t) d].direct_ok == 1);
+        }
+        unhook(f);
+        f.t->close();
+        // (3) reused with the mode off again: mapped copies, the same bytes
+        set_env("DS4_TIER_DIRECT", nullptr);
+        f.t = std::make_unique<ExpertTierSet>();
+        CHECK(f.t->open(f.w->specs, err));
+        wire(f);
+        const int64_t direct_before = f.w->st.stats().tier_direct.load();
+        CHECK(f.t->decide(SLOT, 2, 4, NL, NE, pack, prof, false, ranked, reused, why, notes) && reused);
+        CHECK(fetch_ok(*f.w, L, E));
+        CHECK(f.w->st.stats().tier_direct.load() == direct_before);
+        unhook(f);
+        f.t->close();
+        set_env("DS4_TIER_DIRECT", "1");
+    }
+
+    os::direct_pread_hook() = saved_read;
+    set_env("DS4_TIER_DIRECT", nullptr);
+    set_env("DS4_TIER_LOG", nullptr);
+    set_env("DS4_TIER_THREADS", nullptr);
+}
+#endif
 
 int main() {
     const fs::path base = fs::temp_directory_path() /
@@ -991,11 +1621,16 @@ int main() {
         set_env("DS4_TIER_THREADS", nullptr);
     }
 
+#if !defined(_WIN32)
+    direct_checks(base, ranked, packA, profA);   // DS4_TIER_DIRECT (opt-in): see the section above
+#endif
+
     fs::remove_all(base);
     if (fails) {
         std::printf("%d expert tier checks failed\n", fails);
         return 1;
     }
-    std::printf("expert tier: all checks passed\n");
+    if (skips) std::printf("expert tier: all checks passed (%d skipped: see SKIP above)\n", skips);
+    else std::printf("expert tier: all checks passed\n");
     return 0;
 }

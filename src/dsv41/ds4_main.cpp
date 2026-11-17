@@ -116,6 +116,21 @@ void print_tier_io(const strata::ds4::Stats& s, const strata::ds4::Stats& base, 
                      a.service_p50_ms, a.service_p95_ms, cold_pct,
                      (double) (a.cold_bytes - b.cold_bytes) / 1e6 / nt, cold_s_mean, a.cold_service_p95_ms,
                      (a.wait_ms - b.wait_ms) / nt);
+        if (!a.direct_mode.empty()) {   // DS4_TIER_DIRECT: whole-slot jobs, one a slot (padding included): not comparable with the matrix jobs above
+            const double djobs = (double) (a.direct_jobs - b.direct_jobs);
+            const double dsvc = djobs > 0 ? (a.direct_service_ms - b.direct_service_ms) / djobs : 0.0;
+            const double dq = djobs > 0 ? (a.direct_queue_ms - b.direct_queue_ms) / djobs : 0.0;
+            std::fprintf(stderr,
+                         "  %s direct (DS4_TIER_DIRECT, mode %s): %.1f whole-slot jobs/token (delivered %.1f, mapped fallback %.1f, failed %.1f); "
+                         "slot bytes %.1f MB/token requested, %.1f MB/token delivered (matrix payload delivered %.1f MB/token); "
+                         "queue mean %.3f ms, service mean %.3f ms, session p50/p95 %.3f/%.3f ms\n",
+                         a.path.c_str(), a.direct_mode.c_str(), djobs / nt, (double) (a.direct_ok - b.direct_ok) / nt,
+                         (double) (a.direct_fallbacks - b.direct_fallbacks) / nt, (double) (a.direct_failed - b.direct_failed) / nt,
+                         (double) (a.direct_slot_bytes - b.direct_slot_bytes) / 1e6 / nt,
+                         (double) (a.direct_slot_ok_bytes - b.direct_slot_ok_bytes) / 1e6 / nt,
+                         (double) (a.direct_payload_ok_bytes - b.direct_payload_ok_bytes) / 1e6 / nt,
+                         dq, dsvc, a.direct_service_p50_ms, a.direct_service_p95_ms);
+        }
     }
 }
 

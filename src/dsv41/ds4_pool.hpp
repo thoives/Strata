@@ -218,6 +218,29 @@ struct TierIoStats {
             cold_service_hist.add(s_ns);
         }
     }
+    // DS4_TIER_DIRECT: whole-slot jobs.  Counted apart from the mapped copies above: one direct job is a whole slot (padding
+    // included), not comparable with the three matrix copies of a mapped expert.  `delivered` = read directly; `fallback` =
+    // refused, and copied the mapped way; neither = failed.
+    std::atomic<uint64_t> direct_jobs{0}, direct_ok{0}, direct_fallbacks{0}, direct_failed{0};
+    std::atomic<uint64_t> direct_slot_bytes{0}, direct_slot_ok_bytes{0}, direct_payload_ok_bytes{0};
+    std::atomic<uint64_t> direct_queue_ns{0}, direct_service_ns{0};
+    IoLatencyHist direct_service_hist;
+    void note_direct(uint64_t payload, uint64_t slot_bytes, bool delivered, bool fallback, uint64_t q_ns, uint64_t s_ns) {
+        direct_jobs.fetch_add(1, std::memory_order_relaxed);
+        direct_slot_bytes.fetch_add(slot_bytes, std::memory_order_relaxed);
+        direct_queue_ns.fetch_add(q_ns, std::memory_order_relaxed);
+        direct_service_ns.fetch_add(s_ns, std::memory_order_relaxed);
+        direct_service_hist.add(s_ns);
+        if (delivered) {
+            direct_ok.fetch_add(1, std::memory_order_relaxed);
+            direct_slot_ok_bytes.fetch_add(slot_bytes, std::memory_order_relaxed);
+            direct_payload_ok_bytes.fetch_add(payload, std::memory_order_relaxed);
+        } else if (fallback) {
+            direct_fallbacks.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            direct_failed.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     void note_wait(uint64_t ns) { wait_ns.fetch_add(ns, std::memory_order_relaxed); }
     void note_depth(uint64_t depth) {
         uint64_t cur = queue_depth_max.load(std::memory_order_relaxed);
@@ -243,6 +266,14 @@ public:
         std::chrono::steady_clock::time_point pushed{};   // (DS4_IO_STATS: when it was queued)
         bool tier_copy = false;   // DS4_TIER_LOG: a runtime copy from a tier device's mapping
         bool demand = false;      // ... and it is a demand copy, not a lookahead guess
+        // DS4_TIER_DIRECT: a tier slot read whole through `dfd` (off, len: the device's offset alignment `align`; dst: its
+        // memory alignment `mem_align`), straight into the store's slot, one job a slot.  A refusal copies `fallback` (the same
+        // slot in the tier's mapping) and sets `refused`, so the device is not asked again.  `payload` is the matrices' bytes
+        // (for the stats only: len includes the padding).  Not an `exact` job and not a `mem` copy.
+        bool tier_direct = false;
+        uint64_t align = 0, mem_align = 0, payload = 0;
+        const uint8_t* fallback = nullptr;
+        std::atomic<bool>* refused = nullptr;
     };
     explicit IoQueue(int n, TierIoStats* trace = nullptr) : trace_(trace) {
         for (int i = 0; i < n; ++i) th_.emplace_back([this] { loop(); });
@@ -311,7 +342,7 @@ private:
             }
             const auto t0 = std::chrono::steady_clock::now();
             const uint64_t lead = j.off % os::kDirectAlign;
-            bool ok = false;
+            bool ok = false, direct_hit = false, direct_fb = false;
             if (j.mem != nullptr) {
                 const bool traced = trace_ != nullptr && j.tier_copy;
                 const auto tc0 = traced ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -325,6 +356,20 @@ private:
                                       (uint64_t) std::chrono::duration_cast<ns>(tc1 - tc0).count(), j.demand, cold);
                 }
                 ok = true;
+            } else if (j.tier_direct) {
+                // DS4_TIER_DIRECT: the tier's whole slot straight into the store's slot (no bounce buffer, no move: the two have
+                // the same layout).  Refused: copied from the tier's mapping instead, and the device is not asked again.  Failed:
+                // the bytes are not whole, so the job fails and the store marks the device (fail) as for any failed copy.
+                const os::DirectRead r = os::pread_exact_direct(j.dfd, j.dst, j.len, j.off, j.align, j.mem_align);
+                if (r == os::DirectRead::kOk) {
+                    direct_hit = ok = true;
+                } else if (r == os::DirectRead::kUnsupported) {
+                    if (j.refused != nullptr) j.refused->store(true, std::memory_order_release);
+                    if (j.fallback != nullptr) {
+                        std::memcpy(j.dst, j.fallback, (size_t) j.len);
+                        direct_fb = ok = true;
+                    }
+                }
             } else if (j.exact) {
                 // unbuffered through a bounce buffer (the disk reads aligned spans), then the bytes to where they belong
                 thread_local std::vector<uint8_t> bounce;
@@ -350,9 +395,15 @@ private:
             }
             const auto t_rd = std::chrono::steady_clock::now();
             if (ok && j.keep != nullptr && j.mem == nullptr) std::memmove(j.keep, j.exact ? j.dst : j.dst + lead, (size_t) j.len);   // (keep may overlap dst: the store reads in place and moves up)
+            if (j.tier_direct && trace_ != nullptr) {
+                using ns = std::chrono::nanoseconds;
+                trace_->note_direct(j.payload, j.len, direct_hit, direct_fb,
+                                    (uint64_t) std::chrono::duration_cast<ns>(t0 - j.pushed).count(),
+                                    (uint64_t) std::chrono::duration_cast<ns>(t_rd - t0).count());
+            }
             {
                 static const bool stats = std::getenv("DS4_IO_STATS") != nullptr;
-                if (stats && j.mem == nullptr && j.cancel == nullptr) {   // (demand reads only)
+                if (stats && j.mem == nullptr && j.cancel == nullptr && !j.tier_direct) {   // (demand reads only)
                     const auto t_end = std::chrono::steady_clock::now();
                     using us = std::chrono::microseconds;
                     st_n_.fetch_add(1);

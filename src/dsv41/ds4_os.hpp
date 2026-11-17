@@ -11,6 +11,7 @@
 #endif
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -188,6 +189,49 @@ inline bool pread_direct(fd_t f, void* dst, uint64_t n, uint64_t off) {
         if ((uint64_t) r % kDirectAlign != 0) break;
     }
     return got >= want;
+#endif
+}
+/// DS4_TIER_DIRECT: one whole tier slot read through an unbuffered descriptor, exactly (Linux; ds4_tier.hpp).
+///   kOk           every byte of [off, off + n) is in dst.
+///   kUnsupported  the kernel refuses the unbuffered request (EINVAL, EOPNOTSUPP), or it is misaligned: the device does not do
+///                 direct I/O for it, so the caller copies the slot the mapped way and stops asking this device.
+///   kFailed       the device did not give the bytes: an I/O error, the device ended before the slot did, or a short read that
+///                 cannot go on unbuffered.  Not a support question: the caller treats the device as failed (ds4_tier.hpp).
+enum class DirectRead { kOk, kUnsupported, kFailed };
+/// Tests only: the read the direct path calls (::pread unless a test replaces it), so the retry and failure policy can be
+/// driven with injected errors and short reads on any filesystem, whether or not it supports O_DIRECT.
+#if !defined(_WIN32)
+using DirectPreadFn = ssize_t (*)(int, void*, size_t, off_t);
+inline DirectPreadFn& direct_pread_hook() {
+    static DirectPreadFn f = ::pread;
+    return f;
+}
+#endif
+/// [off, off + n) through `f` into dst.  align: the offset and length must be multiples of it (the device's unbuffered
+/// offset alignment); mem_align: dst must be a multiple of it (the device's unbuffered memory alignment).  Both are powers of
+/// two.  EINTR is retried; a short read continues from where it stopped while that point stays aligned for both.
+inline DirectRead pread_exact_direct(fd_t f, void* dst, uint64_t n, uint64_t off, uint64_t align, uint64_t mem_align) {
+#if defined(_WIN32)
+    (void) f, (void) dst, (void) n, (void) off, (void) align, (void) mem_align;
+    return DirectRead::kUnsupported;
+#else
+    if (align == 0 || mem_align == 0 || n == 0 || off % align != 0 || n % align != 0 || (uintptr_t) dst % mem_align != 0)
+        return DirectRead::kUnsupported;
+    uint8_t* p = (uint8_t*) dst;
+    uint64_t got = 0;
+    const DirectPreadFn rd = direct_pread_hook();
+    while (got < n) {
+        const ssize_t r = rd((int) f, p + got, (size_t) (n - got), (off_t) (off + got));
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EINVAL || errno == EOPNOTSUPP) return DirectRead::kUnsupported;
+            return DirectRead::kFailed;
+        }
+        if (r == 0) return DirectRead::kFailed;   // (the device ends before the slot does: it does not hold this slot)
+        got += (uint64_t) r;
+        if (got < n && (got % align != 0 || got % mem_align != 0)) return DirectRead::kFailed;   // (a short read that cannot go on aligned)
+    }
+    return DirectRead::kOk;
 #endif
 }
 /// Windows: the file opened for unbuffered reads (FILE_FLAG_NO_BUFFERING), for a file no view of this process maps -
