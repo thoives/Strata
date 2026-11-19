@@ -454,6 +454,40 @@ class Install(unittest.TestCase):
         self.assertEqual(self.cfg["args"][self.cfg["args"].index("--max-context") + 1], "131072")
         self.assertIn("checked at 4K and 8K", out)
 
+    # --- your own DSpark drafter (--dspark-json): packed in, not downloaded; the engine runs it with --dspark on
+
+    def own_drafter(self, geometry=True):
+        """A drafter of your own as drafter_pack.py makes it: the .json (its geometry when asked) and the .bin beside it."""
+        d = self.root / "mine"
+        d.mkdir(parents=True, exist_ok=True)
+        data = {"from": ["model-00044-of-00048.safetensors"], "tensors": []}
+        if geometry:
+            data["geometry"] = {"block_size": 5, "noise_token_id": 128799, "markov_rank": 256, "expert_count": 128,
+                                "expert_used_count": 3, "target_layers": [37, 38, 39]}
+        (d / "dspark-q4k.json").write_text(json.dumps(data), encoding="utf-8")
+        (d / "dspark-q4k.bin").write_bytes(b"x" * 16)
+        return d / "dspark-q4k.json"
+
+    def test_an_own_drafter_without_geometry_is_refused_before_anything_is_downloaded(self):
+        rc, out = self.install(model="IST-DAS-2.25bpw", dspark_json=str(self.own_drafter(geometry=False)))
+        self.assertEqual(rc, 1, out)
+        self.assertIn("no DSpark geometry", out)
+        self.assertEqual([c for c in self.calls if c[0] == "get"], [])
+
+    def test_an_own_drafter_whose_bin_is_missing_is_refused_before_anything_is_downloaded(self):
+        drafter = self.own_drafter()
+        drafter.with_suffix(".bin").unlink()
+        rc, out = self.install(model="IST-DAS-2.25bpw", dspark_json=str(drafter))
+        self.assertEqual(rc, 1, out)
+        self.assertIn("is not beside it", out)
+        self.assertEqual([c for c in self.calls if c[0] == "get"], [])
+
+    def test_an_own_drafter_is_for_the_ista_sets_only(self):
+        rc, out = self.install(model="UD-Q8_K_XL", dspark_json=str(self.own_drafter()))
+        self.assertEqual(rc, 1, out)
+        self.assertIn("IST-DAS sets", out)
+        self.assertEqual([c for c in self.calls if c[0] == "get"], [])
+
 
 class Catalog(unittest.TestCase):
     def setUp(self):                                  # the AMD rules below are the Linux ones, whatever box the test runs on
@@ -1067,6 +1101,90 @@ class InstallOfficial(Install):
         self.assertEqual(rc, 1, out)
         self.assertIn("not enough free disk space", out)
 
+    def test_an_own_drafter_is_packed_in_and_the_unsloth_file_is_not_downloaded(self):
+        drafter = self.own_drafter()
+        rc, out = self.install_ista(model="IST-DAS-2.25bpw", dspark_json=str(drafter))
+        self.assertEqual(rc, 0, out)
+        got = [c[2].name for c in self.calls if c[0] == "get"]
+        self.assertNotIn(setup.DSV41_DSPARK, got)
+        self.assertIn(setup.DSV41_ISTA_ENGRAM, got)            # the rest of the set is still fetched
+        packs = [c[1] for c in self.calls if c[0] == "run" and "pack_gguf.py" in " ".join(map(str, c[1]))]
+        self.assertEqual(len(packs), 1)
+        self.assertEqual(packs[0][packs[0].index("--drafter") + 1], str(drafter))
+        for flag in ("--dspark-gguf", "--dspark-noise-token", "--dspark-markov-rank"):
+            self.assertNotIn(flag, packs[0])
+        a = self.cfg["args"]
+        self.assertEqual(a[a.index("--dspark") + 1], "on")      # auto would switch it off on a computer whose experts far exceed the cards
+        self.assertIn("yours: the Unsloth file is not downloaded", out)
+
+    def test_the_default_still_downloads_the_unsloth_drafter_and_runs_auto(self):
+        rc, out = self.install_ista(model="IST-DAS-2.25bpw")
+        self.assertEqual(rc, 0, out)
+        got = [c[2].name for c in self.calls if c[0] == "get"]
+        self.assertIn(setup.DSV41_DSPARK, got)
+        a = self.cfg["args"]
+        self.assertEqual(a[a.index("--dspark") + 1], "auto")
+
+
+    # --- the drafter is remembered in the run config: a start without the flag keeps it, and never rebuilds the pack for nothing
+
+    def packer_runs(self):
+        return sum(1 for c in self.calls if c[0] == "run" and "pack_gguf.py" in " ".join(map(str, c[1])))
+
+    def remember_cfg(self):
+        """What write_setup_config leaves on disk: the run config setup wrote, where the next start reads it."""
+        tag = (setup.MULTI_FILE_FAMILIES["deepseek41"]["tag"] + "IST-DAS-2.25bpw").lower()
+        (self.root / f"strata-{tag}.json").write_text(json.dumps(self.cfg), encoding="utf-8")
+
+    def built(self):
+        """The packer ran: the pack has its tokenizer and tensor map (the harness only records the call)."""
+        pack = self.root / "data" / "packs" / (setup.MULTI_FILE_FAMILIES["deepseek41"]["tag"] + "IST-DAS-2.25bpw").lower()
+        (pack / "tokenizer").mkdir(parents=True, exist_ok=True)
+        (pack / "tokenizer" / "vocab.json").write_text("{}", encoding="utf-8")
+        (pack / "tensors.txt").write_text("", encoding="utf-8")
+
+    def test_a_start_without_the_flag_keeps_the_drafter_it_started_with(self):
+        drafter = self.own_drafter()
+        rc, out = self.install_ista(model="IST-DAS-2.25bpw", dspark_json=str(drafter))
+        self.assertEqual(rc, 0, out)
+        self.remember_cfg()
+        self.built()
+        self.calls = []
+        rc, out = self.install_ista(model="IST-DAS-2.25bpw")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.packer_runs(), 0)                                       # a plain start does not rebuild the pack
+        self.assertNotIn(setup.DSV41_DSPARK, [c[2].name for c in self.calls if c[0] == "get"])
+        self.assertEqual(self.cfg["dspark_json"], str(drafter))
+        a = self.cfg["args"]
+        self.assertEqual(a[a.index("--dspark") + 1], "on")
+
+    def test_dspark_json_empty_gives_the_sets_own_drafter_back(self):
+        drafter = self.own_drafter()
+        self.install_ista(model="IST-DAS-2.25bpw", dspark_json=str(drafter))
+        self.remember_cfg()
+        self.built()
+        self.calls = []
+        rc, out = self.install_ista(model="IST-DAS-2.25bpw", dspark_json="")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.packer_runs(), 1)                                       # the pack is made again with the set's drafter
+        self.assertIn(setup.DSV41_DSPARK, [c[2].name for c in self.calls if c[0] == "get"])
+        self.assertIsNone(self.cfg["dspark_json"])
+        a = self.cfg["args"]
+        self.assertEqual(a[a.index("--dspark") + 1], "auto")
+
+    def test_a_remembered_drafter_that_is_gone_is_refused_before_anything_is_downloaded(self):
+        drafter = self.own_drafter()
+        self.install_ista(model="IST-DAS-2.25bpw", dspark_json=str(drafter))
+        self.remember_cfg()
+        self.built()
+        drafter.unlink()
+        drafter.with_suffix(".bin").unlink()
+        self.calls = []
+        rc, out = self.install_ista(model="IST-DAS-2.25bpw")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("remembered from an earlier run", out)
+        self.assertEqual([c for c in self.calls if c[0] == "get"], [])
+
 
 class InstallSmallest(InstallOfficial):
     def test_downloads_the_iq1_m_files_and_the_shared_ones(self):
@@ -1079,6 +1197,61 @@ class InstallSmallest(InstallOfficial):
         self.assertIn("239 GB", out)
         a = self.cfg["args"]
         self.assertEqual(a[a.index("--dspark") + 1], "auto")
+
+
+class OwnDrafterHelpers(unittest.TestCase):
+    """The pure parts of --dspark-json: the pack command, the checks on a drafter of your own, and which drafter a pack has."""
+
+    def test_the_default_pack_command_is_the_one_setup_always_wrote(self):
+        cmd = setup.dsv41_pack_cmd(Path("/m"), ["a.gguf"], Path("/e.gguf"), Path("/meta.gguf"), Path("/d.gguf"), Path("/p"))
+        self.assertEqual(cmd[1:], [str(setup.ROOT / "tools" / "dsv41" / "pack_gguf.py"), "--model", str(Path("/m")), "--shards", "a.gguf",
+                                   "--engram", str(Path("/e.gguf")), "--engram-meta", str(Path("/meta.gguf")),
+                                   "--dspark-gguf", str(Path("/d.gguf")), "--dspark-noise-token", "128799", "--dspark-markov-rank", "256",
+                                   "--out", str(Path("/p"))])
+
+    def test_an_own_drafter_goes_in_with_drafter_and_no_gguf_flags(self):
+        cmd = setup.dsv41_pack_cmd(Path("/m"), ["a.gguf"], Path("/e.gguf"), Path("/meta.gguf"), Path("/d.gguf"), Path("/p"),
+                                   drafter_json=Path("/mine/dspark-q4k.json"))
+        self.assertEqual(cmd[cmd.index("--drafter") + 1], str(Path("/mine/dspark-q4k.json")))
+        for flag in ("--dspark-gguf", "--dspark-noise-token", "--dspark-markov-rank"):
+            self.assertNotIn(flag, cmd)
+
+    def test_the_problems_with_a_drafter_are_said_plainly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            self.assertIn("not supported on a Mac", setup.dsv41_local_drafter_problem(d / "x.json", True))
+            self.assertIn("not there", setup.dsv41_local_drafter_problem(d / "x.json", False))
+            full = {"geometry": {k: 1 for k in setup.DSV41_DRAFTER_GEOMETRY}}
+            (d / "x.json").write_text(json.dumps(full), encoding="utf-8")
+            self.assertIn("is not beside it", setup.dsv41_local_drafter_problem(d / "x.json", False))
+            (d / "x.bin").write_bytes(b"1")
+            self.assertIsNone(setup.dsv41_local_drafter_problem(d / "x.json", False))
+            (d / "y.json").write_text(json.dumps({"geometry": {"block_size": 5}}), encoding="utf-8")
+            (d / "y.bin").write_bytes(b"1")
+            self.assertIn("no DSpark geometry", setup.dsv41_local_drafter_problem(d / "y.json", False))
+            (d / "z.json").write_text("not json", encoding="utf-8")
+            (d / "z.bin").write_bytes(b"1")
+            self.assertIn("not a readable", setup.dsv41_local_drafter_problem(d / "z.json", False))
+
+    def test_a_drafters_identity_follows_its_json_and_its_bin(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            j, b = d / "dspark-q4k.json", d / "dspark-q4k.bin"
+            j.write_text("{}", encoding="utf-8")
+            b.write_bytes(b"12")
+            first = setup.dsv41_drafter_identity(j)
+            j.write_text('{"x": 1}', encoding="utf-8")
+            second = setup.dsv41_drafter_identity(j)
+            self.assertNotEqual(first, second)
+            b.write_bytes(b"123")
+            self.assertNotEqual(second, setup.dsv41_drafter_identity(j))
+
+    def test_a_pack_with_no_drafter_record_has_the_sets_own_drafter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pack = Path(tmp)
+            self.assertEqual(setup.dsv41_pack_drafter(pack), "shared:" + setup.DSV41_DSPARK)
+            (pack / "drafter.txt").write_text("local:abc:12", encoding="utf-8")
+            self.assertEqual(setup.dsv41_pack_drafter(pack), "local:abc:12")
 
 
 if __name__ == "__main__":

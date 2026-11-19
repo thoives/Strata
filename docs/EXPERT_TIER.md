@@ -99,6 +99,11 @@ Differences from the Qwen engine, in plain words:
   it must be set in that process's environment. A device that cannot do unbuffered reads, or that refuses one while it
   runs, keeps (or goes back to) the copies, and the log says which. Its output has not been compared with the copies on
   real hardware yet: no speed claim is made, and the tier format is unchanged.
+- **Direct read span (experimental, off by default).** With `DS4_TIER_DIRECT=1`, `DS4_TIER_DIRECT_SPAN=1` makes that read
+  cover only the part of the slot the three matrices take, from the first matrix to the end of the last. The slot's padding
+  before and after is not read, so fewer bytes come off the device for each hit. Unset or `0` reads the whole slot. If the
+  shorter read cannot meet the device's alignment or the slot's bounds, the whole slot is read. The tier format is unchanged.
+  The bytes are checked in the host test; the bytes saved on real hardware are not measured yet.
 - **How the CPU lane waits (experimental, off by default).** `DS4_TIER_WAKE=1` makes the CPU lane sleep on the tier
   device's own queue while it waits for a tier copy, and wake when that copy is done. Unset or `0` keeps the wait of the
   last release (a look every 2 ms). The variable is read when the engine starts. It has not been measured on real
@@ -106,6 +111,19 @@ Differences from the Qwen engine, in plain words:
 - **Waiting for any of the CPU lane's reads (experimental, off by default).** `DS4_LANE_WAKE=1` lets the CPU lane compute
   whichever of its experts is ready first, instead of waiting for the first one it asked for. Unset or `0` keeps the
   old order. Not measured on real hardware yet.
+- **Store and draft switches, for comparing builds.** These change how the RAM store and the DeepSeek draft experts are
+  handled. They are meant not to change the answers; a byte check on a GPU is still needed to show that. None of them is
+  measured on real hardware yet, so no speed claim is made.
+  - `DS4_STORE_PIN_FIRST=0` (on by default) gives back the order before the fix that keeps the experts a request already
+    has in RAM from being evicted by that same request's misses. Unset or `1` keeps the fix.
+  - `DS4_STORE_CANCEL_SCAN=1` (off by default) checks the whole RAM store on every cancel, as before. Unset or `0` skips
+    the check when no guessed read is in progress.
+  - `DS4_STORE_RECLAIM_ESTIMATE=1` (off by default) gives RAM back by the old count of chunks, not by their real sizes.
+    Unset or `0` uses the real sizes.
+  - `DS4_DRAFT_BATCH=0` (on by default) sends the draft experts through the old split, one expert at a time. Unset or `1`
+    sends the whole batch in one call.
+  - `DS4_VERIFY_NOFENCE=1` (off by default, not checked on a GPU yet) lets a verify step on one graphics card go on before
+    the host waits for it. Do not use it for real answers until greedy and sampled output have been checked on a GPU.
 
 This engine's plan is [EXPERT_TIER_DSV41_PLAN.md](EXPERT_TIER_DSV41_PLAN.md).
 

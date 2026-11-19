@@ -8565,14 +8565,54 @@ def dsv41_pack_has_tower(pack: Path) -> bool:
     return "\nimage_token_id " in "\n" + txt and "vision.num_hidden_layers" in txt
 
 
-def dsv41_pack_cmd(folder: Path, shards: list, engram: Path, meta: Path, dspark: Path, pack: Path, mmproj: Path | None = None) -> list:
+#: the geometry a drafter .json must carry (drafter_pack.py --config writes it; pack_gguf.py puts it in the pack)
+DSV41_DRAFTER_GEOMETRY = ("block_size", "noise_token_id", "markov_rank", "expert_count", "expert_used_count", "target_layers")
+
+
+def dsv41_local_drafter_problem(path: Path, mac: bool) -> str | None:
+    """Why a drafter of your own cannot be packed (None when it can): not on a Mac (no drafter there yet), the .json and its .bin beside
+    it, and the geometry - without it the engine loads no drafter at all."""
+    if mac:
+        return "the DSpark drafter is not supported on a Mac yet"
+    if not path.is_file():
+        return "that file is not there"
+    if not path.with_suffix(".bin").is_file():
+        return f"{path.with_suffix('.bin').name} is not beside it (drafter_pack.py writes the .json and the .bin together)"
+    try:
+        geometry = json.loads(path.read_text(encoding="utf-8")).get("geometry") or {}
+    except (OSError, ValueError, AttributeError):
+        return "it is not a readable drafter .json"
+    missing = [k for k in DSV41_DRAFTER_GEOMETRY if k not in geometry]
+    if missing:
+        return ("it has no DSpark geometry (" + ", ".join(missing) + "): run drafter_pack.py with --config DeepSeek's config.json "
+                "(the engine loads no drafter without it)")
+    return None
+
+
+def dsv41_drafter_identity(path: Path) -> str:
+    """What a pack's drafter is: the .json's SHA-256 and the .bin's size (a drafter made again is another one)."""
+    return "local:" + hashlib.sha256(path.read_bytes()).hexdigest() + ":" + str(path.with_suffix(".bin").stat().st_size)
+
+
+def dsv41_pack_drafter(pack: Path) -> str:
+    """The drafter a pack was made with: drafter.txt, which setup writes; a pack from before that has the set's own drafter."""
+    mark = pack / "drafter.txt"
+    return mark.read_text(encoding="utf-8").strip() if mark.is_file() else "shared:" + DSV41_DSPARK
+
+
+def dsv41_pack_cmd(folder: Path, shards: list, engram: Path, meta: Path, dspark: Path, pack: Path, mmproj: Path | None = None,
+                   drafter_json: Path | None = None) -> list:
     """The pack recipe for an official IST-DAS set - this and nothing else: another one (--skip-tensors / --dense-override + engram_fold)
     packs without an error and gives garbage text (P2003, 2026-10-23).  The drafter's noise token (128799) and markov rank (256) are stated:
     the IST-DAS GGUFs do not carry them, and a pack with noise id 0 drafts deep less often (decode ~10% slower with DSpark).  --shards names the four files, so an Engram or another
     set in the same folder is not read as part of the model."""
+    # a drafter of your own (drafter_json: drafter_pack.py's .json, geometry in it) is packed in with --drafter; the Unsloth GGUF is then not read
+    if drafter_json is not None:
+        drafter = ["--drafter", str(drafter_json)]
+    else:
+        drafter = ["--dspark-gguf", str(dspark), "--dspark-noise-token", "128799", "--dspark-markov-rank", "256"]
     return [sys.executable, str(ROOT / "tools" / "dsv41" / "pack_gguf.py"), "--model", str(folder), "--shards", *[Path(n).name for n in shards],
-            "--engram", str(engram), "--engram-meta", str(meta), "--dspark-gguf", str(dspark),
-            "--dspark-noise-token", "128799", "--dspark-markov-rank", "256", *(["--mmproj", str(mmproj)] if mmproj else []), "--out", str(pack)]
+            "--engram", str(engram), "--engram-meta", str(meta), *drafter, *(["--mmproj", str(mmproj)] if mmproj else []), "--out", str(pack)]
 
 
 def dsv41_prefill_chunk_args(cards, ram_gb) -> list:
@@ -8775,12 +8815,39 @@ def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, 
     mmproj_file = shared[len(md.get("shared", []))] if ds_vision == "on" else None
     own_files = {f: bool(a.gguf_dir) or f.parent != shared_dir for f in shared}         # a file found outside setup's own folder is the person's
 
+    # your own DSpark drafter (--dspark-json) replaces the Unsloth GGUF: checked before anything is downloaded, packed in, not fetched.
+    # Setup remembers it in the run config (dspark_json), so a start without the flag uses the same drafter and does not rebuild the
+    # pack; --dspark-json "" gives the set's own drafter back
+    given = getattr(a, "dspark_json", None)
+    try:
+        saved_cfg = json.loads((home() / f"strata-{tag.lower()}.json").read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        saved_cfg = {}
+    remembered = saved_cfg.get("dspark_json") if isinstance(saved_cfg, dict) and ista else None
+    if given == "":
+        local_drafter = None
+    elif given is not None:
+        local_drafter = Path(given).expanduser().resolve()
+    else:
+        local_drafter = Path(remembered).expanduser().resolve() if remembered else None
+    if local_drafter is not None:
+        if not ista:
+            fail("--dspark-json is for the IST-DAS sets, which pack a DSpark drafter; this set does not", "leave the flag out for it")
+        problem = dsv41_local_drafter_problem(local_drafter, mac)
+        if problem:
+            fail(f"your DSpark drafter {local_drafter}" + ("" if given is not None else " (remembered from an earlier run)") + f": {problem}",
+                 "make it with tools/dsv41/drafter_pack.py (docs/DEEPSEEK41.md); give --dspark-json FILE for another one, or --dspark-json \"\" "
+                 "for the set's own drafter")
+    skip = {DSV41_DSPARK} if local_drafter is not None else set()
+    fetch = [f for f in shared if f.name not in skip]          # what setup downloads and checks: not the Unsloth drafter when yours is named
+    drafter_id = dsv41_drafter_identity(local_drafter) if local_drafter is not None else "shared:" + DSV41_DSPARK
+
     def partial(f: Path) -> int:
         p = f.with_name(f.name + ".part")
         return p.stat().st_size if p.is_file() else 0
 
     left = sum(0 if f.exists() and (done(f) or a.gguf_dir or own_files.get(f) or f.name in DSV41_LEGACY_FILES) else fam["sha256"][f.name][0] - partial(f)
-               for f in [*shards, *shared]) / 1e9
+               for f in [*shards, *fetch]) / 1e9
     probe = folder if folder.exists() else (folder.parent if folder.parent.exists() else Path(a.models_dir))
     free = free_gb(probe)
     # docs/EXPERT_TIER_DSV41_PLAN.md §11: the expert tier devices the user named (--expert-tier, one flag per device, in order) are
@@ -8821,7 +8888,7 @@ def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, 
             f"is {left * 1e9 / 50e6 / 3600:.1f} hours. Files you already have: --gguf-dir DIR.")
     else:
         say("  Nothing to download: the files are already here.")
-    unchecked = [f for f in [*shards, *shared] if f.exists() and not any(
+    unchecked = [f for f in [*shards, *fetch] if f.exists() and not any(
         f"sha256 {x}" in (f.with_name(f.name + ".done").read_text(encoding="utf-8", errors="replace") if done(f) else "")
         for x in (fam['sha256'][f.name][1], *DSV41_SHA_ALSO.get(f.name, ())))]
     if unchecked:
@@ -8920,12 +8987,14 @@ def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, 
             pin = new
             ok(f"{f.name}: the version with ISTA's newer chat template (the same weights); it is used as it is")
         verify_sha256(f, *pin, own=bool(a.gguf_dir) or f.name in DSV41_LEGACY_FILES)
-    for f in shared:                                  # the Engram, the drafter, the metadata shard: once for every official set
+    for f in fetch:                                   # the Engram, the drafter, the metadata shard: once for every official set
         if f.exists() and (done(f) or own_files[f]):
             ok(f"{f.name} already here ({f.parent})")
         else:
             download(DSV41_SHARED[f.name] + f.name, f)
         verify_sha256(f, *fam["sha256"][f.name], own=own_files[f], also=DSV41_SHA_ALSO.get(f.name, ()))
+    if local_drafter is not None:
+        ok(f"DSpark drafter: {local_drafter} (yours: the Unsloth file is not downloaded)")
     ok(f"model files: {folder} ({len(shards)} shards" + (f"; shared files: {shared_dir if any(not own_files[f] for f in shared) else shared[0].parent}" if shared else "") + ")")
 
     step(6, "preparing the model for Strata")
@@ -8940,6 +9009,10 @@ def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, 
         warn(f"the pack from an earlier run was made from the {'four' if layout == 'six' else 'six'}-shard files of this set; these are the {layout}-shard files: building it again")
         shutil.rmtree(pack, ignore_errors=True)
         have_pack = False
+    if have_pack and ista and dsv41_pack_drafter(pack) != drafter_id:   # a pack with another drafter (yours, or the set's) is made again
+        warn("the pack from an earlier run has another DSpark drafter: building it again with the one this run names")
+        shutil.rmtree(pack, ignore_errors=True)
+        have_pack = False
     if have_pack and ista:                         # a pack from an earlier run is kept only when the engine finds all of its files
         good, why = dsv41_pack_info(exe, pack, lib_dirs)
         if not good:
@@ -8948,14 +9021,17 @@ def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, 
             have_pack = False
     if not have_pack:
         if ista:
+            own = {"drafter_json": local_drafter} if local_drafter is not None else {}
             if udlow:       # the set's own shard 1 carries the metadata (and the drafter's geometry); shared = [Engram, drafter]
-                run(dsv41_pack_cmd(folder, [f.name for f in shards], shared[0], shards[0], shared[1], pack, mmproj_file))
+                run(dsv41_pack_cmd(folder, [f.name for f in shards], shared[0], shards[0], shared[1], pack, mmproj_file, **own))
             else:
-                run(dsv41_pack_cmd(folder, [f.name for f in shards], shared[0], shared[1], shared[2], pack, mmproj_file))
+                run(dsv41_pack_cmd(folder, [f.name for f in shards], shared[0], shared[1], shared[2], pack, mmproj_file, **own))
         else:
             run([sys.executable, str(ROOT / "tools" / "dsv41" / "pack_gguf.py"), "--model", str(folder), "--out", str(pack),
                  *(["--mmproj", str(mmproj_file)] if mmproj_file else [])])
     if ista:
+        pack.mkdir(parents=True, exist_ok=True)
+        (pack / "drafter.txt").write_text(drafter_id, encoding="utf-8")   # which drafter this pack has (dsv41_pack_drafter)
         prof = DSV41_PROFILES / md["profile"]          # which experts are used most: the RAM store starts with them (the engine reads <pack>/expert-profile.bin)
         if prof.is_file() and not (pack / "expert-profile.bin").exists():
             pack.mkdir(parents=True, exist_ok=True)
@@ -8992,7 +9068,7 @@ def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, 
     # so only the floor is written.
     # A Mac (0.2.7.1): the drafter is not loaded at all (--dspark none). It was exact there but not faster (15.1 and 11.0 tokens/s against 15.3
     # without it on the M5 Max), and the engine's "auto" would load it on a 128 GB Mac: its 7 GB of experts take memory the trunk's experts need.
-    args = ["--pack", str(pack), "--max-context", str(ctx), "--eos", "1", "--vision", ds_vision, "--dspark", "none" if mac else "auto",
+    args = ["--pack", str(pack), "--max-context", str(ctx), "--eos", "1", "--vision", ds_vision, "--dspark", "none" if mac else ("on" if local_drafter is not None else "auto"),
             *(["--dspark-conf", "0.65"] if md.get("recipe") == "ista" and not mac else []), *dsv41_prefill_chunk_args(cards, ram),
             *plan["args"], *(["--ssd-cache", str(store_gb)] if store_gb is not None else [])]   # (the tier's store size, §5.2; none without a tier)
     env = dsv41_config_env(cards)
@@ -9018,6 +9094,8 @@ def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, 
         cfg["api_key"] = a.api_key
     if a.browser is not None:
         cfg["open_browser"] = a.browser
+    if ista:   # the drafter this run uses, remembered for the next start (null: the set's own)
+        cfg["dspark_json"] = str(local_drafter) if local_drafter is not None else None
     cfg_path = home() / f"strata-{tag.lower()}.json"
     write_setup_config(cfg_path, cfg, adopted if adopted is not None and adopted.name == cfg_path.name else None, explicit_args(a))
     script = write_run_script(tag, cfg_path, port, cfg.get("open_browser") is not False)
@@ -9396,6 +9474,10 @@ def main() -> int:
                          "or the release's (as `strata update --feed`; a folder is a local test feed)")
     ap.add_argument("--gguf-dir", help="use GGUF files you already have (a folder with every shard: "
                                        "<name>-00001-of-0000N.gguf ... -0000N-of-0000N.gguf)")
+    ap.add_argument("--dspark-json", metavar="FILE",
+                    help="DeepSeek, the IST-DAS sets: your own DSpark drafter instead of the Unsloth file (drafter_pack.py's dspark[-NAME].json, "
+                         "its .bin beside it, the geometry in it: drafter_pack.py --config). It is packed in, not downloaded, and the engine runs "
+                         "with --dspark on. Setup remembers it, so later starts keep it; --dspark-json \"\" gives the set's own drafter back")
     ap.add_argument("--expert-tier", action="append", metavar="PATH,mib=N[,reserve=M][,verify=header|full]",
                     help="the expert tier (docs/EXPERT_TIER_PLAN.md §5.1): one flag per device you give, repeatable, "
                          "in order. The experts your GPU and RAM do not hold are written there once and read from "

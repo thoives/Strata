@@ -7,8 +7,14 @@
 #   tools/ds4/bytecheck.sh <base maya-ds4> <new maya-ds4> <pack> <out dir> <ids file> [<check> ...]
 #     checks: windows (DS4_CHUNK_MIN=100000: windows of 16), chunked (the prompt as one chunked run), drafter
 #             (--dspark on); default: windows chunked.  64 greedy tokens after the prompt.
+#             hybrid: the drafter with a RAM store (--ssd-cache RAM_GB, --dspark-expert-cache-mib DRAFT_MIB) and the expert
+#             tier named by TIER_ARGS (e.g. "--expert-tier /dev/nvme1n1,mib=368640 --expert-tier /dev/nvme2n1,mib=368640"),
+#             DS4_TIER_DIRECT=1.  It does NOT use --no-expert-cache or --expert-profile none: those would place the experts
+#             differently from a tier filled with the normal flags, and a placement that differs makes the engine refill the
+#             devices.  It needs TIER_REUSE_OK=1 (you confirm the tier already holds these args), and it stops before the new
+#             build if the base run did not print "reused from the placement".
 #   env: NEW_RESERVE_MIB (default 600, the engine's --reserve-mib default; the packed KV caches: 624, 626 with the
-#        drafter - see "placement" below); GPU (default 0); CTX (default 8192)
+#        drafter - see "placement" below); GPU (default 0); CTX (default 8192); RAM_GB (46), DRAFT_MIB (512): hybrid only
 #
 # Placement.  --no-expert-cache --expert-profile none fix WHICH experts VRAM holds (by index) and keep them there, but
 # not HOW MANY: that follows the free VRAM at load.  A change that frees or uses VRAM (smaller caches, a new buffer)
@@ -33,7 +39,16 @@ shift 5
 checks=${*:-windows chunked}
 mkdir -p "$out"
 common="--pack $pack --max-context ${CTX:-8192} --vision off --verbose --no-expert-cache --expert-profile none --n 64"
-run() {   # <build> <check> <exe> [env ...] -- <args ...>
+case " $checks " in   # the hybrid check writes to its devices if their placement differs: it runs only when the user says so
+*" hybrid "*)
+    if [ -z "${TIER_ARGS:-}" ] || [ "${TIER_REUSE_OK:-0}" != 1 ]; then
+        echo "hybrid: set TIER_ARGS to the tier's own args and TIER_REUSE_OK=1 (the tier must already hold these args; a" >&2
+        echo "        placement that differs refills the devices, and the first start after a fill writes over them)" >&2
+        exit 2
+    fi ;;
+esac
+base_args=$common
+run() {   # <build> <check> <exe> [env ...] -- <args ...>  (base_args: the flags of the check)
     local b=$1 c=$2 exe=$3
     shift 3
     local envs=()
@@ -44,11 +59,12 @@ run() {   # <build> <check> <exe> [env ...] -- <args ...>
     shift
     local reserve=600
     [ "$b" = new ] && reserve=${NEW_RESERVE_MIB:-600}
-    env CUDA_VISIBLE_DEVICES=${GPU:-0} ${envs[@]+"${envs[@]}"} "$exe" $common --reserve-mib $reserve "$@" --ids "$ids" \
+    env CUDA_VISIBLE_DEVICES=${GPU:-0} ${envs[@]+"${envs[@]}"} "$exe" $base_args --reserve-mib $reserve "$@" --ids "$ids" \
         --dump-logits "$out/${b}_$c.f32" > "$out/${b}_$c.out" 2> "$out/${b}_$c.err"
     echo "$b $c rc=$?"
 }
 for c in $checks; do
+    base_args=$common
     for b in base new; do
         exe=$base
         [ $b = new ] && exe=$new
@@ -56,6 +72,15 @@ for c in $checks; do
         windows) run $b $c "$exe" DS4_CHUNK_MIN=100000 -- --dspark none ;;
         chunked) run $b $c "$exe" -- --dspark none --window 1048576 ;;
         drafter) run $b $c "$exe" -- --dspark on ;;
+        hybrid)
+            base_args="--pack $pack --max-context ${CTX:-8192} --vision off --verbose --n 64"
+            read -r -a tier_words <<< "${TIER_ARGS}"
+            if [ $b = new ] && ! grep -q "reused from the placement" "$out/base_$c.err"; then
+                echo "hybrid: the base run did not reuse the tier (see $out/base_$c.err): stopping before the new build" >&2
+                echo "        if it says 'planned' or 'filled', the devices were refilled by that run" >&2
+                exit 3
+            fi
+            run $b $c "$exe" DS4_TIER_DIRECT=1 -- --dspark on --ssd-cache ${RAM_GB:-46} --dspark-expert-cache-mib ${DRAFT_MIB:-512} "${tier_words[@]}" ;;
         *) echo "unknown check $c" && exit 2 ;;
         esac
     done

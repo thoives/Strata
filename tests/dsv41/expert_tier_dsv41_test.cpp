@@ -162,7 +162,8 @@ struct World {
     ExpertStore st;
     std::vector<TierSpec> specs;
 
-    World(const fs::path& base, const std::string& name, bool verify_full) : dir(base / name) {
+    World(const fs::path& base, const std::string& name, bool verify_full, std::function<uint64_t()> ram = nullptr)
+        : dir(base / name) {
         fs::create_directories(dir);
         shard = (dir / "shard.gguf").string();
         devA = (dir / "tierA.img").string();
@@ -184,6 +185,7 @@ struct World {
         cfg.budget_bytes = 10ull * SLOT;   // (10 slots: enough for the checks, and no more)
         cfg.threads = 2;
         cfg.floor_bytes = 1ull << 20;
+        cfg.ram_avail = ram;   // (null: the RAM is not limited; the RAM test below sets it)
         CHECK(st.init(cfg, make_geo(), dfds, pfds));
         CHECK(st.slot_bytes() == SLOT);
         specs = {{devA, 16, 0, verify_full}, {devB, 12, 0, verify_full}};
@@ -934,6 +936,46 @@ static void direct_checks(const fs::path& base, const std::vector<std::pair<int3
         unhook(f);
         f.t->close();
     }
+
+    // DS4_TIER_DIRECT_SPAN (opt-in): the direct read takes the aligned span that covers the three matrices, the slot's padding on both
+    // sides left out (2 x kSlack of the slot: the blob, BLOB bytes).  The matrices are the file's bytes, and a refusal copies that same
+    // span the mapped way.
+    set_env("DS4_TIER_DIRECT_SPAN", "1");
+    {
+        constexpr uint64_t SPAN = BLOB;
+        Forced f;
+        CHECK(open_forced(base, "direct_span", ranked, pack, prof, f));
+        int d = -1;
+        uint64_t k = 0;
+        CHECK(f.t->find(L, E, d, k));
+        CHECK(fetch_ok(*f.w, L, E));   // (the store's bytes: the file's, all three matrices)
+        const std::vector<ExpertTierSet::DeviceStats> ds = f.t->stats();
+        const ExpertTierSet::DeviceStats& a = ds[(size_t) d];
+        CHECK(a.direct_mode == "direct" && a.direct_jobs == 1 && a.direct_ok == 1 && a.direct_fallbacks == 0 && a.direct_failed == 0);
+        CHECK(a.direct_slot_bytes == SPAN && a.direct_slot_ok_bytes == SPAN);   // (the span is what the device delivered, not the slot)
+        CHECK(a.direct_payload_ok_bytes == 3 * MB4);
+        CHECK(a.completed_jobs == 0 && a.completed_bytes == 0);
+        unhook(f);
+        f.t->close();
+    }
+    {
+        Forced f;
+        CHECK(open_forced(base, "direct_span_refused", ranked, pack, prof, f));
+        int d = -1;
+        uint64_t k = 0;
+        CHECK(f.t->find(L, E, d, k));
+        inject_plan({kShort4k, kEinval});   // (a short read, then the refusal: the same span is copied from the mapping, whole)
+        CHECK(fetch_ok(*f.w, L, E));
+        CHECK(f.fails.load() == 0);
+        {
+            const std::vector<ExpertTierSet::DeviceStats> ds = f.t->stats();
+            CHECK(ds[(size_t) d].direct_mode == "fallback" && ds[(size_t) d].direct_fallbacks == 1 && ds[(size_t) d].direct_ok == 0);
+        }
+        unhook(f);
+        f.t->close();
+    }
+    inject_plan({});
+    set_env("DS4_TIER_DIRECT_SPAN", nullptr);
 
     // ---- DS4_TIER_WAKE: the CPU lane waits on the tier device's queue, and only its own slot's reads end the wait ----
     // Each scenario holds a queue's worker in a gated injected read, so what the waiter does is decided by the test, not by timing:
@@ -1809,11 +1851,17 @@ static void lane_wake_checks(const fs::path& base, const std::vector<std::pair<i
         f.t->close();
     }
     set_env("DS4_LANE_WAKE", "1");
-    lane_ab_check(base, ranked, pack, prof);
-    lane_hook_check(base, ranked, pack, prof);
-    lane_fail_check(base, ranked, pack, prof);
-    lane_noslot_check(base, ranked, pack, prof);
-    lane_mapped_check(base, ranked, pack, prof);
+    // The five scenarios with DS4_TIER_WAKE off, then on.  On the lane's path the wait is the store's, so the tier's own wait is idle
+    // there; the two switches must not end each other's waits, so both settings must pass the same checks.
+    for (const char* tier_wake : {static_cast<const char*>(nullptr), "1"}) {
+        set_env("DS4_TIER_WAKE", tier_wake);
+        lane_ab_check(base, ranked, pack, prof);
+        lane_hook_check(base, ranked, pack, prof);
+        lane_fail_check(base, ranked, pack, prof);
+        lane_noslot_check(base, ranked, pack, prof);
+        lane_mapped_check(base, ranked, pack, prof);
+    }
+    set_env("DS4_TIER_WAKE", nullptr);
     set_env("DS4_LANE_WAKE", nullptr);
     set_env("DS4_TIER_THREADS", nullptr);
     set_env("DS4_TIER_DIRECT", nullptr);
@@ -1822,6 +1870,188 @@ static void lane_wake_checks(const fs::path& base, const std::vector<std::pair<i
     os::direct_pread_hook() = saved_read;
 }
 #endif
+
+// ---- ExpertStore::begin and cancel_stale (ds4_store.hpp, decode plan §1B/§1C): a request's hits are pinned before its misses
+// fill, so a miss never gives up an expert the same request needs; a repeated miss is read once; cancel_stale walks the arena
+// only when a guess is loading.  The store's own hooks: no tier here, so every read is a file read (bytes_read counts them).
+
+static void request_pin_checks(const fs::path& base) {
+    // A full arena (10 slots): layer 0's six experts and layer 1's first four, preloaded hottest first, so list[9] = (1, 3) is
+    // the least recently used and the next victim of the LRU policy.
+    std::vector<std::pair<int, int>> list;
+    for (int l = 0; l < 2; ++l)
+        for (int e = 0; e < NE; ++e) list.push_back({l, e});
+    list.resize(10);
+    {   // the first requested expert is absent; the later one is the victim.  It must survive, and only one read is made.
+        World w(base, "pin_hit", false);
+        CHECK(w.st.preload(list, 0) == 10);
+        const int sY = w.st.find(1, 3);
+        CHECK(sY >= 0 && w.st.find(1, 4) < 0);
+        const int64_t m0 = w.st.stats().misses.load(), h0 = w.st.stats().hits.load(), b0 = w.st.stats().bytes_read.load();
+        const int req[2] = {4, 3};
+        std::vector<char> ok;
+        std::vector<int> sl;
+        w.st.begin(1, req, 2, ok, sl);
+        CHECK(sl[0] >= 0 && sl[1] == sY);   // (the hit keeps its slot; the output keeps the request's order)
+        CHECK(w.st.wait_slots(sl, ok, 0, 2));
+        CHECK(ok[0] && ok[1]);
+        w.st.release(1, req, 2, ok);
+        CHECK(w.st.stats().misses.load() - m0 == 1);            // the absent expert
+        CHECK(w.st.stats().hits.load() - h0 == 1);              // the held one
+        CHECK(w.st.stats().bytes_read.load() - b0 == 3 * MB4);  // one expert's three matrices, read once
+        CHECK(w.st.find(1, 3) == sY);
+        for (int r = 0; r < 3; ++r) {
+            CHECK(same_matrix(w.st.mat(sl[1], r), 1, 3, r));
+            CHECK(same_matrix(w.st.mat(sl[0], r), 1, 4, r));
+        }
+    }
+    {   // a miss repeated in one request is read once: the repeat pins the slot the first one started
+        World w(base, "pin_dup", false);
+        CHECK(w.st.preload(list, 0) == 10);
+        const int sY = w.st.find(1, 3);
+        const int64_t m0 = w.st.stats().misses.load(), b0 = w.st.stats().bytes_read.load();
+        const int req[3] = {4, 4, 3};
+        std::vector<char> ok;
+        std::vector<int> sl;
+        w.st.begin(1, req, 3, ok, sl);
+        CHECK(w.st.wait_slots(sl, ok, 0, 3));
+        CHECK(ok[0] && ok[1] && ok[2]);
+        CHECK(sl[0] >= 0 && sl[0] == sl[1] && sl[2] == sY);
+        w.st.release(1, req, 3, ok);
+        CHECK(w.st.stats().misses.load() - m0 == 1);
+        CHECK(w.st.stats().bytes_read.load() - b0 == 3 * MB4);
+        CHECK(w.st.find(1, 3) == sY);
+        CHECK(w.st.find(1, 4) >= 0);
+    }
+    {   // cancel_stale: no guess loading -> no arena walk; a guess -> one walk; once it has landed -> no further walk
+        World w(base, "cancel_walk", false);
+        const uint64_t w0 = w.st.cancel_walks();
+        w.st.cancel_stale(5);
+        CHECK(w.st.cancel_walks() == w0);
+        const int req[1] = {2};   // a demand fill is not a guess
+        std::vector<char> ok;
+        CHECK(w.st.ensure(0, req, 1, ok) && ok[0]);
+        w.st.release(0, req, 1, ok);
+        w.st.cancel_stale(5);
+        CHECK(w.st.cancel_walks() == w0);
+        // a guess for layer 1 while the token is at layer 0: not passed, so not cancelled, and it lands
+        w.st.prefetch(1, 2);
+        w.st.cancel_stale(0);   // a guess is pending: the walk runs (and still sees it loading)
+        CHECK(w.st.cancel_walks() == w0 + 1);
+        for (int i = 0; i < 5000 && w.st.find(1, 2) < 0; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        CHECK(w.st.find(1, 2) >= 0);   // (ready: find() marks it so)
+        w.st.cancel_stale(0);          // this walk finds nothing loading any more ...
+        CHECK(w.st.cancel_walks() == w0 + 2);
+        w.st.cancel_stale(0);          // ... so the next call does not walk
+        CHECK(w.st.cancel_walks() == w0 + 2);
+        // a guess the token has passed (layer 1 <= 5) is cancelled by the walk, as before: its walk runs too
+        w.st.prefetch(1, 4);
+        w.st.cancel_stale(5);
+        CHECK(w.st.cancel_walks() == w0 + 3);
+    }
+}
+
+// The A/B switches (read when a store starts): DS4_STORE_PIN_FIRST=0 is the order before the pin fix, which the pin_hit case
+// above shows as a second read of the hit; DS4_STORE_CANCEL_SCAN=1 walks the arena on every cancel call.  Both are checked
+// here against the counts they must give, then the variables are cleared again.
+static void switch_checks(const fs::path& base) {
+    std::vector<std::pair<int, int>> list;
+    for (int l = 0; l < 2; ++l)
+        for (int e = 0; e < NE; ++e) list.push_back({l, e});
+    list.resize(10);
+    {   // the old order: the miss for 4 evicts the held 3 (the LRU victim), so 3 is read again: two misses, six matrices read
+        set_env("DS4_STORE_PIN_FIRST", "0");
+        World w(base, "switch_pin_old", false);
+        set_env("DS4_STORE_PIN_FIRST", nullptr);
+        CHECK(w.st.preload(list, 0) == 10);
+        const int64_t m0 = w.st.stats().misses.load(), b0 = w.st.stats().bytes_read.load();
+        const int req[2] = {4, 3};
+        std::vector<char> ok;
+        std::vector<int> sl;
+        w.st.begin(1, req, 2, ok, sl);
+        CHECK(w.st.wait_slots(sl, ok, 0, 2));
+        CHECK(ok[0] && ok[1]);
+        w.st.release(1, req, 2, ok);
+        CHECK(w.st.stats().misses.load() - m0 == 2);
+        CHECK(w.st.stats().bytes_read.load() - b0 == 6 * MB4);
+    }
+    {   // the default (pin first): unchanged, one read for the held expert
+        World w(base, "switch_pin_new", false);
+        CHECK(w.st.preload(list, 0) == 10);
+        const int64_t m0 = w.st.stats().misses.load();
+        const int req[2] = {4, 3};
+        std::vector<char> ok;
+        std::vector<int> sl;
+        w.st.begin(1, req, 2, ok, sl);
+        CHECK(w.st.wait_slots(sl, ok, 0, 2));
+        w.st.release(1, req, 2, ok);
+        CHECK(w.st.stats().misses.load() - m0 == 1);
+    }
+    {   // DS4_STORE_CANCEL_SCAN=1: the walk runs with no guess loading too
+        set_env("DS4_STORE_CANCEL_SCAN", "1");
+        World w(base, "switch_cancel", false);
+        set_env("DS4_STORE_CANCEL_SCAN", nullptr);
+        const uint64_t w0 = w.st.cancel_walks();
+        w.st.cancel_stale(5);
+        CHECK(w.st.cancel_walks() == w0 + 1);
+        w.st.cancel_stale(5);
+        CHECK(w.st.cancel_walks() == w0 + 2);
+    }
+}
+
+// ---- the RAM the store may take (ds4_store.hpp: grow's floor, preload's refusal, shrink_bytes): a synthetic RAM number the test sets,
+// the arena in chunks of 8 slots (DS4_STORE_CHUNK_SLOTS) of 10 slots: the first chunk is committed, the second is refused.
+
+static void ram_pressure_checks(const fs::path& base) {
+    set_env("DS4_STORE_CHUNK_SLOTS", "8");
+    uint64_t avail = ~uint64_t{0};   // (the RAM this process can still get; ~0 when unknown: no limit)
+    std::vector<std::pair<int, int>> list;   // hottest first: layer 0's six, then layer 1's first four (list[9] is the coldest)
+    for (int l = 0; l < 2; ++l)
+        for (int e = 0; e < NE; ++e) list.push_back({l, e});
+    list.resize(10);
+    {
+        World w(base, "ram_pressure", false, [&avail] { return avail; });
+        CHECK(w.st.slots_max() == 10);
+        CHECK(w.st.committed_slots() == 8);   // (init: the first chunk, while the RAM is not limited)
+        // (1) Partial growth: the second chunk is refused (its 2 slots need more than the RAM left above the floor).  The hottest
+        // prefix that fits is read; the colder ones are dropped, not a hotter one.
+        avail = (1ull << 20) + 2 * SLOT - 1;
+        CHECK(w.st.preload(list, 0) == 8);
+        for (int k = 0; k < 8; ++k) {
+            const int s = w.st.find(list[(size_t) k].first, list[(size_t) k].second);
+            CHECK(s >= 0);
+            if (s >= 0)
+                for (int r = 0; r < 3; ++r) CHECK(same_matrix(w.st.mat(s, r), list[(size_t) k].first, list[(size_t) k].second, r));
+        }
+        CHECK(w.st.find(1, 2) < 0 && w.st.find(1, 3) < 0);
+        CHECK(w.st.committed_slots() == 8);
+        // (2) The LRU order of the prefix: a demand miss under the same refusal gives up the coldest held one (list[7], the
+        // least recently touched of the eight), and keeps the hotter.
+        const int req[1] = {0};
+        std::vector<char> ok;
+        CHECK(w.st.ensure(2, req, 1, ok) && ok[0]);
+        w.st.release(2, req, 1, ok);
+        CHECK(w.st.find(1, 1) < 0);
+        CHECK(w.st.find(1, 0) >= 0 && w.st.find(0, 0) >= 0);
+        // (3) The RAM is back: the next preload grows the arena, and the two colder experts come in with no eviction.
+        avail = ~uint64_t{0};
+        const std::vector<std::pair<int, int>> cold = {{1, 2}, {1, 3}};
+        CHECK(w.st.preload(cold, 0) == 2);
+        CHECK(w.st.committed_slots() == 10);
+        CHECK(w.st.find(1, 2) >= 0 && w.st.find(1, 3) >= 0);
+        CHECK(w.st.find(1, 0) >= 0 && w.st.find(0, 0) >= 0);   // (the prefix is still there)
+        // (4) RAM short: shrink_bytes frees the last chunk (2 slots) by its own size, and forgets its experts.  Its slots are the
+        // ones the cold pair took.
+        size_t freed = 0;
+        CHECK(w.st.shrink_bytes(SLOT, &freed) == 1);
+        CHECK(freed == 2 * SLOT);
+        CHECK(w.st.committed_slots() == 8);
+        CHECK(w.st.find(1, 2) < 0 && w.st.find(1, 3) < 0);
+        CHECK(w.st.find(0, 0) >= 0 && w.st.find(1, 0) >= 0);   // (the first chunk's experts are kept)
+        CHECK(w.st.shrink_bytes(0, &freed) == 0 && freed == 0);   // (nothing asked for: nothing given back)
+    }
+    set_env("DS4_STORE_CHUNK_SLOTS", nullptr);
+}
 
 int main() {
     const fs::path base = fs::temp_directory_path() /
@@ -2567,6 +2797,9 @@ int main() {
 
     queue_wait_checks();   // IoQueue::wait_until_zero on a bare queue (DS4_TIER_WAKE's wait)
     lane_rounds_checks();  // DS4_LANE_WAKE: the CPU lane's order of work (no store)
+    request_pin_checks(base);   // begin(): a request's hits pinned before its misses fill; cancel_stale's walk only with a guess
+    switch_checks(base);        // DS4_STORE_PIN_FIRST=0 and DS4_STORE_CANCEL_SCAN=1 give the counts of the old code
+    ram_pressure_checks(base);  // preload's hottest prefix under a refused chunk; shrink_bytes by the chunks' own sizes
 #if !defined(_WIN32)
     direct_checks(base, ranked, packA, profA);   // DS4_TIER_DIRECT (opt-in): see the section above
     lane_wake_checks(base, ranked, packA, profA);   // DS4_LANE_WAKE: the lane on the real store, with held reads

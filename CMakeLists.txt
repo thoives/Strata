@@ -395,6 +395,12 @@ if(STRATA_BUILD_TESTS)
   add_executable(host_limits_test tests/platform/host_limits_test.cpp)
   target_include_directories(host_limits_test PRIVATE include)
   add_test(NAME host_limits_test COMMAND host_limits_test)
+
+  # DSpark's hybrid placement policy (docs/DSPARK_HYBRID_PLAN.md §3): the slot quotas and the draft expert cache. Pure CPU.
+  add_executable(dspark_expert_plan_test tests/core/dspark_expert_plan_test.cpp src/core/dspark_expert_plan.cpp)
+  target_include_directories(dspark_expert_plan_test PRIVATE include)
+  add_test(NAME dspark_expert_plan_test COMMAND dspark_expert_plan_test)
+  set_tests_properties(dspark_expert_plan_test PROPERTIES TIMEOUT 60)
 endif()
 
 # ---- strata_plan ----------------------------------------------------------
@@ -961,7 +967,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                    src/dsv41/ds4_tq.cu src/dsv41/ds4_tq_cpu.cpp src/dsv41/ds4_gg_cpu.cpp src/dsv41/ds4_packinfo.cpp
                    # the expert tier's shared pieces (docs/EXPERT_TIER_DSV41_PLAN.md E1): the planner and the header/table codec,
                    # host files the tier (ds4_tier.hpp) calls: same sources the Qwen engine's strata_engine carries
-                   src/core/expert_tier.cpp src/core/expert_tier_plan.cpp)
+                   src/core/expert_tier.cpp src/core/expert_tier_plan.cpp
+                   # the DSpark hybrid placement's quotas and draft cache (docs/DSPARK_HYBRID_PLAN.md §3): pure host code
+                   src/core/dspark_expert_plan.cpp)
     # the commit the binary was built from, readable with --version (set -DSTRATA_BUILD_ID=... for a tree without .git)
     if(NOT STRATA_BUILD_ID AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/BUILD_ID)   # (a git archive has no .git: the packer writes the commit here)
       file(STRINGS ${CMAKE_CURRENT_SOURCE_DIR}/BUILD_ID STRATA_BUILD_ID LIMIT_COUNT 1)

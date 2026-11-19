@@ -171,6 +171,9 @@ public:
     bool init(const Cfg& c, const std::vector<LayerGeo>& layers, const std::vector<os::fd_t>& dfds, const std::vector<os::fd_t>& pfds) {
         cfg_ = c;
         if (const char* tw = std::getenv("DS4_TIER_WAKE")) cfg_.tier_wake = std::atoi(tw) != 0;
+        if (const char* ds = std::getenv("DS4_TIER_DIRECT_SPAN")) direct_span_ = std::atoi(ds) != 0;   // (opt-in: direct_range)
+        if (const char* pf = std::getenv("DS4_STORE_PIN_FIRST")) pin_first_ = std::atoi(pf) != 0;   // (0: the order before 1B, for an A/B)
+        if (const char* cs = std::getenv("DS4_STORE_CANCEL_SCAN")) cancel_scan_ = std::atoi(cs) != 0;   // (1: the walk on every call, for an A/B)
         geo_ = layers;
         dfds_ = dfds;
         pfds_ = pfds;
@@ -229,6 +232,9 @@ public:
     /// so the nominal slots_max() can be more than the store can keep). Slots are never given back, so this is a guarantee.
     size_t committed_slots() const { return nalloc_; }
     const Stats& stats() const { return st_; }
+    /// cancel_stale's arena walks so far (a test's count: a call with no guess loading does not walk).  Read it when no store
+    /// call is running on another thread.
+    uint64_t cancel_walks() const { return cancel_walks_; }
     double busy_ms() const { return io_ ? io_->busy_ms() : 0.0; }
     static constexpr size_t kSlack = 8192;
 
@@ -264,24 +270,38 @@ public:
         sl.assign((size_t) n, -1);
         if (layer < 0 || layer >= (int) geo_.size()) return;
         std::lock_guard<std::mutex> lk(mu_);
+        if (!pin_first_) {   // DS4_STORE_PIN_FIRST=0: each entry in turn, as before 1B (a miss may then evict a hit that comes later)
+            for (int i = 0; i < n; ++i) {
+                touch_heat(layer, es[i]);
+                const int s = where_[(size_t) layer][(size_t) es[i]];
+                if (s >= 0) {
+                    sl[(size_t) i] = pin_held(s);
+                } else {
+                    st_.misses.fetch_add(1, std::memory_order_relaxed);
+                    sl[(size_t) i] = start_fill(layer, es[i], true);
+                }
+            }
+            return;
+        }
+        // Pass 1: every entry the store holds (ready, or its reads on the way) is pinned before any miss is filled.  A fill
+        // takes the policy's victim, and that can be a later entry of this same request: it would then be read again.
         for (int i = 0; i < n; ++i) {
+            touch_heat(layer, es[i]);
+            const int s = where_[(size_t) layer][(size_t) es[i]];
+            if (s >= 0) sl[(size_t) i] = pin_held(s);
+        }
+        // Pass 2: the misses, in request order.  A repeat of a miss met earlier in this pass is held as a hit (its read is on
+        // the way), so the same expert is never read twice.
+        for (int i = 0; i < n; ++i) {
+            if (sl[(size_t) i] >= 0) continue;
             const int e = es[i];
-            touch_heat(layer, e);
-            int s = where_[(size_t) layer][(size_t) e];
+            const int s = where_[(size_t) layer][(size_t) e];
             if (s >= 0) {
-                Slot& sp = slots_[(size_t) s];
-                try_ready(sp);
-                if (sp.state.load() == kReady && !sp.prefetch) st_.hits.fetch_add(1, std::memory_order_relaxed);
-                if (sp.prefetch) st_.prefetch_used.fetch_add(1, std::memory_order_relaxed);
-                sp.prefetch = false;
-                sp.pin++;
-                sp.tick = ++clock_;
-                sl[(size_t) i] = s;
+                sl[(size_t) i] = pin_held(s);
                 continue;
             }
             st_.misses.fetch_add(1, std::memory_order_relaxed);
-            s = start_fill(layer, e, true);
-            sl[(size_t) i] = s;
+            sl[(size_t) i] = start_fill(layer, e, true);
         }
     }
     /// True when the reads of slot sl (from begin) are all done.
@@ -367,32 +387,49 @@ public:
     /// `leave` slots; returns how many were read.
     size_t preload(const std::vector<std::pair<int, int>>& list, size_t leave) {
         size_t n = 0;
-        std::vector<int> started;   // the slots this call's reads were started for
+        std::vector<int> order;   // the prefix's slots, hottest first: each is pinned from here until it is in
         {
             std::lock_guard<std::mutex> lk(mu_);
             const size_t room = nmax_ > leave ? nmax_ - leave : 0;
             const size_t take = std::min(list.size(), room);
-            started.reserve(take);
-            for (size_t k = take; k-- > 0;) {   // (coldest first: the hottest get the newest ticks)
+            order.reserve(take);
+            // Hottest first, each pinned as it is taken, so no fill of this call gives up a hotter entry of it.  When no slot can be
+            // had (a chunk refused by the RAM floor and nothing unpinned to give up) the list stops there: the colder entries are the
+            // ones dropped.  An entry already held is pinned and kept the same way, and does not count as read.
+            for (size_t k = 0; k < take; ++k) {
                 const int layer = list[k].first, e = list[k].second;
                 if (layer < 0 || layer >= (int) geo_.size() || e < 0 || e >= geo_[(size_t) layer].n_exp) continue;
-                if (where_[(size_t) layer][(size_t) e] >= 0) continue;
-                const int s = start_fill(layer, e, false);
-                if (s < 0) break;
-                slots_[(size_t) s].prefetch = false;   // (warm, not a guess)
-                started.push_back(s);
-                ++n;
+                int s = where_[(size_t) layer][(size_t) e];
+                if (s >= 0) {
+                    slots_[(size_t) s].pin++;
+                } else {
+                    s = start_fill(layer, e, false);
+                    if (s < 0) break;
+                    Slot& sp = slots_[(size_t) s];
+                    sp.prefetch = false;   // (warm, not a guess)
+                    --guesses_loading_;    // (start_fill counted it as one: it is not)
+                    sp.pin = 1;
+                    ++n;
+                }
+                order.push_back(s);
             }
+            // The explicit LRU order: the prefix's hottest gets the newest tick, so the policy gives up the colder ones first.
+            const uint64_t t0 = clock_;
+            clock_ += order.size();
+            for (size_t j = 0; j < order.size(); ++j) slots_[(size_t) order[j]].tick = t0 + (order.size() - j);
         }
-        // Each started slot is waited for on its own (outside the lock), then made ready.  The old wait took every slot of the
-        // arena through again at each wake (nalloc_ slots a wake: quadratic in a long warm list).
-        for (const int s : started) {
-            Slot& sp = slots_[(size_t) s];
-            wait_left(sp);
+        // Each is waited for on its own (outside the lock; pinned, so it stays put), then made ready.  The old wait took every slot
+        // of the arena through again at each wake (nalloc_ slots a wake: quadratic in a long warm list).
+        for (const int s : order) wait_left(slots_[(size_t) s]);
+        {
             std::lock_guard<std::mutex> lk(mu_);
-            if (sp.state.load(std::memory_order_acquire) == kLoading && sp.left.load(std::memory_order_acquire) == 0) {
-                try_ready(sp);
-                if (sp.state.load(std::memory_order_acquire) == kLoading) finish(sp);
+            for (const int s : order) {
+                Slot& sp = slots_[(size_t) s];
+                if (sp.pin > 0) sp.pin--;   // (unpinned before any finish: a failed slot goes free, and no pin may outlive it)
+                if (sp.state.load(std::memory_order_acquire) == kLoading && sp.left.load(std::memory_order_acquire) == 0) {
+                    try_ready(sp);
+                    if (sp.state.load(std::memory_order_acquire) == kLoading) finish(sp);
+                }
             }
         }
         for (;;) {   // until every read is done: still every loading slot of the arena, as before (the ones above are ready, so
@@ -472,11 +509,18 @@ public:
     /// Guesses still waiting in the queue for a layer the token is past: dropped unread (their slots free once the queue has gone by)
     void cancel_stale(int layer_now) {
         std::lock_guard<std::mutex> lk(mu_);
+        // No guess loading (guesses_loading_ bounds them from above): nothing to cancel, and the arena is not walked
+        // (DS4_STORE_CANCEL_SCAN=1 walks it every time, as before)
+        if (!cancel_scan_ && guesses_loading_ == 0) return;
+        ++cancel_walks_;
+        size_t loading = 0;
         for (size_t i = 0; i < nalloc_; ++i) {
             Slot& sp = slots_[i];
-            if (sp.prefetch && sp.pin == 0 && sp.layer >= 0 && sp.layer <= layer_now && sp.state.load(std::memory_order_acquire) == kLoading)
-                sp.cancel.store(true, std::memory_order_release);
+            const bool guess = sp.prefetch && sp.state.load(std::memory_order_acquire) == kLoading;
+            if (guess) ++loading;
+            if (guess && sp.pin == 0 && sp.layer >= 0 && sp.layer <= layer_now) sp.cancel.store(true, std::memory_order_release);
         }
+        guesses_loading_ = loading;   // exact now: a guess that lands later only lowers the true count, so the bound stays one
     }
     /// An access the host saw for an expert the GPU computed (keeps it warm in the policy's eyes).
     void touch(int layer, int e) {
@@ -548,38 +592,22 @@ public:
     size_t shrink_chunks(size_t want) {
         std::lock_guard<std::mutex> lk(mu_);
         size_t done = 0;
-        while (done < want && !chunks_.empty()) {
-            const size_t c = chunks_.size() - 1, first = c * kChunk;
-            bool busy = false;
-            for (size_t i = first; i < nalloc_ && !busy; ++i) {
-                Slot& sp = slots_[i];
-                if (sp.state.load(std::memory_order_acquire) == kLoading && sp.left.load(std::memory_order_acquire) == 0) {   // (read by now)
-                    try_ready(sp);
-                    if (sp.state.load(std::memory_order_acquire) == kLoading) finish(sp);
-                }
-                busy = sp.pin > 0 || sp.visible || sp.state.load(std::memory_order_acquire) == kLoading;
-            }
-            if (busy) break;
-            for (size_t i = first; i < nalloc_; ++i) {
-                Slot& sp = slots_[i];
-                if (sp.layer >= 0 && sp.expert >= 0) {
-                    where_[(size_t) sp.layer][(size_t) sp.expert] = -1;
-                    st_.evictions.fetch_add(1, std::memory_order_relaxed);
-                }
-                sp.layer = sp.expert = -1;
-                sp.prefetch = false;
-                sp.state.store(kFree, std::memory_order_release);
-                sp.base = nullptr;
-            }
-            if (cfg_.unmap_chunk && chunk_dev_[c] != nullptr) cfg_.unmap_chunk(chunks_[c].first);
-            os::range_decommit(chunks_[c].first, chunks_[c].second);
-            chunks_.pop_back();
-            chunk_dev_.pop_back();
-            nalloc_ = first;
-            free_hint_ = std::min(free_hint_, first);
+        while (done < want && drop_last_chunk()) ++done;
+        return done;
+    }
+    /// The same by bytes: gives back chunks from the end until at least `want_bytes` are freed - counted from each chunk's own size
+    /// (the last one may be short), so a chunk of many slots counts as what it is - or until none can go.  Returns the chunks given
+    /// back; `freed`, when set, gets their bytes.
+    size_t shrink_bytes(size_t want_bytes, size_t* freed = nullptr) {
+        std::lock_guard<std::mutex> lk(mu_);
+        size_t done = 0, bytes = 0;
+        while (bytes < want_bytes && !chunks_.empty()) {
+            const size_t cb = chunks_.back().second;
+            if (!drop_last_chunk()) break;
+            bytes += cb;
             ++done;
-            ++shrunk_;
         }
+        if (freed != nullptr) *freed = bytes;
         return done;
     }
     size_t shrunk() const { return shrunk_; }
@@ -627,14 +655,50 @@ private:
         if (cfg_.policy != kLru && ++hits_in_layer_[(size_t) layer] % (uint64_t) cfg_.decay_every == 0)
             for (float& h : heat_[(size_t) layer]) h *= cfg_.decay;   // (a linear pass over 384 floats every 240 accesses of that layer)
     }
-    // DS4_TIER_DIRECT: the checks before a direct read lands in this slot (mu_ held).  The read is the store's whole slot, the
-    // device's alignments hold for the offset, the length and the memory, and the destination is inside the committed arena.
-    bool direct_fits(const TierDirect& td, const Slot& sp) const {
+    // DS4_TIER_DIRECT: the checks before a direct read of [a, a + len) of the tier's slot lands in this store slot (mu_ held).  The
+    // device's alignments hold for the offset, the length and the memory, the range is inside the slot, and the destination is
+    // inside the committed arena.  (a = 0, len = the whole slot: the read as it was.)
+    bool direct_fits(const TierDirect& td, const Slot& sp, uint64_t a, uint64_t len) const {
         if (td.fd == os::kBadFd || sp.base == nullptr || td.len != slot_bytes_) return false;
         if (td.align == 0 || td.mem_align == 0 || (td.align & (td.align - 1)) != 0 || (td.mem_align & (td.mem_align - 1)) != 0) return false;
         const uintptr_t dst = (uintptr_t) (sp.base - kSlack), lo = (uintptr_t) arena_, hi = lo + arena_bytes_;
         if (dst < lo || dst > hi || slot_bytes_ > hi - dst) return false;
-        return td.off % td.align == 0 && td.len % td.align == 0 && dst % td.mem_align == 0 && td.len % td.mem_align == 0;
+        if (len == 0 || a > slot_bytes_ || len > slot_bytes_ - a) return false;
+        return (td.off + a) % td.align == 0 && len % td.align == 0 && (dst + a) % td.mem_align == 0 && len % td.mem_align == 0;
+    }
+    // DS4_TIER_DIRECT: the range of the tier's slot that one direct read takes (mu_ held): with DS4_TIER_DIRECT_SPAN on, the aligned span
+    // that covers the layer's three matrices (the slot's leading and trailing padding left out; the matrices' gaps stay in); when
+    // that span cannot meet the device's alignments or bounds, and always with the switch off, the whole slot.  False: neither fits.
+    bool direct_range(const LayerGeo& g, const TierDirect& td, const Slot& sp, uint64_t& a, uint64_t& len) const {
+        if (direct_span_ && td.align != 0 && (td.align & (td.align - 1)) == 0) {
+            uint64_t lo = UINT64_MAX, hi = 0;
+            for (int r = 0; r < 3; ++r) {
+                lo = std::min<uint64_t>(lo, kSlack + g.tr[r]);
+                hi = std::max<uint64_t>(hi, kSlack + g.tr[r] + g.bytes[r]);
+            }
+            const uint64_t a0 = lo & ~(td.align - 1), b0 = (hi + td.align - 1) & ~(td.align - 1);
+            if (b0 <= slot_bytes_ && b0 > a0 && direct_fits(td, sp, a0, b0 - a0)) {
+                a = a0;
+                len = b0 - a0;
+                return true;
+            }
+        }
+        if (!direct_fits(td, sp, 0, slot_bytes_)) return false;
+        a = 0;
+        len = slot_bytes_;
+        return true;
+    }
+    // A slot the store holds for a request (ready, or its reads on the way): counted as a hit once ready and not a guess, pinned
+    // for the request, and touched.  mu_ held.  Returns s.
+    int pin_held(int s) {
+        Slot& sp = slots_[(size_t) s];
+        try_ready(sp);
+        if (sp.state.load() == kReady && !sp.prefetch) st_.hits.fetch_add(1, std::memory_order_relaxed);
+        if (sp.prefetch) st_.prefetch_used.fetch_add(1, std::memory_order_relaxed);
+        sp.prefetch = false;
+        sp.pin++;
+        sp.tick = ++clock_;
+        return s;
     }
     // a slot for (layer, e) and its reads started; -1 if there is none to be had.  mu_ held.
     int start_fill(int layer, int e, bool demand) {
@@ -653,6 +717,7 @@ private:
         sp.expert = e;
         sp.pin = demand ? 1 : 0;
         sp.prefetch = !demand;
+        if (!demand) ++guesses_loading_;
         sp.visible = false;
         sp.tick = ++clock_;
         sp.state.store(kLoading, std::memory_order_release);
@@ -685,19 +750,20 @@ private:
         // device's queue, with the same priority.  Anything the checks refuse is the three mapped copies below, as before.  The
         // count is set before the slot is findable (where_ is published after it).
         TierDirect td;
-        const bool direct = tdev >= 0 && cfg_.tier_direct && cfg_.tier_direct(tdev, tslot, td) && direct_fits(td, sp);
+        uint64_t da = 0, dlen = 0;   // the direct read's range in the slot (direct_range: the whole slot, or the matrices' span)
+        const bool direct = tdev >= 0 && cfg_.tier_direct && cfg_.tier_direct(tdev, tslot, td) && direct_range(g, td, sp, da, dlen);
         sp.left.store(direct ? 1 : 3, std::memory_order_release);
         where_[(size_t) layer][(size_t) e] = s;
         if (direct) {
             IoQueue::Job dj;
             dj.dfd = td.fd;
-            dj.off = td.off;
-            dj.len = td.len;
-            dj.dst = sp.base - kSlack;   // (the store's slot starts kSlack before its blob: the tier's slot has the same layout, E2)
+            dj.off = td.off + da;
+            dj.len = dlen;
+            dj.dst = sp.base - kSlack + da;   // (the store's slot starts kSlack before its blob: the tier's slot has the same layout, E2)
             dj.align = td.align;
             dj.mem_align = td.mem_align;
             dj.payload = g.bytes[0] + g.bytes[1] + g.bytes[2];
-            dj.fallback = tbase - kSlack;   // (the same slot in the tier's mapping: copied if the device refuses the direct read)
+            dj.fallback = tbase - kSlack + da;   // (the same range in the tier's mapping: copied if the device refuses the direct read)
             dj.refused = td.refused;
             dj.tier_direct = true;
             dj.left = &sp.left;
@@ -803,6 +869,40 @@ private:
         nalloc_ += n;
         return true;
     }
+    // gives back the arena's last chunk (its experts forgotten) if no slot of it is in use.  mu_ held.  False: none, or it is busy.
+    bool drop_last_chunk() {
+        if (chunks_.empty()) return false;
+        const size_t c = chunks_.size() - 1, first = c * kChunk;
+        bool busy = false;
+        for (size_t i = first; i < nalloc_ && !busy; ++i) {
+            Slot& sp = slots_[i];
+            if (sp.state.load(std::memory_order_acquire) == kLoading && sp.left.load(std::memory_order_acquire) == 0) {   // (read by now)
+                try_ready(sp);
+                if (sp.state.load(std::memory_order_acquire) == kLoading) finish(sp);
+            }
+            busy = sp.pin > 0 || sp.visible || sp.state.load(std::memory_order_acquire) == kLoading;
+        }
+        if (busy) return false;
+        for (size_t i = first; i < nalloc_; ++i) {
+            Slot& sp = slots_[i];
+            if (sp.layer >= 0 && sp.expert >= 0) {
+                where_[(size_t) sp.layer][(size_t) sp.expert] = -1;
+                st_.evictions.fetch_add(1, std::memory_order_relaxed);
+            }
+            sp.layer = sp.expert = -1;
+            sp.prefetch = false;
+            sp.state.store(kFree, std::memory_order_release);
+            sp.base = nullptr;
+        }
+        if (cfg_.unmap_chunk && chunk_dev_[c] != nullptr) cfg_.unmap_chunk(chunks_[c].first);
+        os::range_decommit(chunks_[c].first, chunks_[c].second);
+        chunks_.pop_back();
+        chunk_dev_.pop_back();
+        nalloc_ = first;
+        free_hint_ = std::min(free_hint_, first);
+        ++shrunk_;
+        return true;
+    }
     // the slot to give up (or a free one): the policy's lowest among the unpinned, not visible, ready ones.  mu_ held.
     int take_slot(bool demand) {
         for (size_t i = free_hint_; i < nalloc_; ++i)
@@ -841,6 +941,13 @@ private:
     size_t slot_bytes_ = 0, nmax_ = 0, nalloc_ = 0, free_hint_ = 0, arena_bytes_ = 0;
     uint8_t* arena_ = nullptr;
     size_t shrunk_ = 0;
+    uint64_t cancel_walks_ = 0;   // (cancel_stale's arena walks: the test's count, under mu_)
+    // (mu_) an upper bound on the guesses still loading: start_fill counts a guess up, preload counts its own back down (it is
+    // warm, not a guess), cancel_stale recounts them exactly.  Zero: cancel_stale has nothing to cancel and does not walk.
+    size_t guesses_loading_ = 0;
+    bool direct_span_ = false;   // DS4_TIER_DIRECT_SPAN (read in init): a direct tier read takes the matrices' span, not the slot
+    bool pin_first_ = true;      // DS4_STORE_PIN_FIRST (read in init): begin() pins the held experts before it fills misses (0: the old order)
+    bool cancel_scan_ = false;   // DS4_STORE_CANCEL_SCAN (read in init): 1 = cancel_stale() walks the arena on every call (the old way)
     std::unique_ptr<Slot[]> slots_;
     std::vector<std::pair<void*, size_t>> chunks_;
     std::vector<void*> chunk_dev_;
