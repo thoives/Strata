@@ -232,6 +232,10 @@ DSV41_FLAGS = {
     "--dspark": ("on|off|none|auto", "The DSpark drafter that guesses ahead to speed up answers (auto loads it only where it helps)."),
     "--dspark-conf": ("F", "How sure a DSpark guess must be to be used (0 to 1)."),
     "--dspark-block": ("N", "The most words DSpark guesses in one round."),
+    "--dspark-depth": ("N", "The most guessed words the model checks in one round (the drafter still guesses its whole block; "
+                            "this only limits the checks)."),
+    "--dspark-expert-cache-mib": ("N", "The most graphics memory, in MiB, the drafter's experts may use (with --dspark on; its experts "
+                                       "are kept in RAM in full, the rest of the expert memory goes to the model)."),
     "--expert-profile": ("FILE|none", "A table of which experts are used most, to decide what is kept in memory first."),
     "--ssd-cache": ("GB", "How much RAM keeps the most used experts so they are not read from the SSD again (sizes itself when absent)."),
     "--expert-tier": ("PATH,mib=N[,reserve=M][,verify=header|full]",

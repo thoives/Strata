@@ -14,6 +14,7 @@
 // and after the last layer logits = head(rmsnorm(sum_s pre[s] h[s])).
 #include "ds4_launch.h"   // strata_ds4_launch: <<<>>> on CUDA and HIP, a dispatch on Metal
 #include "ds4_model.hpp"
+#include "strata/core/dspark_expert_plan.hpp"   // the DSpark hybrid placement's quotas and draft cache (docs/DSPARK_HYBRID_PLAN.md)
 #include "ds4_pick_rule.hpp"
 #include "ds4_experts_rule.hpp"
 #include "ds4_engram_io.hpp"
@@ -782,6 +783,9 @@ struct Layer {
     std::vector<int> slot;                      // expert -> VRAM slot or -1
     std::vector<int> ram;                       // expert -> RAM-tier slot or -1 (a GGUF's in-place experts; empty: none)
     std::vector<uint8_t*> host;                 // expert -> host (non-null: on the CPU lane; its halves in hh)
+    // the DSpark hybrid placement: a draft layer's every expert's whole blob in RAM of its own (dback[e] + lay.trellis[r] is matrix
+    // r), resident or not, so eviction and promotion never copy down and the CPU lane never reads the files (draft_backing)
+    std::vector<uint8_t*> dback;
     // the CPU lane keeps an expert as NH column parts, part X on NUMA node X: gate / up columns [X n_ff / NH, ..),
     // down columns [X dim / NH, ..), each a standalone EXL3 matrix (its own trellis, the full suh, its part of svh)
     struct Half {
@@ -1163,6 +1167,8 @@ struct Model::Impl {
     struct Swap {
         int layer = 0, in = -1, out = -1;
         int ram = -1;   // (copy_mode, `in` held in RAM) the spare slot `out` is copied into from VRAM
+        bool ok = true;     // the copy finished (a draft swap is published only when it did)
+        bool draft = false; // the hybrid draft cache's swap (draft_propose / draft_publish), not the trunk's heat rule
     };
     static constexpr int kMaxSwaps = 8;
     // the swap rule: a CPU-lane expert in when its heat passes the coldest VRAM one's x margin + bonus; heat x decay
@@ -1265,6 +1271,27 @@ struct Model::Impl {
         (void) d;
         return false;
 #endif
+    }
+    // The DSpark hybrid placement (--dspark-expert-cache-mib; docs/DSPARK_HYBRID_PLAN.md), off unless asked for: the drafter's
+    // experts' RAM backing (draft_chunks: anonymous memory of their own, never pinned, never a verifier copy), the draft cache's
+    // policy (its histogram and residency, kept on the loaded model), and the draft round counter, ticked as each draft starts
+    bool draft_hybrid = false;
+    uint64_t draft_cap = 0;                          // bytes: the drafter's VRAM slots, spare slots included
+    std::unique_ptr<strata::core::DraftExpertCache> draft_pol;
+    uint64_t draft_round = 0;
+    std::vector<uint8_t*> draft_chunks;
+    std::vector<size_t> draft_chunk_bytes;
+    static int draft_swaps_max() {   // copies the draft cache starts per draft (DS4_DRAFT_SWAPS; bounded further by DS4_CACHE_INFLIGHT)
+        static const int n = std::getenv("DS4_DRAFT_SWAPS") ? std::max(1, std::atoi(std::getenv("DS4_DRAFT_SWAPS"))) : 2;
+        return n;
+    }
+    static strata::core::DraftCacheConfig draft_cfg() {   // the policy's knobs: starting points, measured by the benchmark gate, not tuned
+        strata::core::DraftCacheConfig c;
+        if (std::getenv("DS4_DRAFT_DECAY")) c.decay_per_round = std::atof(std::getenv("DS4_DRAFT_DECAY"));
+        if (std::getenv("DS4_DRAFT_MIN")) c.min_score = std::atof(std::getenv("DS4_DRAFT_MIN"));
+        if (std::getenv("DS4_DRAFT_MARGIN")) c.margin = std::atof(std::getenv("DS4_DRAFT_MARGIN"));
+        if (std::getenv("DS4_DRAFT_COOLDOWN")) c.retry_cooldown_rounds = (uint64_t) std::atoll(std::getenv("DS4_DRAFT_COOLDOWN"));
+        return c;
     }
     bool copy_mode = false;
     std::vector<std::array<uint8_t*, 2>> ram_part;   // slot -> its parts
@@ -1520,6 +1547,7 @@ struct Model::Impl {
             if (ram_pinned) (void) cudaHostUnregister(ram_chunks[i]);
             os::anon_free(ram_chunks[i], ram_chunk_bytes[i]);
         }
+        for (size_t i = 0; i < draft_chunks.size(); ++i) os::anon_free(draft_chunks[i], draft_chunk_bytes[i]);   // (never pinned)
         for (Dev& d : devs) {
             cudaSetDevice(d.id);
             for (void* p : d.allocs) cudaFree(p);
@@ -2003,6 +2031,7 @@ struct Model::Impl {
         return true;
     }
     const uint8_t* mx_mat(const Layer& l, int e, int r) const {   // expert e's matrix r: its RAM-tier slot, else the file's
+        if (!l.dback.empty()) return l.dback[(size_t) e] + l.lay.trellis[r];   // (a DSpark draft layer: its RAM backing)
         if (store) {
             const int s = store->find(l.il, e);
             if (s >= 0) return store->mat(s, r);
@@ -2043,6 +2072,10 @@ struct Model::Impl {
     // expert e (from the file) -> its blob; and member m of nm's part of a blob (gate / up rows [m n_ff / nm, ..), down
     // inputs of the same range: in each row the blocks [m n_ff / nm / 32, ..)) and back
     bool read_mx(const Layer& l, int e, uint8_t* blob) const {   // (from its RAM-tier slot or copy when it has one)
+        if (!l.dback.empty()) {   // (a DSpark draft layer: its RAM backing, whole)
+            std::memcpy(blob, l.dback[(size_t) e], l.blob);
+            return true;
+        }
         if (!l.ram.empty() && l.ram[(size_t) e] >= 0) {
             if (copy_mode) ram_to_blob(l, l.ram[(size_t) e], blob);
             else std::memcpy(blob, ram_slots[(size_t) l.ram[(size_t) e]], l.blob);
@@ -3086,9 +3119,13 @@ struct Model::Impl {
             c_accd.resize((size_t) NH * S * DQ * (E / NH));
             c_yd.resize(S * E);
         }
-        // the experts: VRAM slots in what each device has left, the rest on the host
+        // the experts: VRAM slots in what each device has left, the rest on the host.  The hybrid's drafter is RAM-backed before the
+        // verifier's copies and store are sized (draft_backing), so its bytes are not taken from them afterwards
+        if (!hybrid_setup(err)) return false;
         if (!place_experts(err)) return false;
+        if (!draft_backing(err)) return false;
         if (!load_experts(err)) return false;
+        if (!draft_policy_init(err)) return false;
         if (pk.gguf) make_pools();
         if (chunk > 0) {
             // the CPU lane's parts pinned (the chunks stream them to the GPUs by DMA), each layer's virtual slots
@@ -4687,11 +4724,37 @@ struct Model::Impl {
                 room = std::max(0.0, room - std::min(budget, all) * nm);
             }
             double budget_t = budget;   // the drafter's experts first, all of them (every draft uses its blocks)
+            std::vector<strata::core::DraftLayerShape> sh;
+            std::vector<Layer*> dl;
             for (Layer& l : L)
                 if (l.grp == (int) gi && l.mtp) {
-                    l.n_vram = std::min(l.n_exp, (int) std::floor(budget_t / (double) ucount(l)));
-                    budget_t -= (double) l.n_vram * ucount(l);
+                    sh.push_back({(uint64_t) ucount(l), l.n_exp});
+                    dl.push_back(&l);
                 }
+            if (draft_hybrid && !dl.empty()) {   // the hybrid placement: the drafter's share is the MiB cap, split per layer by plan_draft_quotas
+                // (equal shares, whole aligned slots, a spare per partial layer); the verifier gets what the drafter did not take
+                const auto q = strata::core::plan_draft_quotas((uint64_t) std::min(budget, (double) draft_cap), sh);
+                uint64_t draft_bytes = 0;
+                int draft_resident = 0, draft_experts = 0;
+                for (size_t i = 0; i < dl.size(); ++i) {
+                    const strata::core::DraftLayerQuota& dq = q.layers[i];
+                    dl[i]->n_vram = dq.fully_resident ? dl[i]->n_exp : dq.usable + dq.spare;
+                    budget_t -= (double) dq.bytes();
+                    draft_bytes += dq.bytes();
+                    draft_resident += dl[i]->n_vram;
+                    draft_experts += dl[i]->n_exp;
+                }
+                std::fprintf(stderr, "ds4: DSpark placement: %d of %d draft experts in VRAM (%.2f GB of slots, cap %lld MiB, spare included); "
+                                     "the verifier's experts get %.2f GB of this group's %.2f GB\n",
+                             draft_resident, draft_experts, draft_bytes / 1e9, (long long) o.dspark_cache_mib,
+                             std::max(0.0, budget_t) / 1e9, budget / 1e9);
+            } else {
+                for (Layer& l : L)
+                    if (l.grp == (int) gi && l.mtp) {
+                        l.n_vram = std::min(l.n_exp, (int) std::floor(budget_t / (double) ucount(l)));
+                        budget_t -= (double) l.n_vram * ucount(l);
+                    }
+            }
             double want = 0;
             for (const Layer& l : L)
                 if (l.grp == (int) gi && !l.mtp && !l.cpu_only) want += (double) ucount(l) * l.n_exp;
@@ -4711,7 +4774,7 @@ struct Model::Impl {
                 if (l.grp == (int) gi) used += (double) ucount(l) * l.n_vram;
             // what the floors left: whole experts, layer by layer
             for (Layer& l : L) {
-                if (l.grp != (int) gi || l.cpu_only) continue;
+                if (l.grp != (int) gi || l.cpu_only || (draft_hybrid && l.mtp)) continue;   // (the hybrid's drafter gets its quota only)
                 while (l.n_vram < l.n_exp && used + (double) ucount(l) <= budget) {
                     ++l.n_vram;
                     used += (double) ucount(l);
@@ -4843,6 +4906,130 @@ struct Model::Impl {
 
     // a GGUF's VRAM experts, in file order, by a few threads through pinned staging blobs (the CPU lane's stay in the
     // file: the mapping reads them on first use)
+    // --dspark-expert-cache-mib: refuses the configurations the hybrid placement does not cover, then sets the drafter's cap.
+    // The MXFP4 GGUF path only (the drafter's experts are MXFP4 there, one GPU a block), and not on a Mac (no drafter there yet).
+    bool hybrid_setup(std::string& err) {
+        draft_hybrid = o.dspark_cache_mib >= 0;
+        if (!draft_hybrid) return true;
+#if defined(STRATA_METAL)
+        err = "--dspark-expert-cache-mib: the DSpark drafter is not supported on a Mac yet";
+        return false;
+#else
+        if (g.n_mtp == 0) {
+            err = "--dspark-expert-cache-mib needs the DSpark drafter in the pack (--dspark on, and a pack that has one)";
+            return false;
+        }
+        if (L.empty() || L[0].lay.fmt != gg::kFmtMXFP4) {
+            err = "--dspark-expert-cache-mib: the hybrid placement is for GGUF packs (MXFP4 experts); this pack's experts are not MXFP4";
+            return false;
+        }
+        for (const Layer& l : L)
+            if (l.mtp && (l.lay.fmt != gg::kFmtMXFP4 || l.nm != 1)) {
+                err = "--dspark-expert-cache-mib: the drafter's experts must be MXFP4 on one GPU (layer " + std::to_string(l.il) + " is not)";
+                return false;
+            }
+        draft_cap = (uint64_t) o.dspark_cache_mib << 20;
+        std::fprintf(stderr, "ds4: DSpark's VRAM expert slots: at most %lld MiB (--dspark-expert-cache-mib); its experts are kept in RAM in full\n",
+                     (long long) o.dspark_cache_mib);
+        return true;
+#endif
+    }
+
+    // The drafter's experts in RAM, every one of them (docs/DSPARK_HYBRID_PLAN.md §2): read once from the drafter's files into memory of
+    // their own - never pinned, never a verifier copy, store or RAM-tier slot - so the drafter's CPU lane and every promotion read RAM and
+    // no file during decode.  Refused before anything is read when the RAM does not hold them beside kRamMargin.
+    bool draft_backing(std::string& err) {
+        if (!draft_hybrid) return true;
+        uint64_t bytes = 0;
+        for (const Layer& l : L)
+            if (l.mtp) bytes += (uint64_t) l.n_exp * l.blob;
+        const uint64_t avail = ram_avail();
+        if (avail != ~uint64_t{0} && bytes + kRamMargin > avail) {
+            char msg[256];
+            std::snprintf(msg, sizeof msg,
+                          "--dspark-expert-cache-mib: the drafter's experts need %.1f GB of RAM, and %.1f GB is free beside the %.0f GB kept for the rest",
+                          bytes / 1e9, avail / 1e9, kRamMargin / 1e9);
+            err = msg;
+            return false;
+        }
+        std::vector<std::pair<int, int>> jobs;   // (layer index, expert)
+        for (Layer& l : L) {
+            if (!l.mtp) continue;
+            const size_t n = (size_t) l.n_exp * l.blob;
+            uint8_t* base = (uint8_t*) os::anon_alloc(n, -1, 1);
+            if (base == nullptr) {
+                err = "no RAM for layer " + std::to_string(l.il) + "'s drafter experts (" + std::to_string(n >> 20) + " MiB)";
+                return false;
+            }
+            draft_chunks.push_back(base);
+            draft_chunk_bytes.push_back(n);
+            l.dback.assign((size_t) l.n_exp, nullptr);
+            for (int e = 0; e < l.n_exp; ++e) {
+                l.dback[(size_t) e] = base + (size_t) e * l.blob;
+                jobs.push_back({l.il, e});
+            }
+        }
+        std::sort(jobs.begin(), jobs.end(), [&](const std::pair<int, int>& a, const std::pair<int, int>& b) {   // (file order)
+            const Layer &la = L[(size_t) a.first], &lb = L[(size_t) b.first];
+            if (la.mx_file[0] != lb.mx_file[0]) return la.mx_file[0] < lb.mx_file[0];
+            return la.mx_off[0] + (uint64_t) a.second * la.mx_stride[0] < lb.mx_off[0] + (uint64_t) b.second * lb.mx_stride[0];
+        });
+        std::atomic<size_t> next{0};
+        std::atomic<bool> failed{false};
+        std::vector<std::thread> th;
+        for (int t = 0; t < 12 && !jobs.empty(); ++t)
+            th.emplace_back([&] {
+                for (size_t i; (i = next.fetch_add(1)) < jobs.size() && !failed.load();) {
+                    const Layer& l = L[(size_t) jobs[i].first];
+                    if (!read_mx_file(l, jobs[i].second, l.dback[(size_t) jobs[i].second])) failed.store(true);
+                }
+            });
+        for (auto& t : th) t.join();
+        if (failed.load()) {
+            err = "reading the drafter's experts from the model's files failed";
+            return false;
+        }
+        // the CPU lane's pointer for every draft expert that is not in VRAM: its RAM backing (place_experts set the file's)
+        for (Layer& l : L)
+            if (l.mtp)
+                for (int e = 0; e < l.n_exp; ++e)
+                    if (l.slot[(size_t) e] < 0) l.host[(size_t) e] = l.dback[(size_t) e];
+        std::fprintf(stderr, "ds4: DSpark's %zu experts in RAM (%.2f GB), read from the model's files\n", jobs.size(), bytes / 1e9);
+        return true;
+    }
+
+    // The adaptive draft cache starts from the placement: the VRAM experts it holds are its residents, its spare slot is free
+    // (docs/DSPARK_HYBRID_PLAN.md §3).  --no-expert-cache: no policy, so no swaps - the placement stays fixed.
+    bool draft_policy_init(std::string& err) {
+        if (!draft_hybrid || !o.expert_cache) return true;
+        strata::core::DraftQuotaPlan plan;
+        for (const Layer& l : L) {
+            if (!l.mtp) continue;
+            strata::core::DraftLayerQuota q;
+            q.slot_bytes = l.blob;
+            q.n_experts = l.n_exp;
+            q.fully_resident = l.n_vram == l.n_exp;
+            q.usable = q.fully_resident ? l.n_exp : l.n_vram;
+            q.spare = !q.fully_resident && l.spare_vram >= 0 ? 1 : 0;
+            plan.layers.push_back(q);
+        }
+        try {
+            draft_pol = std::make_unique<strata::core::DraftExpertCache>(plan, draft_cfg());
+            int32_t di = 0;
+            for (const Layer& l : L) {
+                if (!l.mtp) continue;
+                if (!plan.layers[(size_t) di].fully_resident)
+                    for (int e = 0; e < l.n_exp; ++e)
+                        if (l.slot[(size_t) e] >= 0) draft_pol->adopt_resident(di, e);
+                ++di;
+            }
+        } catch (const std::exception& ex) {
+            err = std::string("the DSpark draft cache: ") + ex.what();
+            return false;
+        }
+        return true;
+    }
+
     bool load_experts_mx(std::string& err) {
         struct Job {
             int layer, e;
@@ -4918,7 +5105,7 @@ struct Model::Impl {
                 if (l.slot[(size_t) e] >= 0) {
                     for (int r = 0; r < 3; ++r)
                         os::advise(pk.fds[(size_t) l.mx_file[r]], (l.mx_off[r] + (uint64_t) e * l.mx_stride[r]), mx_part_bytes(l, r), false);
-                } else {
+                } else if (!(draft_hybrid && l.mtp)) {   // (the hybrid's drafter is in RAM in full already: draft_backing)
                     warm.push_back({l.il, e, sum > 0 ? p[e] / sum : 0.0});
                 }
             }
@@ -6666,7 +6853,7 @@ struct Model::Impl {
             // more than computing a warm expert, 0.34 ms a 6.3 MB matrix on Windows)
             std::vector<std::pair<const void*, size_t>> want;
             for (const Ent& en : ents)
-                if (!store && (l.ram.empty() || l.ram[(size_t) en.e] < 0))
+                if (!store && l.dback.empty() && (l.ram.empty() || l.ram[(size_t) en.e] < 0))
                     for (int r = 0; r < 3; ++r) want.push_back({mx_mat(l, en.e, r), mx_part_bytes(l, r)});
             os::prefetch_cold(want);
         }
@@ -6845,7 +7032,7 @@ struct Model::Impl {
             // off by default (the mmap path, owner PC: not faster in every pair); DS4_IQ_PF_COLD=1 turns it on)
             std::vector<std::pair<const void*, size_t>> want;
             for (const Ent& en : ents)
-                if (!store && (l.ram.empty() || l.ram[(size_t) en.e] < 0))
+                if (!store && l.dback.empty() && (l.ram.empty() || l.ram[(size_t) en.e] < 0))
                     for (int r = 0; r < 3; ++r) want.push_back({mx_mat(l, en.e, r), mx_part_bytes(l, r)});
             static const bool pf_all = std::getenv("DS4_IQ_PF_COLD") == nullptr || std::atoi(std::getenv("DS4_IQ_PF_COLD")) == 0;
 #if defined(__APPLE__)   // (macOS: the cold reads of a call's matrices in parallel, and a page-cache census under DS4_CPU_LOG)
@@ -7244,8 +7431,8 @@ struct Model::Impl {
                 sw_queue.pop_front();
             }
             Layer& l = L[(size_t) sw.layer];
-            if (l.lay.fmt == gg::kFmtMXFP4) {   // in: from the file; out: nothing to keep (the file has it)
-                swap_in_mx(l, sw, B);
+            if (l.lay.fmt == gg::kFmtMXFP4) {   // in: from the file (a draft: its RAM backing); out: nothing to keep (the file or the backing has it)
+                sw.ok = swap_in_mx(l, sw, B);
                 std::lock_guard<std::mutex> lk(sw_mu);
                 sw_ready.push_back(sw);
                 continue;
@@ -7324,10 +7511,11 @@ struct Model::Impl {
     // a GGUF's swap: expert sw.in from the file (copy_mode: its copy) into the spare VRAM slot (each member its part);
     // the expert it replaces goes back to the CPU lane, which reads it from the file's mapping - or (copy_mode, sw.ram)
     // from the layer's spare RAM slot, which it is copied into from VRAM here
-    void swap_in_mx(Layer& l, Swap& sw, SwapBufs& B) {
+    bool swap_in_mx(Layer& l, Swap& sw, SwapBufs& B) {
         uint8_t *sw_a = B.a, *sw_b = B.b, *sw_h = B.h;   // (this thread's)
         const std::vector<cudaStream_t>& copy_st = B.st;
-        bool ok = copy_mode ? read_mx(l, sw.in, sw_a) : read_mx_file(l, sw.in, sw_a);   // (a copy holds its slot till
+        // (a draft's RAM backing, or a copy: read_mx; the file otherwise)
+        bool ok = (copy_mode || !l.dback.empty()) ? read_mx(l, sw.in, sw_a) : read_mx_file(l, sw.in, sw_a);   // (a copy holds its slot till
                                                                                           // this swap's switch)
         for (int m = 0; m < l.nm && ok; ++m) {
             const Layer& x = member(l, m);
@@ -7351,7 +7539,8 @@ struct Model::Impl {
             }
             if (got) blob_to_ram(l, sw_b, sw.ram);
             else sw.ram = -1;   // (back to the file's pages then)
-        } else if (ok && store && l.nm == 1 && l.lay.fmt == gg::kFmtMXFP4 && strata::ds4::store_feature_default(env_tri("DS4_STORE_PUT"), defaults_026())) {
+        } else if (ok && store && l.nm == 1 && l.lay.fmt == gg::kFmtMXFP4 && !(draft_hybrid && l.mtp) &&
+                   strata::ds4::store_feature_default(env_tri("DS4_STORE_PUT"), defaults_026())) {   // (the store is the trunk's: never a draft's)
             // `out` goes back to the CPU lane: its blob is in VRAM, so it is copied into a store slot now - the lane would otherwise read it from
             // the SSD and wait for it (1-2 misses a token on the 251 GB R9700 box).  DS4_STORE_PUT=0: off.
             uint8_t* dst = store->put_begin(l.il, sw.out);
@@ -7389,6 +7578,7 @@ struct Model::Impl {
         } else if (!ok) {
             std::fprintf(stderr, "ds4 cache: layer %d expert %d: the move into VRAM failed\n", l.il, sw.in);
         }
+        return ok;
     }
 
     // after a chunked prompt: the expert cache catches up with what the prompt picked at once - a window prompt gets
@@ -7488,6 +7678,72 @@ struct Model::Impl {
         const size_t n = store->shrink_chunks(chunks);
         if (n > 0) std::fprintf(stderr, "ds4: RAM store: %.1f GB free: gave back %zu chunks (%zu slots left)\n", avail / 1e9, n, store->slots_allocated());
     }
+    // At a completed draft (every draft, even one whose proposals confidence then rejects all of): the draft cache proposes up to
+    // draft_swaps_max() copies (never more than the cache threads' in-flight room), which cache_loop makes from the drafter's RAM
+    // backing; the next cache tick publishes them (draft_publish).  Called on the decode thread, as is every draft.
+    void draft_propose() {
+        if (!draft_pol || cache_ths.empty()) return;
+        const int32_t room = std::min<int32_t>(draft_swaps_max(), c_inflight - sw_inflight);
+        if (room <= 0) return;
+        const auto props = draft_pol->propose(draft_round, room);
+        bool queued = false;
+        for (const strata::core::DraftSwap& p : props) {
+            Layer& l = L[(size_t) (g.nl + p.layer)];
+            if (p.victim < 0) {   // (a free usable slot: the placement fills them all, so this does not arise - refused, not run)
+                draft_pol->complete(p, false, draft_round);
+                ++st.draft_failed;
+                continue;
+            }
+            Swap sw;
+            sw.layer = l.il;
+            sw.in = p.expert;
+            sw.out = p.victim;
+            sw.draft = true;
+            l.swap_pending = true;
+            ++sw_inflight;
+            std::lock_guard<std::mutex> lk(sw_mu);
+            sw_queue.push_back(sw);
+            queued = true;
+        }
+        if (queued) sw_cv.notify_all();
+    }
+
+    // A draft swap that cache_loop finished: a copy that failed keeps the old mapping (the expert waits out the policy's cooldown); a
+    // good one takes the spare slot, the victim goes back to the CPU lane - its RAM backing is already there, so nothing is copied back -
+    // and the device's table gets the same two writes the trunk's swaps make, synchronised because the pinned words are reused.
+    // The trunk's counters (st.swaps) are not touched: the draft's are st.draft_*.  Runs on the decode thread; the idle settle thread
+    // (cache_settle_idle) runs it only while no request is in flight.
+    void draft_publish(const Swap& sw) {
+        Layer& l = L[(size_t) sw.layer];
+        const strata::core::DraftSwap ds{sw.layer - g.nl, sw.in, sw.out};
+        l.swap_pending = false;
+        --sw_inflight;
+        if (!sw.ok) {
+            draft_pol->complete(ds, false, draft_round);
+            ++st.draft_failed;
+            return;
+        }
+        const int old_slot = l.slot[(size_t) sw.out];
+        l.slot[(size_t) sw.in] = l.spare_vram;
+        set_vm(l, sw.in, l.spare_vram);
+        l.host[(size_t) sw.in] = nullptr;
+        l.slot[(size_t) sw.out] = -1;
+        l.host[(size_t) sw.out] = (uint8_t*) mx_mat(l, sw.out, 0);
+        l.spare_vram = old_slot;
+        {
+            const Dev& dm = devs[(size_t) l.dev];
+            l.tab_pin[0] = (unsigned long long) (l.vram_base + (size_t) l.slot[(size_t) sw.in] * unit(l));
+            l.tab_pin[1] = 0ull;
+            cudaSetDevice(dm.id);
+            cudaMemcpyAsync(l.vram_tab + sw.in, &l.tab_pin[0], 8, cudaMemcpyHostToDevice, dm.st);
+            cudaMemcpyAsync(l.vram_tab + sw.out, &l.tab_pin[1], 8, cudaMemcpyHostToDevice, dm.st);
+            cudaStreamSynchronize(dm.st);
+        }
+        ++st.draft_promotions;
+        st.draft_promo_bytes += (int64_t) l.blob;
+        draft_pol->complete(ds, true, draft_round);
+    }
+
     void cache_tick_swaps(int T) {
         if (!o.expert_cache || cache_ths.empty()) return;
         std::vector<Swap> ready;
@@ -7512,6 +7768,10 @@ struct Model::Impl {
             ++st.ram_moves;
         }
         for (const Swap& sw : ready) {
+            if (sw.draft) {   // the hybrid drafter's: published here (the decode thread, between windows) or left as it was
+                draft_publish(sw);
+                continue;
+            }
             Layer& l = L[(size_t) sw.layer];
             const int old_slot = l.slot[(size_t) sw.out];
             const std::array<uint8_t*, 4> old_parts = l.hh[(size_t) sw.in];
@@ -7575,6 +7835,10 @@ struct Model::Impl {
         }
         bool queued = false, rqueued = false;
         for (Layer& l : L) {
+            if (draft_hybrid && l.mtp) {   // (the hybrid's drafter swaps by the draft cache's rule, in draft_propose: not by heat)
+                l.cpu_hits.clear();
+                continue;
+            }
             if (l.cpu_hits.empty()) continue;
             std::vector<int> hits;
             hits.swap(l.cpu_hits);
@@ -7638,8 +7902,8 @@ struct Model::Impl {
         }
     }
     // an expert the CPU lane reads from the files (neither in VRAM nor in the RAM tier)
-    static bool file_read(const Layer& l, int e) {
-        return l.slot[(size_t) e] < 0 && (l.ram.empty() || l.ram[(size_t) e] < 0);
+    static bool file_read(const Layer& l, int e) {   // (a DSpark draft layer's experts are in RAM in full: never read from the files)
+        return l.dback.empty() && l.slot[(size_t) e] < 0 && (l.ram.empty() || l.ram[(size_t) e] < 0);
     }
     // the layer whose picks layer l0 guesses a layers ahead (1, 2): the next ones of its stack on its device, MXFP4
     // experts read in place, some of them from the files now (none: nothing to read early - null)
@@ -8002,6 +8266,7 @@ struct Model::Impl {
         const int T = g.d_block, D = g.dim, H = g.hc, V = g.vocab, R = g.d_rank;
         const int64_t p0 = pos;
         if (g.n_mtp == 0 || T < 1 || T > kWin || p0 + T > o.max_context) return true;
+        ++draft_round;   // the routes this draft makes are its round's (the draft cache ages by rounds, never by time)
         int tk[kWin];
         tk[0] = y;
         for (int t = 1; t < T; ++t) tk[t] = g.d_noise;
@@ -8157,6 +8422,7 @@ struct Model::Impl {
             out.push_back(tok[i + 1]);
             conf.push_back(cf[i]);
         }
+        draft_propose();   // (a completed draft: the draft cache's maintenance, whatever the confidence then rejects)
         return true;
     }
 
@@ -10726,6 +10992,12 @@ struct Model::Impl {
                 l.heat[(size_t) e] += 1.0f;
                 if (l.slot[(size_t) e] < 0) l.cpu_hits.push_back(e);
                 per[(size_t) e].push_back({t, i});
+                if (draft_hybrid && l.mtp) {   // the draft cache's histogram: every executed route, on the GPU or the CPU lane (a rejected draft's too)
+                    const bool gpu = l.slot[(size_t) e] >= 0;
+                    if (gpu) ++st.draft_gpu_routes;
+                    else ++st.draft_cpu_routes;
+                    if (draft_pol) draft_pol->record(l.il - g.nl, e, draft_round, gpu);
+                }
             }
         }
         int nslots = 0;

@@ -84,10 +84,48 @@ DENSE_KEEP = ("markov_head", "confidence_head", "norm", "hc_", "ffn.gate.", "att
 E2M1 = np.array([0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12], dtype=np.float32)
 
 
+ROLE_RE = re.compile(r"(mtp\.\d+\.ffn\.experts\.)\d+\.(w[123])\.weight$")
+
+
+def requant_target(name: str, dt: str, shape: list, experts: str, dense: str) -> str:
+    """The type dspark.bin's tensor `name` (source type `dt`, shape `shape`) is written in by --requant: `experts` for a
+    routed expert, `dense` for a dense matrix the engine reads as one, and its own type otherwise.
+
+    A tensor keeps its own type when the quant cannot take it: a norm, a gate, a head, a non-BF16 or non-matrix tensor, or a
+    matrix whose rows are not whole blocks of the quant (Q4_K's blocks are 256 columns, so a 32 x k matrix stays BF16). That
+    lets a 4-bit-heavy drafter be built without a hand-written list of exceptions; the caller reports what was kept."""
+    role = ROLE_RE.match(name)
+    want = experts if role else dense
+    if want in ("keep", dt):
+        return dt
+    if not role and (dt != "BF16" or len(shape) != 2 or shape[1] % 32 or any(k in name for k in DENSE_KEEP)):
+        return dt
+    if len(shape) != 2 or shape[1] % QTYPES[want][1]:
+        return dt
+    return want
+
+
+#: the drafter's geometry as the GGUF names it (the keys after "<arch>.dspark.") -> the checkpoint config.json's text_config names
+DRAFTER_GEOMETRY = {"block_size": "dspark_block_size", "noise_token_id": "dspark_noise_token_id",
+                    "markov_rank": "dspark_markov_rank", "expert_count": "dspark_n_routed_experts",
+                    "expert_used_count": "dspark_num_experts_per_tok", "target_layers": "dspark_target_layer_ids"}
+
+
+def drafter_geometry(config: dict) -> dict:
+    """The DSpark geometry DeepSeek's own config.json states (text_config's dspark_* values).  The checkpoint's shards carry
+    the drafter's tensors but not these, and a pack without them loads no drafter (the engine needs the block size), so
+    drafter_pack.py writes them into dspark.json and pack_gguf.py puts them in the pack."""
+    text = config.get("text_config", config)
+    missing = [src for src in DRAFTER_GEOMETRY.values() if src not in text]
+    if missing:
+        raise SystemExit("the config has no %s (the checkpoint's text_config carries the DSpark geometry)" % ", ".join(missing))
+    return {k: text[src] for k, src in DRAFTER_GEOMETRY.items()}
+
+
 def requant(d: pathlib.Path, name: str, experts: str, dense: str, lib: str, jobs: int, out=None) -> int:
     """dspark.bin's tensors again with the routed experts in `experts` and the dense matrices (the ones the engine reads
     as matrices) in `dense`, through ggml's quantizers (libggml-base): dspark-<name>.bin / .json beside it - a smaller
-    drafter (pack_gguf.py --drafter dspark-<name>)."""
+    drafter (pack_gguf.py --drafter dspark-<name>.json)."""
     import ctypes
     from concurrent.futures import ThreadPoolExecutor
     g = ctypes.CDLL(lib)
@@ -115,19 +153,18 @@ def requant(d: pathlib.Path, name: str, experts: str, dense: str, lib: str, jobs
         g.ggml_quantize_chunk(tid, x.ctypes.data, q.ctypes.data, 0, rows, ne0, ones.ctypes.data)
         return q
 
-    role_re = re.compile(r"(mtp\.\d+\.ffn\.experts\.)\d+\.(w[123])\.weight$")
+    bad = {experts, dense} - {"keep"} - set(QTYPES)
+    if bad:
+        raise SystemExit("--requant: %s is not a type it writes (%s, or keep)" % (", ".join(sorted(bad)), ", ".join(QTYPES)))
 
     def prep(item):
         t, dt, so, nb, shape = item
         b = raw[so:so + nb]
-        m = role_re.match(t)
+        m = ROLE_RE.match(t)
         role = (m.group(1), m.group(2)) if m else None
-        want = experts if role else dense
-        if (not role and (dt != "BF16" or len(shape) != 2 or shape[1] % 32 or any(k in t for k in DENSE_KEEP))) \
-                or want in ("keep", dt):
+        want = requant_target(t, dt, shape, experts, dense)
+        if want == dt:
             return t, dt, np.asarray(b), shape, role
-        if shape[1] % QTYPES[want][1]:
-            raise SystemExit("%s: rows of %d are not whole %s blocks" % (t, shape[1], want))
         return t, want, quant(want, np.ascontiguousarray(f32(dt, b)), shape[0], shape[1]), shape, role
 
     for t in {experts, dense} - {"keep"}:
@@ -148,8 +185,22 @@ def requant(d: pathlib.Path, name: str, experts: str, dense: str, lib: str, jobs
                 off += q.nbytes
                 prev = role
     (o / ("dspark-%s.bin.part" % name)).replace(o / ("dspark-%s.bin" % name))
-    (o / ("dspark-%s.json" % name)).write_text(json.dumps({"from": "dspark.bin", "experts": experts, "dense": dense,
-                                                          "tensors": entries}))
+    out_json = {"from": "dspark.bin", "experts": experts, "dense": dense, "tensors": entries}
+    if "geometry" in src:   # the geometry travels with the drafter (a requantized one is the same drafter)
+        out_json["geometry"] = src["geometry"]
+    (o / ("dspark-%s.json" % name)).write_text(json.dumps(out_json))
+    # the effective types and bytes per class: what the drafter really holds (a tensor the quant did not fit stays "kept")
+    by_class: dict[str, list] = {}
+    for t, odt, _, nbytes, _ in entries:
+        k = "experts" if ROLE_RE.match(t) else "dense" if odt in QTYPES else "kept"
+        c = by_class.setdefault(k, [0, 0, set()])
+        c[0] += 1
+        c[1] += nbytes
+        c[2].add(odt)
+    for k in ("experts", "dense", "kept"):
+        if k in by_class:
+            n, nbytes, types = by_class[k]
+            print("  %-8s %5d tensors  %8.3f GB  %s" % (k, n, nbytes / 1e9, ", ".join(sorted(types))))
     print("dspark-%s.bin: %d tensors, %.2f GB (experts %s, dense %s)" % (name, len(entries), off / 1e9, experts, dense))
     return 0
 
@@ -165,6 +216,8 @@ def main() -> int:
                     help="(--requant) libggml-base")
     ap.add_argument("--jobs", type=int, default=8)
     ap.add_argument("--out", help="(--requant) the folder to write to (default: --dir)")
+    ap.add_argument("--config", help="DeepSeek's config.json at the same revision as the shards: its text_config's dspark_* values are "
+                                     "written into dspark.json (the pack needs them to load the drafter). Default: <dir>/config.json when there is one")
     a = ap.parse_args()
     d = pathlib.Path(a.dir)
     if a.requant:
@@ -209,7 +262,17 @@ def main() -> int:
                 off += pad
             del raw
     (d / "dspark.bin.part").replace(d / "dspark.bin")
-    (d / "dspark.json").write_text(json.dumps({"from": list(SHARDS), "tensors": entries}))
+    cfg = pathlib.Path(a.config).expanduser() if a.config else d / "config.json"
+    if a.config and not cfg.is_file():
+        raise SystemExit(f"{cfg}: no config.json there")
+    out_json = {"from": list(SHARDS), "tensors": entries}
+    if cfg.is_file():
+        out_json["geometry"] = drafter_geometry(json.loads(cfg.read_text(encoding="utf-8")))
+        print(f"geometry from {cfg}: block {out_json['geometry']['block_size']}, targets {out_json['geometry']['target_layers']}")
+    else:
+        print(f"WARNING: no config.json (--config): dspark.json has no block size, so pack_gguf.py will not load this drafter. "
+              f"Download DeepSeek's config.json at the same revision and run again with --config.")
+    (d / "dspark.json").write_text(json.dumps(out_json))
     print(f"dspark.bin: {len(entries)} tensors, {off / 1e9:.2f} GB")
     return 0
 

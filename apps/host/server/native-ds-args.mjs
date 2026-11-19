@@ -10,7 +10,7 @@
 /** Options that take one value. */
 export const DS_VALUE_FLAGS = new Set([
   '--pack', '--gpus', '--max-context', '--reserve-mib', '--vram-experts', '--cpu-threads', '--expert-profile', '--ssd-cache', '--ssd-policy',
-  '--eos', '--dspark', '--dspark-conf', '--dspark-block', '--dspark-depth', '--experts', '--tp', '--prefill-chunk', '--threads', '--vision',
+  '--eos', '--dspark', '--dspark-conf', '--dspark-block', '--dspark-depth', '--dspark-expert-cache-mib', '--experts', '--tp', '--prefill-chunk', '--threads', '--vision',
   '--mmap-experts', '--layer-split',
 ]);
 /** Options that stand alone. */

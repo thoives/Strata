@@ -153,7 +153,7 @@ void usage() {
                  "maya-ds4 --pack <model>/maya-ds4 [--gpus 0,1,...] [--max-context N] [--reserve-mib N]\n"
                  "           [--vram-experts F] [--cpu-threads N] [--expert-profile FILE|none] [--profile-readonly] [--ssd-cache GB] [--ssd-policy lru|lfu|lfulru] [--no-expert-cache] [--verbose]\n"
                  "           [--expert-tier PATH,mib=N[,reserve=M][,verify=header|full] (repeatable, one per device)] [--expert-tier-refill]\n"
-                 "           [--tp N] [--threads on|off] [--prefill-chunk N] [--dspark on|off|none|auto] [--dspark-block N] [--dspark-conf F] [--experts N|auto]\n"
+                 "           [--tp N] [--threads on|off] [--prefill-chunk N] [--dspark on|off|none|auto] [--dspark-block N] [--dspark-conf F] [--dspark-depth N] [--dspark-expert-cache-mib N] [--experts N|auto]\n"
                  "           [--vision on|off] [--mmap-experts on|off|auto]\n"
                  "           (--ids I,J,... [--images FILE] [--n N] [--dump-logits FILE] | --serve\n"
                  "           | --encode-image FILE.rgb --size WxH --dump-image OUT\n"
@@ -1395,6 +1395,14 @@ int main(int argc, char** argv) {
         }
         else if (a == "--dspark-block") o.dspark_block = std::max(0, std::atoi(val("--dspark-block").c_str()));
         else if (a == "--dspark-depth") g_spec_depth = std::max(1, std::atoi(val("--dspark-depth").c_str()));
+        else if (a == "--dspark-expert-cache-mib") {   // a whole number of MiB: 0 is the zero-slot placement, never a bad value read as 0
+            const std::string v = val("--dspark-expert-cache-mib");
+            if (v.empty() || v.find_first_not_of("0123456789") != std::string::npos || v.size() > 12) {
+                std::fprintf(stderr, "--dspark-expert-cache-mib needs a whole number of MiB (0 or more), not '%s'\n", v.c_str());
+                return 2;
+            }
+            o.dspark_cache_mib = std::atoll(v.c_str());
+        }
         else if (a == "--tp") o.tp = std::max(1, std::atoi(val("--tp").c_str()));
         else if (a == "--prefill-chunk") o.prefill_chunk = std::max(0, std::atoi(val("--prefill-chunk").c_str()));
         else if (a == "--threads") o.threads = val("--threads") != "off";
@@ -1448,6 +1456,11 @@ int main(int argc, char** argv) {
     }
     if (o.pack.empty() || (!serve_mode && ids_s.empty() && enc_rgb.empty() && score_ids.empty() && prof_ids.empty() && spec_ids.empty())) {
         usage();
+        return 2;
+    }
+    // the hybrid draft placement is an explicit choice: a drafter the user turned on by name, not the auto rule's or none
+    if (o.dspark_cache_mib >= 0 && (o.dspark_auto || !o.dspark || !spec)) {   // (off: loaded but not drafting; none: not loaded)
+        std::fprintf(stderr, "--dspark-expert-cache-mib needs --dspark on (not auto, off or none): it places the drafter's experts itself\n");
         return 2;
     }
     if (o.profile.empty()) o.profile = o.pack + "/expert-profile.bin";   // "none": no profile
@@ -1605,6 +1618,11 @@ int main(int argc, char** argv) {
                      rounds, d_off, d_acc, (double) out.size() / (double) rounds, (s1.draft_ms - s0.draft_ms) / nv,
                      s1.verify_ms - s0.verify_ms, (long long) (s1.drafts_offered > 0 ? 0 : 0));
         std::fprintf(stderr, "dspark %s\n", per_position(s0, s1).c_str());
+        if (s1.draft_gpu_routes + s1.draft_cpu_routes > 0)   // (--dspark-expert-cache-mib: the draft's own counters, apart from the trunk's)
+            std::fprintf(stderr, "dspark experts: %lld routes on the GPU, %lld on the CPU lane (%.1f%% GPU); %lld promoted (%.1f MB), %lld failed\n",
+                         (long long) s1.draft_gpu_routes, (long long) s1.draft_cpu_routes,
+                         100.0 * (double) s1.draft_gpu_routes / (double) (s1.draft_gpu_routes + s1.draft_cpu_routes),
+                         (long long) s1.draft_promotions, (double) s1.draft_promo_bytes / 1e6, (long long) s1.draft_failed);
     }
     if (std::getenv("DS4_TOKLOG") != nullptr && tok_ms.size() > 8) {   // the decode's tokens after the first (which carries the prompt's tail)
         std::vector<double> v(tok_ms.begin() + 1, tok_ms.end());

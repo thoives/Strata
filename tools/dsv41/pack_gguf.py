@@ -81,6 +81,7 @@ class Gguf:
                 self.tensors.append((name, typ, dims, off))
             align = int(self.kv.get("general.alignment", 32))
             pos = f.tell()
+            self.header_end = pos   # (where the file's metadata and tensor directory end: all a metadata-only file has)
             self.data_start = (pos + align - 1) // align * align
         del self.f
 
@@ -279,6 +280,18 @@ def apply_source_config(kv: dict, config: dict):
         kv.setdefault(keys[0], text[source])
 
 
+def apply_drafter_geometry(kv: dict, geometry: dict):
+    """The DSpark drafter's geometry (dspark.json's "geometry", from DeepSeek's config.json, drafter_pack.py) into the pack's kv under
+    <arch>.dspark.<name>, the way a dflash GGUF states it: the engine reads these to load the drafter.  A value the GGUF already
+    carries must agree with it."""
+    a = kv["general.architecture"]
+    for k, v in geometry.items():
+        key = "%s.dspark.%s" % (a, k)
+        if key in kv and kv[key] != v:
+            raise SystemExit("the drafter's %s (%r) disagrees with the GGUF's %s (%r)" % (k, v, key, kv[key]))
+        kv.setdefault(key, v)
+
+
 def int_tensors_to_engram(gs, kv: dict):
     """The IST-DAS sets carry the Engram's hash parameters as integer tensors of the first shard (engram_token_map I32,
     engram_primes / engram_offsets / engram_multipliers I64, one row a layer) instead of metadata: read them into the
@@ -330,8 +343,9 @@ def split_ple(g: Gguf, kv: dict):
 
 
 def short(g: Gguf):
-    """Why a GGUF file is shorter than its own tensor directory says (a download still running), or None."""
-    need = g.data_start
+    """Why a GGUF file is shorter than its own tensor directory says (a download still running), or None. A file with no tensor data
+    ends at its header (no padding after it); the data start's padding is owed only before a tensor's bytes."""
+    need = g.header_end
     for _, typ, dims, off in g.tensors:
         if typ in TYPES:
             _, per, bpb = TYPES[typ]
@@ -454,6 +468,21 @@ def write_tokenizer(out: pathlib.Path, kv: dict, template: str | None):
         (out / "chat_template.jinja").write_text(template, encoding="utf-8")
 
 
+def dspark_gguf_choice(explicit_gguf: str | None, explicit_json: str | None, discovered: pathlib.Path | None):
+    """The DSpark GGUF to add (unsloth's dflash), or None: then drafter_pack.py's dspark.json is the drafter.
+
+    Without a choice the first dspark-*.gguf beside the model is used (`discovered`). An explicit choice wins over that
+    discovery: --drafter takes its json, so the GGUF beside the model is left out; --dspark-gguf takes that GGUF. Naming both
+    is an error, because one of them would otherwise be silently ignored."""
+    if explicit_gguf and explicit_json:
+        raise ValueError("--dspark-gguf and --drafter both name the DSpark drafter: give one of them")
+    if explicit_gguf:
+        return pathlib.Path(explicit_gguf).expanduser().resolve()
+    if explicit_json:
+        return None
+    return discovered
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", required=True, help="the directory of the GGUF's shards")
@@ -462,7 +491,7 @@ def main() -> int:
     ap.add_argument("--vision", help="vision_pack.py's folder (default: <model>/../vision; taken when it is there)")
     ap.add_argument("--dspark-gguf", help="unsloth's DSpark drafter GGUF (dspark-*-Q8_0.gguf, architecture dflash): its three "
                                           "blocks become mtp.0-2 beside the trunk's tensors (default: the first dspark-*.gguf "
-                                          "in <model>/.. when there is one)")
+                                          "in <model>/.. when there is one, unless --drafter is given; not with --drafter)")
     ap.add_argument("--mmproj", help="unsloth's vision tower GGUF (mmproj-*.gguf, clip / deepseek41v): its tensors become the "
                                      "checkpoint's vision.* / aligner.* (default: the first mmproj*.gguf in <model>/.. whose projector is deepseek41v; other families' are ignored)")
     ap.add_argument("--tq-experts", nargs="+", help="folders tq_convert.py wrote (tq.json + tq-L<layer>.bin): the routed experts of the layers "
@@ -474,7 +503,8 @@ def main() -> int:
     ap.add_argument("--override-roles", default="down")
     ap.add_argument("--override-layers", default="")
     ap.add_argument("--tq-layers", help="only these layers (comma list) of the --tq-experts folders")
-    ap.add_argument("--drafter", help="the DSpark drafter's .json (drafter_pack.py's; default <model>/../dspark/dspark.json)")
+    ap.add_argument("--drafter", help="the DSpark drafter's .json (drafter_pack.py's, with its .bin beside it; default <model>/../dspark/dspark.json). "
+                                      "Given, it wins over a dspark-*.gguf found beside the model")
     ap.add_argument("--dspark-noise-token", type=int, help="the drafter's noise token id (dspark_noise_token_id), for a quant "
                                                           "whose GGUF does not state it (the IST-DAS sets): DeepSeek-V4.1-Flash's is 128799")
     ap.add_argument("--dspark-markov-rank", type=int, help="the markov head's rank (dspark_markov_rank); default: the drafter's "
@@ -725,8 +755,13 @@ def main() -> int:
     # the DSpark drafter from unsloth's GGUF (architecture dflash): blk.N.* -> mtp.N.*, the head tensors under the
     # checkpoint's names (fc -> main_proj, enc.output_norm -> main_norm, output_norm -> norm of the last block,
     # conf_proj -> confidence_head.proj, markov_w1 / w2 -> markov_head.embed / head)
-    ds_path = pathlib.Path(a.dspark_gguf).expanduser().resolve() if a.dspark_gguf else next(
-        iter(sorted(model.parent.glob("dspark-*.gguf"))), None)
+    discovered = next(iter(sorted(model.parent.glob("dspark-*.gguf"))), None)
+    try:
+        ds_path = dspark_gguf_choice(a.dspark_gguf, a.drafter, discovered)
+    except ValueError as e:
+        raise SystemExit(str(e))
+    if a.drafter and discovered is not None:
+        print("DSpark drafter from --drafter (%s); %s beside the model is not used (--dspark-gguf to use it)" % (a.drafter, discovered.name))
     dspark_gguf = False
     if ds_path is not None:
         if not ds_path.is_file():
@@ -893,11 +928,19 @@ def main() -> int:
     drafter = pathlib.Path(a.drafter).expanduser().resolve() if a.drafter else model.parent / "dspark" / "dspark.json"
     if a.drafter and not drafter.is_file():
         raise SystemExit("%s: no drafter there" % drafter)
+    if a.drafter and not drafter.with_suffix(".bin").is_file():   # an explicit drafter is either used or an error, never skipped
+        raise SystemExit("%s: its .bin is not beside it (drafter_pack.py writes the .json and the .bin together)" % drafter)
     drafter_in = (drafter.is_file() and drafter.with_suffix(".bin").is_file()) and not dspark_gguf
     if drafter_in:
         files.append(rel(drafter.with_suffix(".bin")))
         groups = int(kv["%s.attention.output_group_count" % kv["general.architecture"]])
-        for name, dt, off, nb, shape in json.loads(drafter.read_text())["tensors"]:
+        dj = json.loads(drafter.read_text())
+        if dj.get("geometry"):
+            apply_drafter_geometry(kv, dj["geometry"])
+        elif "%s.dspark.block_size" % kv["general.architecture"] not in kv:
+            print("WARNING: %s has no geometry (block size, target layers): the engine will not load this drafter. "
+                  "Make it with drafter_pack.py --config <DeepSeek's config.json>" % drafter.name)
+        for name, dt, off, nb, shape in dj["tensors"]:
             if name.endswith(".attn.wo_a.weight"):   # (one entry a group, as the trunk's)
                 for i in range(groups):
                     tensors.append(("%s.slice.%d.weight" % (name[:-len(".weight")], i), dt, len(files) - 1,

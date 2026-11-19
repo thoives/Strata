@@ -1809,11 +1809,17 @@ static void lane_wake_checks(const fs::path& base, const std::vector<std::pair<i
         f.t->close();
     }
     set_env("DS4_LANE_WAKE", "1");
-    lane_ab_check(base, ranked, pack, prof);
-    lane_hook_check(base, ranked, pack, prof);
-    lane_fail_check(base, ranked, pack, prof);
-    lane_noslot_check(base, ranked, pack, prof);
-    lane_mapped_check(base, ranked, pack, prof);
+    // The five scenarios with DS4_TIER_WAKE off, then on.  On the lane's path the wait is the store's, so the tier's own wait is idle
+    // there; the two switches must not end each other's waits, so both settings must pass the same checks.
+    for (const char* tier_wake : {static_cast<const char*>(nullptr), "1"}) {
+        set_env("DS4_TIER_WAKE", tier_wake);
+        lane_ab_check(base, ranked, pack, prof);
+        lane_hook_check(base, ranked, pack, prof);
+        lane_fail_check(base, ranked, pack, prof);
+        lane_noslot_check(base, ranked, pack, prof);
+        lane_mapped_check(base, ranked, pack, prof);
+    }
+    set_env("DS4_TIER_WAKE", nullptr);
     set_env("DS4_LANE_WAKE", nullptr);
     set_env("DS4_TIER_THREADS", nullptr);
     set_env("DS4_TIER_DIRECT", nullptr);

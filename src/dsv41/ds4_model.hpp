@@ -61,6 +61,10 @@ struct Options {
     bool dspark = true;              // load the DSpark drafter (the checkpoint's mtp.* blocks) for speculative decoding
     int dspark_block = 0;             // at most this many drafts a round (--dspark-block N; 0: the pack's block size)
     float dspark_conf = 0.5f;         // a draft is verified while its confidence (sigmoid) is at least this
+    // the hybrid draft placement (docs/DSPARK_HYBRID_PLAN.md): --dspark-expert-cache-mib N. -1: not given, the placement is the
+    // release's. N >= 0: the drafter's experts are RAM-backed in full, its VRAM slots (spare included) take at most N MiB, the rest
+    // of the expert budget goes to the verifier, and the drafter's CPU lane reads RAM. Needs --dspark on and a GGUF pack's drafter.
+    int64_t dspark_cache_mib = -1;
     // tensor parallelism: runs of tp GPUs of one kind (the same memory) take the same layers, each a share of the
     // heads, of the output projection and of every expert's FFN, summed through host-mapped memory (a GPU unlike the
     // next stays alone); tp > 1 runs with threads (--tp 1 --threads off: one host thread, layer split only)
@@ -139,6 +143,9 @@ struct Stats {
     double store_wait_ms = 0.0, store_busy_ms = 0.0;
     int64_t store_slots = 0, store_slots_max = 0;
     int64_t drafts_offered = 0, drafts_accepted = 0, drafts_rounds = 0;
+    // the hybrid draft placement (--dspark-expert-cache-mib): routed draft experts run from the GPU or the CPU lane, the copies the
+    // draft cache moved into VRAM and the ones that failed. Draft counters are kept apart from the trunk's (swaps above).
+    int64_t draft_gpu_routes = 0, draft_cpu_routes = 0, draft_promotions = 0, draft_promo_bytes = 0, draft_failed = 0;
     // per draft position (the 1st .. 8th of a round): verified with all the drafts before it accepted, and accepted
     int64_t draft_reached[8] = {}, draft_kept[8] = {};
     double draft_ms = 0.0, verify_ms = 0.0;   // the drafter's time, the verification windows' time
