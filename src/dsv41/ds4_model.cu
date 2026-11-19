@@ -990,7 +990,7 @@ struct Model::Impl {
         cudaSetDevice(devs[(size_t) di].id);
         if (c.flow)
             for (size_t i = c.base; i < c.n_read; ++i)
-                while (fit(c, i).left.load(std::memory_order_acquire) != 0) c.io->wait_any(500);
+                while (fit(c, i).left.load(std::memory_order_acquire) != 0) c.io->wait_until_zero(fit(c, i).left);
         if (c.cs != nullptr) cudaStreamSynchronize(c.cs);
         cudaStreamSynchronize(devs[(size_t) di].st);
         err = kHalted;
@@ -9443,7 +9443,7 @@ struct Model::Impl {
             cudaStreamSynchronize(devs[di].st);   // (nothing of the run's still reads or writes them: the device's
             cudaStreamSynchronize(c.cs);          // copies done, every read the run issued done - a failed run's too)
             for (size_t i = c.base; i < c.n_read; ++i)
-                while (fit(c, i).left.load(std::memory_order_acquire) != 0) c.io->wait_any(500);
+                while (fit(c, i).left.load(std::memory_order_acquire) != 0) c.io->wait_until_zero(fit(c, i).left);
             if (c.lm_pinned) cudaFreeHost(c.lm_state);
             else os::anon_free(c.lm_state, c.lm_state_bytes);
             os::anon_free(c.lc, c.lc_bytes);
