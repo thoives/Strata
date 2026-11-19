@@ -103,6 +103,9 @@ Differences from the Qwen engine, in plain words:
   device's own queue while it waits for a tier copy, and wake when that copy is done. Unset or `0` keeps the wait of the
   last release (a look every 2 ms). The variable is read when the engine starts. It has not been measured on real
   hardware yet: no speed claim is made, and the tier format is unchanged.
+- **Waiting for any of the CPU lane's reads (experimental, off by default).** `DS4_LANE_WAKE=1` lets the CPU lane compute
+  whichever of its experts is ready first, instead of waiting for the first one it asked for. Unset or `0` keeps the
+  old order. Not measured on real hardware yet.
 
 This engine's plan is [EXPERT_TIER_DSV41_PLAN.md](EXPERT_TIER_DSV41_PLAN.md).
 

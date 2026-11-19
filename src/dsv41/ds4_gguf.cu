@@ -26,6 +26,11 @@
 #include <mutex>
 #include <unordered_map>
 
+// ds4_kernels.cu's wait_seq (declared there too): the device waits until *seq_ptr == seq; a no-op on Metal
+namespace strata::ds4 {
+void wait_seq(const unsigned* seq_ptr, unsigned seq, cudaStream_t s);
+}
+
 namespace strata::ds4::gguf {
 namespace {
 
@@ -1417,7 +1422,23 @@ void moe_gate_up(const x3::MoeArgs& a, const float* x, float* h, cudaStream_t s)
     check("moe_gate_up");
 }
 
-void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* out, cudaStream_t s) {
+void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* out, cudaStream_t s, const unsigned* wait_ptr,
+              unsigned wait_val) {
+    // DS4_MOE_LATE_WAIT: the reply wait is the last thing before the combine.  A refusal below returns before the combine, and the
+    // guard still waits there: the CPU lane writes the reply's buffer, and the caller may reuse it once this call returns.
+    struct ReplyWait {
+        const unsigned* p;
+        unsigned v;
+        cudaStream_t st;
+        bool done = false;
+        void go() {
+            if (p != nullptr && !done) {
+                done = true;
+                wait_seq(p, v, st);
+            }
+        }
+        ~ReplyWait() { go(); }
+    } reply{wait_ptr, wait_val, s};
     if (!mx_geometry("moe_down", a.k, a.n_embd, a.n_ff) || h == nullptr) return;
     Scratch* sc = scratch(s);
     if (sc == nullptr) return;
@@ -1444,6 +1465,7 @@ void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* 
 #endif
             launch_groups<DownK>(m, a.n_embd, a.k, 1, s);
     }
+    reply.go();   // (DS4_MOE_LATE_WAIT: the CPU lane's reply is in place from here: the combine below reads it)
     CombArgs c{};
     c.plan_ptr = a.plan_ptr;
     c.plan_w = a.plan_w;

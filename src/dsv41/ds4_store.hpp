@@ -192,6 +192,12 @@ public:
             heat_[l].assign((size_t) geo_[l].n_exp, 0.0f);
         }
         io_.reset(new IoQueue(std::max(1, c.threads)));
+        // DS4_LANE_WAKE (opt-in; "1" on, "0" off): the store's completion signal, fed by this queue, by each tier device's queue
+        // (set when a slot's reads are pushed there) and by put_done.  Off: no hub, and nothing below changes.
+        if (const char* lw = std::getenv("DS4_LANE_WAKE"); lw != nullptr && std::atoi(lw) != 0) {
+            hub_ = std::make_shared<CompletionHub>();
+            io_->set_hub(hub_);
+        }
         grow();   // (the first chunk now: whether the GPU can map it is known from the start)
         // DS4_STORE_PREGROW=1 (default on Linux with the GPU mapping, =0 off): the whole arena now.  cuMemHostRegister (the GPU mapping of a chunk) taken while a kernel of
         // the decode is running waited on it for good on Linux (H100, driver 580): registering all chunks before the first
@@ -280,6 +286,31 @@ public:
     }
     /// True when the reads of slot sl (from begin) are all done.
     bool loaded(int s) const { return s >= 0 && slots_[(size_t) s].left.load(std::memory_order_acquire) <= 0; }
+    /// DS4_LANE_WAKE on (the store has its completion signal): a lane may sleep in wait_any_loaded().  Off: false.
+    bool lane_wake_on() const { return hub_ != nullptr; }
+    /// DS4_LANE_WAKE: sleeps until one of the slots sl[0..n) has its last read done, or `timeout_us` passes (the caller looks again).
+    /// Returns true when one is done.  Only the slots' own counts end the wait: a completion of any other slot, or of one of several
+    /// reads of a slot, wakes it to test and it sleeps again.  The test is made under the hub's mutex, and the sleep is entered
+    /// with that mutex held, so a read that finishes just before the sleep is seen (its notify waits for the sleep).  The caller
+    /// passes slots it has pinned (begin), so none is given up and refilled meanwhile; a -1 is skipped.  Call it only when
+    /// lane_wake_on().
+    bool wait_any_loaded(const int* sl, int n, int timeout_us = 2000) {
+        if (hub_ == nullptr || n <= 0) return false;
+        auto any_done = [&] {
+            for (int i = 0; i < n; ++i)
+                if (sl[i] >= 0 && slots_[(size_t) sl[i]].left.load(std::memory_order_acquire) <= 0) return true;
+            return false;
+        };
+        std::unique_lock<std::mutex> lk(hub_->mu);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(timeout_us);
+        for (;;) {
+            if (any_done()) return true;
+#ifdef DS4_IOQUEUE_TEST_HOOKS
+            if (CompletionHub::WaitHook h = CompletionHub::wait_hook()) h(hub_.get());
+#endif
+            if (hub_->cv.wait_until(lk, deadline) == std::cv_status::timeout) return any_done();
+        }
+    }
     /// The second half: waits for the slots sl[a..b) and marks ok[i] for the good ones.  False if any failed or had no slot.
     bool wait_slots(std::vector<int>& sl, std::vector<char>& ok, int a, int b) {
         const auto t0 = std::chrono::steady_clock::now();
@@ -436,6 +467,7 @@ public:
         // No job of the store's queue counted this slot down: a caller waiting for it (wait_left on the store queue) is woken now
         // and not at its next 2 ms look.  With DS4_TIER_WAKE only: the default path is as in the last release.
         if (cfg_.tier_wake && io_) io_->notify_done();
+        if (hub_ != nullptr) hub_->notify();   // (DS4_LANE_WAKE: a lane sleeping on this slot is woken the same way)
     }
     /// Guesses still waiting in the queue for a layer the token is past: dropped unread (their slots free once the queue has gone by)
     void cancel_stale(int layer_now) {
@@ -675,6 +707,7 @@ private:
             dj.tier_copy = true;
             dj.demand = demand;
             st_.tier_direct.fetch_add(1, std::memory_order_relaxed);
+            if (hub_ != nullptr) tq->set_hub(hub_);   // (DS4_LANE_WAKE)
             tq->push(&dj, 1, !demand);
             return s;
         }
@@ -707,7 +740,10 @@ private:
                 st_.bytes_read.fetch_add((int64_t) g.bytes[r], std::memory_order_relaxed);
             }
         }
-        if (tdev >= 0) tq->push(jobs, 3, !demand);   // (the tier device's own queue: demand at the front, guess at the back)
+        if (tdev >= 0) {   // (the tier device's own queue: demand at the front, guess at the back)
+            if (hub_ != nullptr) tq->set_hub(hub_);   // (DS4_LANE_WAKE: this device's completions are announced too)
+            tq->push(jobs, 3, !demand);
+        }
         else io_->push(jobs, 3, !demand);            // (a guess waits behind every demand read)
         return s;
     }
@@ -814,7 +850,26 @@ private:
     uint64_t clock_ = 0;
     std::mutex mu_;
     std::unique_ptr<IoQueue> io_;
+    std::shared_ptr<CompletionHub> hub_;   // DS4_LANE_WAKE: the store's completion signal (null: off).  Shared with the queues that hold it.
     Stats st_;
 };
+
+/// DS4_LANE_WAKE: the order a CPU lane takes its n entries in.  A round tests ready(i) for each entry still to do: the ready ones go
+/// to batch() together, in index order (one call); when none is ready, wait(rest) sleeps until one of the rest may be, and the round
+/// is taken again.  So the lane computes whatever is ready and sleeps only when nothing is.  Every entry is in exactly one batch.
+/// Bits: the order is only a change of the batches.  That is safe if the entries are independent (each writes its own rows), the
+/// same assumption DS4_MISS_SPLIT makes.  Not checked on hardware yet: tools/dsv41/bytecheck.sh must confirm it.
+template <class Ready, class Batch, class Wait>
+void lane_rounds(size_t n, Ready&& ready, Batch&& batch, Wait&& wait) {
+    std::vector<size_t> todo(n);
+    for (size_t i = 0; i < n; ++i) todo[i] = i;
+    while (!todo.empty()) {
+        std::vector<size_t> go, rest;
+        for (size_t i : todo) (ready(i) ? go : rest).push_back(i);
+        if (!go.empty()) batch(go);
+        else wait(rest);
+        todo.swap(rest);
+    }
+}
 
 }  // namespace strata::ds4

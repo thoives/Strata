@@ -272,6 +272,23 @@ been measured, and it stays opt-in until it is. The proof is an interleaved A/B 
 `DS4_TIER_LOG=1`. Compare the tier wait time (`wait_ns`), the copy p50/p95 and decode tok/s, and report the hardware
 and the number of runs ([COMMUNITY_BENCHMARKS.md](COMMUNITY_BENCHMARKS.md)).
 
+Two more opt-in switches, both off by default and both not measured on hardware yet (no speed claim is made):
+
+- `DS4_LANE_WAKE=1` (the store's completion signal, `CompletionHub` in `ds4_pool.hpp`). The store's queue, each tier
+  device's queue (set when a slot's reads are pushed there) and `put_done` announce each finished slot read. The CPU
+  lane (`cpu_experts`, the MXFP4 path) computes every entry that is ready as one batch, in the entries' order, and sleeps
+  only when none is ready, on its own pending slots (`wait_any_loaded`, bounded at 2 ms). The all-ready fast path, the
+  reply reduction and the GPU combine are unchanged. The explicit lookahead order (`ord`) still waits for all of its
+  entries, so it is not affected. The default path does not use the signal.
+- `DS4_MOE_LATE_WAIT=1` (the decode's single-token path, GGUF experts only). The device waits for the CPU lane's reply
+  inside `gg::moe_down`, after the down projections and before the combine that reads the reply, instead of before the
+  projections. The kernels and the scratch are the same. A refusal in `moe_down` still waits, so the reply buffer is
+  not reused while the lane writes it.
+
+The proof for both is the interleaved A/B on the same day and build described above, plus a byte check: the logits and
+the greedy tokens must match the default build (`tools/dsv41/bytecheck.sh`). Host tests cover the wait (the
+`ds4_expert_tier_test` cases for `DS4_LANE_WAKE`); the GPU parts are not built or run in a host-only check.
+
 ### 8.3 GPU
 
 The copies land in store slots. Store chunks are GPU-mapped as they are today, so the device kernels read tier-served

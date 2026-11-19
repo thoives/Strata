@@ -1135,6 +1135,9 @@ struct Model::Impl {
     // a window of one through moe_gate_up / moe_down (DS4_MOE_TOKEN=0: win_experts, whose down rows run
     // before the wait for the CPU lane - the same bits, no faster)
     bool moe_token_path = std::getenv("DS4_MOE_TOKEN") == nullptr || std::atoi(std::getenv("DS4_MOE_TOKEN")) != 0;
+    // DS4_MOE_LATE_WAIT=1 (opt-in): on the single-token path with the GGUF experts, the wait for the CPU lane's reply moves from before
+    // the down projections to gg::moe_down, just before the combine that reads the reply.  The same kernels and scratch; the same bits.
+    const bool moe_late_wait = std::getenv("DS4_MOE_LATE_WAIT") != nullptr && std::atoi(std::getenv("DS4_MOE_LATE_WAIT")) != 0;
     int async_max_t = std::getenv("DS4_ASYNC_T") ? std::atoi(std::getenv("DS4_ASYNC_T")) : 8;   // windows up to this
     // lookahead: while layer L runs, the device guesses the next layer's picks (its gate on L's FFN input, the same
     // choice) and publishes them with L's routing; the CPU lane asks for the guessed experts it will read from the files
@@ -7002,6 +7005,27 @@ struct Model::Impl {
                 rescue(0, (int) es.size());
             }
         }
+        // DS4_LANE_WAKE: an entry the lane may compute now: a RAM copy, no store slot (its wait rescues it), or a slot whose reads are done
+        bool lane_ready(int e) const {
+            if (!m) return true;
+            const int i = idx(e);
+            return i < 0 || sl[(size_t) i] < 0 || m->store->loaded(sl[(size_t) i]);
+        }
+        // DS4_LANE_WAKE: sleeps until one of the pending entries (each with a slot whose reads are not done) is done.  The store's
+        // completion signal, bounded: a completion of another slot wakes it to look again.  Without a pending slot, the first entry's
+        // wait (which rescues it) is taken at once.
+        void wait_pending(const std::vector<int>& pend) {
+            std::vector<int> s;
+            for (int e : pend) {
+                const int i = idx(e);
+                if (i >= 0 && sl[(size_t) i] >= 0) s.push_back(sl[(size_t) i]);
+            }
+            if (s.empty()) {
+                if (!pend.empty()) wait_expert(pend.front());
+                return;
+            }
+            m->store->wait_any_loaded(s.data(), (int) s.size());
+        }
         ~StoreHold() {
             if (m) m->store->release(layer, es.data(), (int) es.size(), ok);
         }
@@ -7023,6 +7047,28 @@ struct Model::Impl {
             if (cold.empty()) {
                 hold.wait_all();
                 return cpu_experts_mx(l, x, ents, ldx, ord);
+            }
+            // DS4_LANE_WAKE=1 (opt-in; the store has its completion signal): every entry that is ready is computed as one batch, in the
+            // entries' order, and a lane with none ready sleeps until one of its own pending slots is done - not on the first of them,
+            // which is what the loop below does.  Each entry is computed once, with its own slot0; the reply and the combine are as before.
+            static const bool lane_wake = std::getenv("DS4_LANE_WAKE") != nullptr && std::atoi(std::getenv("DS4_LANE_WAKE")) != 0;
+            if (lane_wake && hold.m->store->lane_wake_on()) {
+                lane_rounds(
+                    ents.size(), [&](size_t i) { return hold.lane_ready(ents[i].e); },
+                    [&](const std::vector<size_t>& pick) {
+                        std::vector<Ent> b;
+                        for (size_t i : pick) {
+                            hold.wait_expert(ents[i].e);   // (ready: the bookkeeping only; a failed read is rescued here)
+                            b.push_back(ents[i]);
+                        }
+                        cpu_experts_mx(l, x, b, ldx, nullptr);
+                    },
+                    [&](const std::vector<size_t>& rest) {
+                        std::vector<int> pend;
+                        for (size_t i : rest) pend.push_back(ents[i].e);
+                        hold.wait_pending(pend);
+                    });
+                return;
             }
             for (const Ent& en : hot) hold.wait_expert(en.e);   // (done reading: only the bookkeeping)
             if (!hot.empty()) cpu_experts_mx(l, x, hot, ldx, nullptr);
@@ -10552,10 +10598,12 @@ struct Model::Impl {
                 else x3::moe_gate_up(ma, d.x, d.xg, s);
                 const double m1 = tlog2 ? now_ms() : 0.0;
                 prof_mark(d, 3);
-                if (lead) wait_seq(&resps[slot].seq, sq, s);
+                // (DS4_MOE_LATE_WAIT, GGUF experts: the reply is waited for inside gg::moe_down, after the down projections)
+                const bool late = moe_late_wait && mx && lead;
+                if (lead && !late) wait_seq(&resps[slot].seq, sq, s);
                 const double m2 = tlog2 ? now_ms() : 0.0;
                 prof_mark(d, 4);
-                if (mx) gg::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
+                if (mx) gg::moe_down(ma, d.xg, d.sh_out, d.moe_out, s, late ? &resps[slot].seq : nullptr, sq);
                 else x3::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
                 if (tlog2) { t_moe_gu += m1 - m0; t_moe_wait += m2 - m1; t_moe_dn += now_ms() - m2; ++t_moe_n; }
             } else {   // each distinct expert read once for the window's tokens

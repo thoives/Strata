@@ -485,7 +485,7 @@ static void queue_wait_checks() {
 // descriptor, aligned as the slots are, so the retry, refusal and failure paths run on any filesystem).  (3) A real O_DIRECT
 // read of the tier's slots, which SKIPS (and is not counted as a pass) where the test directory refuses O_DIRECT reads; set
 // DS4_TIER_TEST_DIR to a directory that takes them.
-enum Inject { kPass, kEintr, kShort4k, kShortOdd, kEinval, kEio, kZero, kBlock };
+enum Inject { kPass, kEintr, kShort4k, kShortOdd, kEinval, kEio, kZero, kBlock, kBlockB };
 static std::mutex g_inj_mu;
 static std::vector<int> g_inj;   // the next injected outcomes of the direct path's reads, front first (empty: pass-through)
 static int g_inj_calls = 0;      // direct reads that reached the injected read
@@ -512,6 +512,7 @@ struct ReadGate {
     }
 };
 static ReadGate g_read_gate;
+static ReadGate g_read_gate_b;   // (kBlockB: a second gate, for a lane whose two reads are held and released one at a time)
 
 static ssize_t inject_pread(int fd, void* buf, size_t n, off_t off) {
     int code = kPass;
@@ -532,6 +533,9 @@ static ssize_t inject_pread(int fd, void* buf, size_t n, off_t off) {
         case kZero: return 0;
         case kBlock:
             g_read_gate.await();
+            return ::pread(fd, buf, n, off);
+        case kBlockB:
+            g_read_gate_b.await();
             return ::pread(fd, buf, n, off);
         default: return ::pread(fd, buf, n, off);
     }
@@ -684,10 +688,10 @@ static void wire(Forced& f) {
 
 // Opens the tier over a new world (its devices forced direct), decides, and fills it (unless `fill` is false: the caller fills).
 static bool open_forced(const fs::path& base, const std::string& name, const std::vector<std::pair<int32_t, int32_t>>& ranked,
-                        const std::string& pack, const std::string& prof, Forced& f, bool fill = true) {
+                        const std::string& pack, const std::string& prof, Forced& f, bool fill = true, bool force = true) {
     f.t = std::make_unique<ExpertTierSet>();
     f.w = std::make_unique<World>(base, name, false);
-    f.t->set_direct_test_force(true);
+    f.t->set_direct_test_force(force);   // (false: the mapped copies, as a device that cannot take a direct read)
     std::string err;
     if (!f.t->open(f.w->specs, err)) { std::printf("FAIL open %s: %s\n", name.c_str(), err.c_str()); ++fails; return false; }
     wire(f);
@@ -1403,6 +1407,419 @@ static void direct_checks(const fs::path& base, const std::vector<std::pair<int3
     set_env("DS4_TIER_DIRECT", nullptr);
     set_env("DS4_TIER_LOG", nullptr);
     set_env("DS4_TIER_THREADS", nullptr);
+}
+#endif
+
+// ---- DS4_LANE_WAKE (ds4_store.hpp: lane_rounds and wait_any_loaded; ds4_model.cu's cpu_experts uses both) ----
+
+// The round's order alone: the ready entries go as one batch in index order; a wait is taken only when none is ready, and it is for
+// the pending entries alone.
+static void lane_rounds_checks() {
+    {   // all ready: one batch, in order, and no wait
+        std::vector<std::vector<size_t>> batches;
+        int waits = 0;
+        strata::ds4::lane_rounds(
+            4, [](size_t) { return true; }, [&](const std::vector<size_t>& b) { batches.push_back(b); },
+            [&](const std::vector<size_t>&) { ++waits; });
+        CHECK(batches.size() == 1 && batches[0] == (std::vector<size_t>{0, 1, 2, 3}) && waits == 0);
+    }
+    {   // entries 0 and 3 pending: the ready ones (1, 2) go first; the first wait's completion is 3, the second's is 0
+        std::vector<char> ready = {0, 1, 1, 0};
+        std::vector<std::vector<size_t>> batches, waits;
+        int nwait = 0;
+        strata::ds4::lane_rounds(
+            4, [&](size_t i) { return ready[i] != 0; }, [&](const std::vector<size_t>& b) { batches.push_back(b); },
+            [&](const std::vector<size_t>& r) {
+                for (size_t i : r) CHECK(!ready[i]);   // (a wait is only for entries that are pending)
+                waits.push_back(r);
+                ready[nwait++ == 0 ? r.back() : r.front()] = 1;
+            });
+        CHECK((batches == std::vector<std::vector<size_t>>{{1, 2}, {3}, {0}}));
+        CHECK((waits == std::vector<std::vector<size_t>>{{0, 3}, {0}}));
+    }
+    {   // no entries: nothing to do
+        int calls = 0;
+        strata::ds4::lane_rounds(
+            0, [&](size_t) { ++calls; return true; }, [&](const std::vector<size_t>&) { ++calls; },
+            [&](const std::vector<size_t>&) { ++calls; });
+        CHECK(calls == 0);
+    }
+}
+
+#if !defined(_WIN32)   // (the held reads: the injected direct read and the gate of the section above)
+// The lane's three hooks over one layer's entries, as ds4_model.cu's StoreHold gives them: an entry is ready when its slot's reads are
+// done or it has no slot (its wait rescues it); a batch waits for each of its entries and rescues one that failed; a wait sleeps on the
+// pending slots it was given.  It keeps what happened: each batch's entries, each batch's loaded state at its start, each wait's
+// entries, whether each wait ended at its bound, and whether its entries had a slot done when it returned.
+struct LaneRun {
+    ExpertStore& st;
+    int layer;
+    std::vector<int> es, sl;
+    std::vector<char> ok;
+    std::mutex mu;
+    std::vector<std::vector<size_t>> batches, waits;
+    std::vector<std::vector<char>> snaps;
+    std::vector<char> ret_loaded;
+    int timeouts = 0;
+    LaneRun(ExpertStore& s, int l, const std::vector<int>& e, const std::vector<int>& slots)
+        : st(s), layer(l), es(e), sl(slots), ok(e.size(), 0) {}
+    void rescue(size_t i) {   // (as StoreHold::rescue: read again until the entry has a slot)
+        for (int tries = 0; !ok[i] && tries < 2000; ++tries) {
+            std::vector<char> o2;
+            const int e = es[i];
+            st.ensure(layer, &e, 1, o2);
+            if (!o2.empty() && o2[0]) {
+                ok[i] = 1;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    void run() {
+        strata::ds4::lane_rounds(
+            es.size(),
+            [&](size_t i) { return sl[i] < 0 || st.loaded(sl[i]); },
+            [&](const std::vector<size_t>& b) {
+                std::vector<char> snap(es.size(), 0);
+                for (size_t i = 0; i < es.size(); ++i) snap[i] = st.loaded(sl[i]) ? 1 : 0;
+                {
+                    std::lock_guard<std::mutex> lk(mu);
+                    batches.push_back(b);
+                    snaps.push_back(snap);
+                }
+                for (size_t i : b) {
+                    st.wait_slots(sl, ok, (int) i, (int) i + 1);
+                    if (!ok[i]) rescue(i);
+                }
+            },
+            [&](const std::vector<size_t>& r) {
+                {
+                    std::lock_guard<std::mutex> lk(mu);
+                    waits.push_back(r);
+                }
+                std::vector<int> s;
+                for (size_t i : r) s.push_back(sl[i]);
+                const bool got = st.wait_any_loaded(s.data(), (int) s.size(), 10'000'000);   // (10 s: a lost wake-up shows as this bound)
+                bool any = false;
+                for (size_t i : r) any = any || st.loaded(sl[i]);
+                std::lock_guard<std::mutex> lk(mu);
+                if (!got) ++timeouts;
+                ret_loaded.push_back(any ? 1 : 0);
+            });
+    }
+};
+
+// A held read's expert, and the (layer, expert, drive) of every expert the tier holds (the store's view: find)
+struct Held {
+    int l, e, d;
+};
+static std::vector<Held> held_experts(Forced& f, const std::vector<std::pair<int32_t, int32_t>>& ranked) {
+    std::vector<Held> out;
+    for (const auto& x : ranked) {
+        int d = -1;
+        uint64_t k = 0;
+        if (f.t->find(x.first, x.second, d, k)) out.push_back({x.first, x.second, d});
+    }
+    return out;
+}
+static bool poll_until(const std::function<bool()>& cond, int ms) {
+    const auto t0 = test_clock::now();
+    while (!cond()) {
+        if (test_clock::now() - t0 > std::chrono::milliseconds(ms)) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return true;
+}
+static std::atomic<int> g_hook_calls{0};
+// the completion hook: runs under the hub's mutex with the expert still pending, so the held read finishes just before the lane sleeps
+static void release_on_sleep(const strata::ds4::CompletionHub*) {
+    if (g_hook_calls++ == 0) g_read_gate.release();
+}
+
+// Two experts of one layer on two drives: A's read held in the gate, B's read free.  The lane computes B while A is held, sleeps for A
+// alone (B's completion does not end its sleep), and A's completion ends the sleep at once.
+static void lane_ab_check(const fs::path& base, const std::vector<std::pair<int32_t, int32_t>>& ranked, const std::string& pack,
+                          const std::string& prof) {
+    Forced f;
+    CHECK(open_forced(base, "lane_ab", ranked, pack, prof, f));
+    CHECK(f.w->st.lane_wake_on());
+    const std::vector<Held> h = held_experts(f, ranked);
+    int ia = -1, ib = -1;
+    for (size_t i = 0; i < h.size() && ia < 0; ++i)
+        for (size_t j = i + 1; j < h.size(); ++j)
+            if (h[i].l == h[j].l && h[i].d != h[j].d) {
+                ia = (int) i;
+                ib = (int) j;
+                break;
+            }
+    CHECK(ia >= 0);
+    if (ia >= 0) {
+        const int L = h[(size_t) ia].l;
+        const int ea[1] = {h[(size_t) ia].e}, eb[1] = {h[(size_t) ib].e};
+        g_read_gate.close();
+        const int calls0 = inject_calls();
+        inject_plan({kBlock});   // A's read is the first direct read: it is held in the gate
+        std::vector<char> oka;
+        std::vector<int> sla;
+        f.w->st.begin(L, ea, 1, oka, sla);
+        CHECK(sla[0] >= 0);
+        bool in_gate = poll_until([&] { return inject_calls() > calls0; }, 5000);
+        CHECK(in_gate);
+        // B's read is held too, in a gate of its own: both are pending when the lane starts, so it must sleep on both
+        g_read_gate_b.close();
+        const int calls1 = inject_calls();
+        inject_plan({kBlockB});
+        std::vector<char> okb;
+        std::vector<int> slb;
+        f.w->st.begin(L, eb, 1, okb, slb);
+        CHECK(slb[0] >= 0);
+        bool b_in_gate = poll_until([&] { return inject_calls() > calls1; }, 5000);
+        CHECK(b_in_gate);
+        inject_plan({});
+        LaneRun lr(f.w->st, L, {h[(size_t) ia].e, h[(size_t) ib].e}, {sla[0], slb[0]});
+        std::thread lane([&] { lr.run(); });
+        bool asleep = poll_until(
+            [&] {
+                std::lock_guard<std::mutex> lk(lr.mu);
+                return !lr.waits.empty();
+            },
+            5000);
+        CHECK(asleep);
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));   // (nothing is computed while both are held)
+        {
+            std::lock_guard<std::mutex> lk(lr.mu);
+            CHECK(lr.batches.empty() && lr.timeouts == 0);
+        }
+        // B's read finishes while A is held: the lane computes B, and only B
+        const auto rel_b = test_clock::now();
+        g_read_gate_b.release();
+        bool b_done = poll_until(
+            [&] {
+                std::lock_guard<std::mutex> lk(lr.mu);
+                return !lr.batches.empty();
+            },
+            5000);
+        CHECK(b_done);
+        CHECK(!f.w->st.loaded(sla[0]));   // (A is still held when B is computed)
+        CHECK(test_clock::now() - rel_b < std::chrono::seconds(5));
+        bool asleep_a = poll_until(
+            [&] {
+                std::lock_guard<std::mutex> lk(lr.mu);
+                return !lr.waits.empty() && lr.waits.back() == std::vector<size_t>{0};
+            },
+            5000);
+        CHECK(asleep_a);   // the lane sleeps for A alone
+        // An unrelated copy on B's drive completes while A is held: it must not end the sleep (the lane's wait looks at A's count only)
+        std::atomic<int> other_left{1};
+        std::vector<uint8_t> osrc(4096, 7), odst(4096, 0);
+        IoQueue::Job other;
+        other.mem = osrc.data();
+        other.dst = odst.data();
+        other.len = osrc.size();
+        other.left = &other_left;
+        f.t->queue(h[(size_t) ib].d)->push(&other, 1, false);
+        CHECK(wait_below(other_left, 0, 5000));
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        {
+            std::lock_guard<std::mutex> lk(lr.mu);
+            CHECK(lr.ret_loaded.size() <= 1);   // (at most the wait that B ended, and it had B done)
+            CHECK(std::all_of(lr.ret_loaded.begin(), lr.ret_loaded.end(), [](char v) { return v == 1; }));
+            CHECK(lr.batches.size() == 1 && lr.timeouts == 0);
+        }
+        const auto rel = test_clock::now();
+        g_read_gate.release();   // A's read finishes: the lane wakes at once
+        lane.join();
+        CHECK(lr.batches.size() == 2 && lr.batches[1] == std::vector<size_t>{0});
+        CHECK(lr.snaps.size() == 2 && lr.snaps[0][0] == 0 && lr.snaps[0][1] == 1);   // at B's batch, A was not done
+        CHECK(lr.timeouts == 0 && test_clock::now() - rel < std::chrono::seconds(5));
+        CHECK(lr.ok[0] == 1 && lr.ok[1] == 1);
+        CHECK(store_ok(*f.w, L, h[(size_t) ia].e) && store_ok(*f.w, L, h[(size_t) ib].e));
+        f.w->st.release(L, lr.es.data(), 2, lr.ok);
+        inject_plan({});
+        g_read_gate_b.release();
+    }
+    unhook(f);
+    f.t->close();
+}
+
+// The same lane over one expert, whose read finishes just before the lane sleeps: the test hook releases the held read under the hub's
+// mutex, while the lane sees the expert pending.  The wait must end at once (a lost wake-up would take the 10 s bound).
+static void lane_hook_check(const fs::path& base, const std::vector<std::pair<int32_t, int32_t>>& ranked, const std::string& pack,
+                            const std::string& prof) {
+    Forced f;
+    CHECK(open_forced(base, "lane_hook", ranked, pack, prof, f));
+    const std::vector<Held> h = held_experts(f, ranked);
+    CHECK(!h.empty());
+    if (!h.empty()) {
+        const int e1[1] = {h[0].e};
+        g_read_gate.close();
+        const int calls0 = inject_calls();
+        inject_plan({kBlock});
+        std::vector<char> ok1;
+        std::vector<int> sl1;
+        f.w->st.begin(h[0].l, e1, 1, ok1, sl1);
+        bool in_gate = poll_until([&] { return inject_calls() > calls0; }, 5000);
+        CHECK(in_gate);
+        g_hook_calls = 0;
+        strata::ds4::CompletionHub::wait_hook() = release_on_sleep;
+        LaneRun lr(f.w->st, h[0].l, {h[0].e}, {sl1[0]});
+        const auto t0 = test_clock::now();
+        lr.run();
+        strata::ds4::CompletionHub::wait_hook() = nullptr;
+        CHECK(g_hook_calls.load() >= 1);
+        CHECK(lr.timeouts == 0 && test_clock::now() - t0 < std::chrono::seconds(5));
+        CHECK(lr.ok[0] == 1 && store_ok(*f.w, h[0].l, h[0].e));
+        f.w->st.release(h[0].l, lr.es.data(), 1, lr.ok);
+        inject_plan({});
+    }
+    unhook(f);
+    f.t->close();
+}
+
+// A failed read of an expert: the wait ends at the failure (the slot's count is done), and the batch rescues the expert from the file.
+static void lane_fail_check(const fs::path& base, const std::vector<std::pair<int32_t, int32_t>>& ranked, const std::string& pack,
+                            const std::string& prof) {
+    Forced f;
+    CHECK(open_forced(base, "lane_fail", ranked, pack, prof, f));
+    const std::vector<Held> h = held_experts(f, ranked);
+    CHECK(!h.empty());
+    if (!h.empty()) {
+        const int e1[1] = {h[0].e};
+        inject_plan({kEio});   // the expert's direct read fails
+        std::vector<char> ok1;
+        std::vector<int> sl1;
+        f.w->st.begin(h[0].l, e1, 1, ok1, sl1);
+        CHECK(sl1[0] >= 0);
+        LaneRun lr(f.w->st, h[0].l, {h[0].e}, {sl1[0]});
+        lr.run();
+        CHECK(lr.timeouts == 0);
+        CHECK(lr.ok[0] == 1 && store_ok(*f.w, h[0].l, h[0].e));
+        CHECK(f.fails.load() >= 1);   // (the store reported the device's failure)
+        f.w->st.release(h[0].l, lr.es.data(), 1, lr.ok);
+        inject_plan({});
+    }
+    unhook(f);
+    f.t->close();
+}
+
+// No slot: the store's ten slots are pinned, so the eleventh expert has none.  The lane takes it as ready at once (no wait), and its batch
+// rescues it when a pin is given back.
+static void lane_noslot_check(const fs::path& base, const std::vector<std::pair<int32_t, int32_t>>& ranked, const std::string& pack,
+                              const std::string& prof) {
+    Forced f;
+    CHECK(open_forced(base, "lane_noslot", ranked, pack, prof, f));
+    CHECK(ranked.size() >= 11);
+    struct Pin {
+        int l = 0, e = 0;
+        std::vector<char> ok;
+        std::vector<int> sl;
+    };
+    std::vector<Pin> pins(10);
+    int npinned = 0;
+    for (size_t i = 0; i < pins.size(); ++i) {
+        pins[i].l = ranked[i].first;
+        pins[i].e = ranked[i].second;
+        f.w->st.begin(pins[i].l, &pins[i].e, 1, pins[i].ok, pins[i].sl);
+        npinned += pins[i].sl[0] >= 0 ? 1 : 0;
+    }
+    CHECK(npinned == 10);
+    const int lx = ranked[10].first, ex = ranked[10].second;
+    std::vector<char> okx;
+    std::vector<int> slx;
+    f.w->st.begin(lx, &ex, 1, okx, slx);
+    CHECK(slx[0] < 0);
+    LaneRun lr(f.w->st, lx, {ex}, {slx[0]});
+    std::thread freer([&] {   // the pinned reads land, then the pins are given back
+        for (const Pin& p : pins)
+            if (p.sl[0] >= 0) poll_until([&] { return f.w->st.loaded(p.sl[0]); }, 5000);
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        const std::vector<char> rel(1, 1);
+        for (Pin& p : pins)
+            if (p.sl[0] >= 0) f.w->st.release(p.l, &p.e, 1, rel);
+    });
+    lr.run();
+    freer.join();
+    CHECK(lr.batches.size() == 1 && lr.waits.empty());   // a no-slot entry is never slept for
+    CHECK(lr.ok[0] == 1 && store_ok(*f.w, lx, ex));
+    f.w->st.release(lx, lr.es.data(), 1, lr.ok);
+    unhook(f);
+    f.t->close();
+}
+
+// A mapped tier hit is three copies, queued behind the device's one worker.  The lane sleeps while the worker is held, and its wait ends
+// only when all three are in: the slot's count goes 3, 2, 1, 0 and the wait looks at each, but returns with the slot loaded.
+static void lane_mapped_check(const fs::path& base, const std::vector<std::pair<int32_t, int32_t>>& ranked, const std::string& pack,
+                              const std::string& prof) {
+    Forced f;
+    set_env("DS4_TIER_DIRECT", nullptr);   // (off at open: the tier hit is three mapped copies, the three-part wait this checks)
+    CHECK(open_forced(base, "lane_mapped", ranked, pack, prof, f, true, false));
+    set_env("DS4_TIER_DIRECT", "1");
+    const std::vector<Held> h = held_experts(f, ranked);
+    CHECK(!h.empty());
+    if (!h.empty()) {
+        WorkerHold hold(f.w->shard);
+        hold.hold(f.t->queue(h[0].d));   // (the device's one worker is in the gate: the copies queue behind it)
+        const int e1[1] = {h[0].e};
+        std::vector<char> ok1;
+        std::vector<int> sl1;
+        f.w->st.begin(h[0].l, e1, 1, ok1, sl1);
+        CHECK(sl1[0] >= 0 && !f.w->st.loaded(sl1[0]));
+        LaneRun lr(f.w->st, h[0].l, {h[0].e}, {sl1[0]});
+        std::atomic<bool> finished{false};
+        std::thread lane([&] {
+            lr.run();
+            finished = true;
+        });
+        bool asleep = poll_until(
+            [&] {
+                std::lock_guard<std::mutex> lk(lr.mu);
+                return !lr.waits.empty();
+            },
+            5000);
+        CHECK(asleep);
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));   // (the copies cannot run while the worker is held)
+        CHECK(!finished.load() && !f.w->st.loaded(sl1[0]));
+        g_read_gate.release();   // the worker goes on: the three copies run in turn
+        lane.join();
+        CHECK(hold.done(5000));
+        CHECK(lr.timeouts == 0 && lr.ret_loaded.size() == 1 && lr.ret_loaded[0] == 1);
+        CHECK(lr.ok[0] == 1 && store_ok(*f.w, h[0].l, h[0].e));
+        f.w->st.release(h[0].l, lr.es.data(), 1, lr.ok);
+        inject_plan({});
+    }
+    unhook(f);
+    f.t->close();
+}
+
+// DS4_LANE_WAKE on the real store (the switch is read once, when the store is made).  Every read a scenario holds is held by the test
+// (a gated injected read), so what the lane does is decided by the test, not by timing.
+static void lane_wake_checks(const fs::path& base, const std::vector<std::pair<int32_t, int32_t>>& ranked, const std::string& pack,
+                             const std::string& prof) {
+    fs::create_directories(base);
+    set_env("DS4_TIER_THREADS", "1");   // (one worker a device: a held read is the only one on its queue)
+    set_env("DS4_TIER_DIRECT", "1");    // (read when the tier opens: a tier hit is one whole-slot direct read, the held read as in direct_wake)
+    const os::DirectPreadFn saved_read = os::direct_pread_hook();
+    os::direct_pread_hook() = inject_pread;
+    {   // off (the default): no completion signal, so the lane's wait is not the new one
+        set_env("DS4_LANE_WAKE", nullptr);
+        Forced f;
+        CHECK(open_forced(base, "lane_off", ranked, pack, prof, f));
+        CHECK(!f.w->st.lane_wake_on());
+        unhook(f);
+        f.t->close();
+    }
+    set_env("DS4_LANE_WAKE", "1");
+    lane_ab_check(base, ranked, pack, prof);
+    lane_hook_check(base, ranked, pack, prof);
+    lane_fail_check(base, ranked, pack, prof);
+    lane_noslot_check(base, ranked, pack, prof);
+    lane_mapped_check(base, ranked, pack, prof);
+    set_env("DS4_LANE_WAKE", nullptr);
+    set_env("DS4_TIER_THREADS", nullptr);
+    set_env("DS4_TIER_DIRECT", nullptr);
+    strata::ds4::CompletionHub::wait_hook() = nullptr;
+    inject_plan({});
+    os::direct_pread_hook() = saved_read;
 }
 #endif
 
@@ -2149,8 +2566,10 @@ int main() {
     }
 
     queue_wait_checks();   // IoQueue::wait_until_zero on a bare queue (DS4_TIER_WAKE's wait)
+    lane_rounds_checks();  // DS4_LANE_WAKE: the CPU lane's order of work (no store)
 #if !defined(_WIN32)
     direct_checks(base, ranked, packA, profA);   // DS4_TIER_DIRECT (opt-in): see the section above
+    lane_wake_checks(base, ranked, packA, profA);   // DS4_LANE_WAKE: the lane on the real store, with held reads
 #endif
 
     fs::remove_all(base);

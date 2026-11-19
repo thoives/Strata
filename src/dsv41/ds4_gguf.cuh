@@ -73,7 +73,10 @@ void rows(const x3::Mat& m, uint16_t* dst, bool bf16, cudaStream_t s);
 /// x3::moe_gate_up / moe_down / win_experts / set_gate_up / set_down for a GGUF's experts (lay.fmt == kFmtMXFP4; the
 /// roles' types in lay.K, see expert_type).
 void moe_gate_up(const x3::MoeArgs& a, const float* x, float* h, cudaStream_t s);
-void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* out, cudaStream_t s);
+/// DS4_MOE_LATE_WAIT (the decode's single-token path): a non-null wait_ptr makes the device wait for *wait_ptr == wait_val after the
+/// down projections and before the combine, which is the only part that reads the CPU lane's reply.  Null (the default): as before.
+void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* out, cudaStream_t s,
+              const unsigned* wait_ptr = nullptr, unsigned wait_val = 0);
 bool win_experts(const x3::WinArgs& a, cudaStream_t s);
 void set_gate_up(const x3::SetArgs& a, const float* x, int ldx, const int* row_idx, uint16_t* h16, int ldh,
                  cudaStream_t s);

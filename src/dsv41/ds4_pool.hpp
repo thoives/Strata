@@ -14,6 +14,7 @@
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -128,6 +129,30 @@ private:
     std::atomic<bool> quit_{false};
     std::mutex mu_;
     std::condition_variable cv_;
+};
+
+/// DS4_LANE_WAKE: one completion signal for a whole expert store.  Each IoQueue that carries a store slot's reads (the
+/// store's own queue, every tier device's) calls notify() after it counts a read's `left` down, and so does ExpertStore::put_done
+/// for a slot the GPU filled.  A waiter tests its own predicate under `mu` and sleeps on `cv` with the same lock, so a
+/// completion that lands between its test and its sleep is seen, not lost.  notify() takes no per-slot state: the waiter
+/// decides from its counters, so an unrelated completion only makes it look again.
+struct CompletionHub {
+    std::mutex mu;
+    std::condition_variable cv;
+    void notify() {
+        // (a waiter holds mu from its test until it sleeps: this lock waits for that, so the count it just lowered is seen by
+        //  the waiter's next test, or the notify below wakes it from its sleep)
+        { std::lock_guard<std::mutex> lk(mu); }
+        cv.notify_all();
+    }
+#ifdef DS4_IOQUEUE_TEST_HOOKS
+    /// Test builds only: called by a waiter under `mu` when its predicate is false, just before it sleeps.  It must not call notify().
+    using WaitHook = void (*)(const CompletionHub*);
+    static WaitHook& wait_hook() {
+        static WaitHook f = nullptr;
+        return f;
+    }
+#endif
 };
 
 /// File reads on threads of their own, in the order they were pushed, the pusher never waiting: the prompt path's
@@ -312,6 +337,13 @@ public:
         const uint64_t seen = done_;
         done_cv_.wait_for(lk, std::chrono::microseconds(us), [&] { return done_ != seen; });
     }
+    /// DS4_LANE_WAKE: the completion signal this queue announces each finished job to (null: none, the default).  The store sets
+    /// it before it pushes a slot's reads here, so every job of that slot is announced.  Taken under mu_: a job popped before the
+    /// change keeps the signal it was popped with.
+    void set_hub(std::shared_ptr<CompletionHub> h) {
+        std::lock_guard<std::mutex> lk(mu_);
+        hub_ = std::move(h);
+    }
 #ifdef DS4_IOQUEUE_TEST_HOOKS
     /// Test builds only (the test target defines DS4_IOQUEUE_TEST_HOOKS; production has no hook, no static and no pointer
     /// load): called at the start of each wait_until_zero(), with the queue waited on and the counter, while the
@@ -358,6 +390,7 @@ private:
 #endif
         for (;;) {
             Job j;
+            std::shared_ptr<CompletionHub> hub;   // (DS4_LANE_WAKE: announced to when set; a null copy costs nothing)
             {
                 std::unique_lock<std::mutex> lk(mu_);
                 cv_.wait(lk, [&] { return quit_ || !q_.empty() || !ql_.empty(); });
@@ -365,6 +398,7 @@ private:
                 std::deque<Job>& qq = q_.empty() ? ql_ : q_;
                 j = qq.front();
                 qq.pop_front();
+                if (hub_) hub = hub_;
             }
             if (j.cancel != nullptr && j.cancel->load(std::memory_order_acquire)) {   // (dropped unread)
                 if (j.bad != nullptr) j.bad->store(true, std::memory_order_release);
@@ -374,6 +408,7 @@ private:
                     ++done_;
                 }
                 done_cv_.notify_all();
+                if (hub) hub->notify();
                 continue;
             }
             const auto t0 = std::chrono::steady_clock::now();
@@ -460,6 +495,7 @@ private:
                 ++done_;
             }
             done_cv_.notify_all();
+            if (hub) hub->notify();
         }
     }
     std::vector<std::thread> th_;
@@ -471,6 +507,7 @@ private:
     std::atomic<uint64_t> busy_us_{0}, direct_{0}, buffered_{0};
     std::atomic<uint64_t> st_n_{0}, st_q_{0}, st_r_{0}, st_m_{0}, st_b_{0};   // DS4_IO_STATS: jobs, queue wait / read / copy us, bytes
     TierIoStats* trace_ = nullptr;   // (DS4_TIER_LOG: the tier queue's counters; null on the store's queue)
+    std::shared_ptr<CompletionHub> hub_;   // (DS4_LANE_WAKE: guarded by mu_; null by default)
 };
 
 }  // namespace strata::ds4
