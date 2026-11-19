@@ -260,6 +260,18 @@ Only `wait_slots` records the CPU lane's wait, so a `preload` at start (`ds4_mod
 are not counted. The depth is the device queue's size when a tier copy is pushed: a fill read is a model-file read,
 not a tier read, and adds no counter (§9).
 
+How the CPU lane waits (`DS4_TIER_WAKE`, opt-in, off by default). The tier's copies run on the device's own `IoQueue`,
+and the store's queue never hears of them. By default `wait_slots` polls the store's queue every 2 ms until the
+slot's `left` count is zero, as in the last release. `preload` waits for each slot it started the same way, one slot
+at a time (it used to rescan every slot of the arena at each wake). With `DS4_TIER_WAKE=1` a tier-backed slot waits on
+its device's queue instead (`IoQueue::wait_until_zero`). The design intent is that the lane then wakes when the slot's
+last copy finishes, not at the next 2 ms poll. The wait is bounded at 50 ms and the queue is looked up again at each
+turn, so a lost wake-up or a closed device costs at most the bound, never a hang. A file-backed slot and a slot put in
+by the GPU (`put_begin`, which signals no queue) keep the store queue's poll. This is design intent only: it has not
+been measured, and it stays opt-in until it is. The proof is an interleaved A/B on the same day and the same build with
+`DS4_TIER_LOG=1`. Compare the tier wait time (`wait_ns`), the copy p50/p95 and decode tok/s, and report the hardware
+and the number of runs ([COMMUNITY_BENCHMARKS.md](COMMUNITY_BENCHMARKS.md)).
+
 ### 8.3 GPU
 
 The copies land in store slots. Store chunks are GPU-mapped as they are today, so the device kernels read tier-served

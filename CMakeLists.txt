@@ -1054,6 +1054,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       add_executable(ds4_expert_tier_test tests/dsv41/expert_tier_dsv41_test.cpp src/core/expert_tier.cpp src/core/expert_tier_plan.cpp)
       target_include_directories(ds4_expert_tier_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41 ${CMAKE_CURRENT_SOURCE_DIR}/include)
       target_compile_features(ds4_expert_tier_test PRIVATE cxx_std_17)
+      # the queue's wait hook (ds4_pool.hpp) exists in this test's build only: production has no hook
+      target_compile_definitions(ds4_expert_tier_test PRIVATE DS4_IOQUEUE_TEST_HOOKS=1)
       target_link_libraries(ds4_expert_tier_test PRIVATE Threads::Threads)
       add_test(NAME ds4_expert_tier_test COMMAND ds4_expert_tier_test)
       set_tests_properties(ds4_expert_tier_test PROPERTIES TIMEOUT 120)

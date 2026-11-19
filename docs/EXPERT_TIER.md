@@ -99,6 +99,10 @@ Differences from the Qwen engine, in plain words:
   it must be set in that process's environment. A device that cannot do unbuffered reads, or that refuses one while it
   runs, keeps (or goes back to) the copies, and the log says which. Its output has not been compared with the copies on
   real hardware yet: no speed claim is made, and the tier format is unchanged.
+- **How the CPU lane waits (experimental, off by default).** `DS4_TIER_WAKE=1` makes the CPU lane sleep on the tier
+  device's own queue while it waits for a tier copy, and wake when that copy is done. Unset or `0` keeps the wait of the
+  last release (a look every 2 ms). The variable is read when the engine starts. It has not been measured on real
+  hardware yet: no speed claim is made, and the tier format is unchanged.
 
 This engine's plan is [EXPERT_TIER_DSV41_PLAN.md](EXPERT_TIER_DSV41_PLAN.md).
 

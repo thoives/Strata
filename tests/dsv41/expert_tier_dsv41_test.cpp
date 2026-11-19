@@ -6,14 +6,23 @@
 // DS4_TIER_DIRECT (opt-in, Linux): the read policy with injected errno values and short reads, the store and queue on a forced
 // direct tier (any filesystem), and a real O_DIRECT read of the tier's slots.  The real read is SKIPPED (reported, not counted)
 // where the test directory refuses O_DIRECT reads or the device gives no alignment; set DS4_TIER_TEST_DIR to one that does.
+// DS4_TIER_WAKE (opt-in): IoQueue::wait_until_zero on a bare queue (a partial completion, a lost notification, a completion just
+// before the sleep), and the store's wait_slots() on a held tier queue - the mapped copies and the direct read - which must
+// wait on the device's queue (and on the store's queue with the switch off), end only with its own slot, and fall back to the
+// store's queue for a slot the GPU put in (put_begin).  The queue's test hook needs DS4_IOQUEUE_TEST_HOOKS (CMake defines it).
 //   ds4_expert_tier_test   exit 0: all passed (a skip is reported in the last line)
+#ifndef DS4_IOQUEUE_TEST_HOOKS
+#error "build this test with -DDS4_IOQUEUE_TEST_HOOKS: its wait checks observe IoQueue::wait_until_zero through the queue's test hook"
+#endif
 #include "ds4_tier.hpp"
 
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <chrono>
+#include <condition_variable>
 #include <filesystem>
+#include <functional>
 #include <atomic>
 #include <map>
 #include <memory>
@@ -256,6 +265,196 @@ struct BigCopy {
 };
 
 static int skips = 0;   // (direct-I/O checks that could not run here: reported, never counted as passed)
+
+// ---- IoQueue::wait_until_zero (ds4_pool.hpp): the wait on one counter ------------------------------------------------------------
+using strata::ds4::IoQueue;
+using test_clock = std::chrono::steady_clock;
+
+static bool wait_flag(const std::atomic<bool>& f, int ms) {   // true when f was set within ms
+    const auto t0 = test_clock::now();
+    while (!f.load() && test_clock::now() - t0 < std::chrono::milliseconds(ms)) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    return f.load();
+}
+static bool wait_below(const std::atomic<int>& v, int bound, int ms) {   // true when v <= bound within ms
+    const auto t0 = test_clock::now();
+    while (v.load() > bound && test_clock::now() - t0 < std::chrono::milliseconds(ms)) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    return v.load() <= bound;
+}
+
+// The queue's test hook (DS4_IOQUEUE_TEST_HOOKS): runs at the start of every wait_until_zero(), under the queue's completion mutex,
+// so no completion can be announced between it and the sleep.  It records the calls (which queue, which counter), and `act` may
+// act at that point.  `early` counts calls that began sooner after the one before than the safety-net timeout (50 ms) allows:
+// the wait before it ended without its counter being zero and without the timeout (an unrelated completion woke it for good).
+// A correct wait cannot raise it, however slowly the test runs.
+struct SlotWaitObs {
+    std::mutex mu;
+    std::condition_variable cv;
+    int calls = 0, early = 0, wrong_queue = 0;
+    const IoQueue* expect = nullptr;   // when set: every call must be on this queue (wrong_queue counts the others)
+    const IoQueue* queue = nullptr;
+    const std::atomic<int>* left = nullptr;
+    test_clock::time_point last{};
+    std::function<void(const std::atomic<int>*)> act;
+    bool await_calls(int n, int ms) {
+        std::unique_lock<std::mutex> lk(mu);
+        return cv.wait_for(lk, std::chrono::milliseconds(ms), [&] { return calls >= n; });
+    }
+    int calls_now() {
+        std::lock_guard<std::mutex> lk(mu);
+        return calls;
+    }
+};
+static SlotWaitObs* g_slot_wait_obs = nullptr;
+
+static void observe_slot_wait(const IoQueue* q, const std::atomic<int>* left) {
+    SlotWaitObs* o = g_slot_wait_obs;
+    if (o == nullptr) return;
+    std::function<void(const std::atomic<int>*)> act;
+    {
+        std::lock_guard<std::mutex> lk(o->mu);
+        const auto now = test_clock::now();
+        if (o->calls > 0 && now - o->last < std::chrono::milliseconds(40)) ++o->early;
+        o->last = now;
+        ++o->calls;
+        if (o->expect != nullptr && q != o->expect) ++o->wrong_queue;
+        o->queue = q;
+        o->left = left;
+        act = o->act;
+    }
+    o->cv.notify_all();
+    if (act) act(left);
+}
+
+// Installs `obs` as the queue's hook for a scope.
+struct SlotWaitScope {
+    IoQueue::SlotWaitHook saved_hook;
+    SlotWaitObs* saved_obs;
+    explicit SlotWaitScope(SlotWaitObs& o) : saved_hook(IoQueue::slot_wait_hook()), saved_obs(g_slot_wait_obs) {
+        g_slot_wait_obs = &o;
+        IoQueue::slot_wait_hook() = observe_slot_wait;
+    }
+    ~SlotWaitScope() {
+        IoQueue::slot_wait_hook() = saved_hook;
+        g_slot_wait_obs = saved_obs;
+    }
+};
+
+// The wait on a bare queue: no store, no tier, no files.  A mem job is a plain copy that counts its `left` down.
+static void queue_wait_checks() {
+    const std::vector<uint8_t> src(4096, 3);
+    auto copy_job = [&](uint8_t* dst, std::atomic<int>* left) {
+        IoQueue::Job j;
+        j.mem = src.data();
+        j.dst = dst;
+        j.len = src.size();
+        j.left = left;
+        return j;
+    };
+    auto us_since = [](test_clock::time_point t0) {
+        return (long long) std::chrono::duration_cast<std::chrono::microseconds>(test_clock::now() - t0).count();
+    };
+
+    // A partial completion does not end the wait: two of the slot's three reads are done, the waiter still sleeps; the third
+    // ends it.  (The waiter holds the completion mutex until it sleeps, so the two reads are announced to a sleeper.)
+    {
+        std::vector<uint8_t> dst(3 * 4096, 0);
+        std::atomic<int> left{3};
+        IoQueue q(1);
+        SlotWaitObs obs;
+        SlotWaitScope scope(obs);
+        std::atomic<bool> returned{false};
+        std::atomic<int> got{-1};
+        std::thread waiter([&] {
+            got = q.wait_until_zero(left, 5'000'000) ? 1 : 0;
+            returned = true;
+        });
+        CHECK(obs.await_calls(1, 2000));
+        IoQueue::Job jobs[3] = {copy_job(dst.data(), &left), copy_job(dst.data() + 4096, &left), copy_job(dst.data() + 8192, &left)};
+        q.push(jobs, 2, false);
+        CHECK(wait_below(left, 1, 5000));   // (both done and announced)
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        CHECK(!returned.load());            // one read is still out: the wait goes on
+        q.push(jobs + 2, 1, false);
+        CHECK(wait_flag(returned, 3000));
+        waiter.join();
+        CHECK(got.load() == 1 && left.load() == 0);   // (done, not timed out)
+    }
+
+    // A lost notification costs the timeout, not a hang: the counter is zeroed with no job and no signal while the waiter sleeps.
+    {
+        std::vector<uint8_t> dummy(4096, 0);
+        std::atomic<int> left{1};
+        IoQueue q(1);
+        SlotWaitObs obs;
+        SlotWaitScope scope(obs);
+        std::atomic<bool> returned{false};
+        std::atomic<int> got{-1};
+        std::atomic<long long> elapsed_us{0};
+        std::thread waiter([&] {
+            const auto t0 = test_clock::now();
+            got = q.wait_until_zero(left, 20'000) ? 1 : 0;
+            elapsed_us = us_since(t0);
+            returned = true;
+        });
+        CHECK(obs.await_calls(1, 2000));
+        left.store(0, std::memory_order_release);   // (no queue signal)
+        const bool woke = wait_flag(returned, 2000);
+        CHECK(woke);   // (a wait without a bound sleeps for ever here)
+        if (!woke) {   // (let a broken wait end, so the thread joins: any completion of the queue announces)
+            IoQueue::Job nudge = copy_job(dummy.data(), nullptr);
+            q.push(&nudge, 1, false);
+        }
+        waiter.join();
+        CHECK(got.load() == 1);   // (the predicate is read once more at the timeout: the zeroed counter is seen)
+        CHECK(elapsed_us.load() < 1'000'000);
+    }
+
+    // With nothing done the wait returns false at its timeout (not before, not much after).  On a thread with a watchdog: a wait
+    // with no bound would never return, and the test must fail, not hang.
+    {
+        std::vector<uint8_t> dummy(4096, 0);
+        std::atomic<int> left{1};
+        IoQueue q(1);
+        std::atomic<bool> returned{false};
+        std::atomic<int> got{-1};
+        std::atomic<long long> elapsed_us{0};
+        std::thread waiter([&] {
+            const auto t0 = test_clock::now();
+            got = q.wait_until_zero(left, 20'000) ? 1 : 0;
+            elapsed_us = us_since(t0);
+            returned = true;
+        });
+        const bool woke = wait_flag(returned, 2000);
+        CHECK(woke);
+        if (!woke) {   // (let a broken wait end: the count to zero, then a completion of the queue announces it)
+            left.store(0, std::memory_order_release);
+            IoQueue::Job nudge = copy_job(dummy.data(), nullptr);
+            q.push(&nudge, 1, false);
+        }
+        waiter.join();
+        CHECK(got.load() == 0);
+        CHECK(elapsed_us.load() >= 19'000 && elapsed_us.load() < 2'000'000);
+    }
+
+    // A slot that is done already returns at once, with a long timeout; so does a count that reaches zero (no signal) after the
+    // waiter took the mutex and before it sleeps: a wait that slept first and looked later would take the five seconds.
+    {
+        std::atomic<int> left{0};
+        IoQueue q(1);
+        auto t0 = test_clock::now();
+        CHECK(q.wait_until_zero(left, 5'000'000));
+        CHECK(us_since(t0) < 1'000'000);
+
+        left.store(1);
+        SlotWaitObs obs;
+        obs.act = [&](const std::atomic<int>*) { left.store(0, std::memory_order_release); };
+        SlotWaitScope scope(obs);
+        t0 = test_clock::now();
+        CHECK(q.wait_until_zero(left, 5'000'000));
+        CHECK(us_since(t0) < 1'000'000);
+        CHECK(obs.calls_now() == 1);
+    }
+}
 #if !defined(_WIN32)
 // ---- DS4_TIER_DIRECT (opt-in, Linux): one whole-slot direct read into a store slot (ds4_tier.hpp, ds4_store.hpp) --------------
 // Three kinds of check.  (1) The read policy on its own (os::pread_exact_direct, with injected errno values and short reads):
@@ -263,10 +462,33 @@ static int skips = 0;   // (direct-I/O checks that could not run here: reported,
 // descriptor, aligned as the slots are, so the retry, refusal and failure paths run on any filesystem).  (3) A real O_DIRECT
 // read of the tier's slots, which SKIPS (and is not counted as a pass) where the test directory refuses O_DIRECT reads; set
 // DS4_TIER_TEST_DIR to a directory that takes them.
-enum Inject { kPass, kEintr, kShort4k, kShortOdd, kEinval, kEio, kZero };
+enum Inject { kPass, kEintr, kShort4k, kShortOdd, kEinval, kEio, kZero, kBlock };
 static std::mutex g_inj_mu;
 static std::vector<int> g_inj;   // the next injected outcomes of the direct path's reads, front first (empty: pass-through)
 static int g_inj_calls = 0;      // direct reads that reached the injected read
+
+// A deterministic gate for an injected read: the worker blocks in inject_pread until the test lets it finish.
+struct ReadGate {
+    std::mutex mu;
+    std::condition_variable cv;
+    bool open = false;
+    void close() {
+        std::lock_guard<std::mutex> lk(mu);
+        open = false;
+    }
+    void release() {
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            open = true;
+        }
+        cv.notify_all();
+    }
+    void await() {
+        std::unique_lock<std::mutex> lk(mu);
+        cv.wait(lk, [&] { return open; });
+    }
+};
+static ReadGate g_read_gate;
 
 static ssize_t inject_pread(int fd, void* buf, size_t n, off_t off) {
     int code = kPass;
@@ -285,6 +507,9 @@ static ssize_t inject_pread(int fd, void* buf, size_t n, off_t off) {
         case kEinval: errno = EINVAL; return -1;
         case kEio: errno = EIO; return -1;
         case kZero: return 0;
+        case kBlock:
+            g_read_gate.await();
+            return ::pread(fd, buf, n, off);
         default: return ::pread(fd, buf, n, off);
     }
 }
@@ -296,6 +521,40 @@ static int inject_calls() {
     std::lock_guard<std::mutex> lk(g_inj_mu);
     return g_inj_calls;
 }
+
+// The only worker of a queue, held in a gated injected read (g_read_gate) of an ordinary file: whatever is queued behind it waits
+// until the test opens the gate.  hold() returns once the worker is in the gate.
+struct WorkerHold {
+    int fd = -1;
+    void* buf = nullptr;
+    std::atomic<int> left{1};
+    explicit WorkerHold(const std::string& path) : fd(::open(path.c_str(), O_RDONLY)) {
+        CHECK(fd >= 0);
+        CHECK(posix_memalign(&buf, 4096, 4096) == 0);
+    }
+    ~WorkerHold() {
+        if (fd >= 0) ::close(fd);
+        std::free(buf);
+    }
+    void hold(IoQueue* q) {
+        g_read_gate.close();
+        inject_plan({kBlock});
+        const int calls0 = inject_calls();
+        IoQueue::Job j;
+        j.dfd = (os::fd_t) fd;
+        j.off = 0;
+        j.len = 4096;
+        j.dst = (uint8_t*) buf;
+        j.align = 4096;
+        j.mem_align = 4096;
+        j.tier_direct = true;
+        j.left = &left;
+        q->push(&j, 1, false);
+        for (int i = 0; i < 5000 && inject_calls() == calls0; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        CHECK(inject_calls() > calls0);
+    }
+    bool done(int ms) const { return wait_below(left, 0, ms); }   // (after the gate is open)
+};
 
 // The read policy alone: the outcome, the bytes, the retries, and what is refused without any read being sent.
 static void direct_policy_checks(const fs::path& dir) {
@@ -645,6 +904,251 @@ static void direct_checks(const fs::path& base, const std::vector<std::pair<int3
         CHECK(a.started_bytes == 3 * MB4 && a.demand_experts == 1);        // the logical payload, as the mapped path counts it
         CHECK(a.completed_jobs == 0 && a.completed_bytes == 0);            // (no mapped copy: nothing counted as one)
         CHECK(a.direct_service_ns > 0);
+        unhook(f);
+        f.t->close();
+    }
+
+    // ---- DS4_TIER_WAKE: the CPU lane waits on the tier device's queue, and only its own slot's reads end the wait ----
+    // Each scenario holds a queue's worker in a gated injected read, so what the waiter does is decided by the test, not by timing:
+    // the waiter is on the queue the test names, an unrelated job finishing does not release it, and its own slot's last read does.
+    // A waiter that was released by anything else shows as `early` (it began another wait sooner than the safety-net timeout allows)
+    // or as `returned` before the gate opens.
+    auto nonzero_wait = [&](Forced& f, int d, uint64_t before) {   // tier_note_wait recorded the wait (>= the settle below)
+        const std::vector<ExpertTierSet::DeviceStats> ds = f.t->stats();
+        return ds[(size_t) d].wait_ns >= before + 25'000'000ull;
+    };
+    {   // the whole-slot direct read (DS4_TIER_DIRECT), an unrelated completion, and a read that ends as the waiter goes to sleep
+        set_env("DS4_TIER_THREADS", "2");   // (one worker is held in the gated read, the other runs an unrelated job)
+        set_env("DS4_TIER_WAKE", "1");
+        Forced f;
+        CHECK(open_forced(base, "direct_wake", ranked, pack, prof, f));
+        int d = -1;
+        uint64_t k = 0;
+        CHECK(f.t->find(L, E, d, k));
+        IoQueue* tq = f.t->queue(d);
+        CHECK(tq != nullptr);
+        SlotWaitObs obs;
+        obs.expect = tq;
+        SlotWaitScope scope(obs);
+        const uint64_t wait0 = f.t->stats()[(size_t) d].wait_ns;
+
+        g_read_gate.close();
+        inject_plan({kBlock});
+        const int es[1] = {E};
+        std::vector<char> ok;
+        std::vector<int> sl;
+        f.w->st.begin(L, es, 1, ok, sl);   // (the whole-slot read is on the tier queue, its worker held in it)
+        CHECK(sl[0] >= 0 && !f.w->st.loaded(sl[0]));
+        std::atomic<bool> returned{false};
+        std::thread waiter([&] {
+            f.w->st.wait_slots(sl, ok, 0, 1);
+            returned = true;
+        });
+        CHECK(obs.await_calls(1, 2000));   // (the caller waits on this device's queue)
+        CHECK(obs.queue == tq && obs.left != nullptr && obs.left->load() > 0);
+
+        // An unrelated job on the same queue finishes while the slot's read is still held: it must not end the wait.
+        std::atomic<int> other_left{1};
+        std::vector<uint8_t> osrc(4096, 7), odst(4096, 0);
+        IoQueue::Job other;
+        other.mem = osrc.data();
+        other.dst = odst.data();
+        other.len = osrc.size();
+        other.left = &other_left;
+        tq->push(&other, 1, false);
+        CHECK(wait_below(other_left, 0, 5000));
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));   // (the waiter, if the completion woke it, has run by now)
+        CHECK(!returned.load());
+        CHECK(obs.early == 0);
+
+        g_read_gate.release();   // the slot's own read finishes
+        waiter.join();
+        CHECK(returned.load());
+        CHECK(ok[0] == 1 && store_ok(*f.w, L, E));
+        CHECK(obs.early == 0 && obs.wrong_queue == 0);
+        CHECK(nonzero_wait(f, d, wait0));
+
+        // A read that is done, and not yet announced, as the waiter goes to sleep: the count says so, and the wait must not
+        // wait for the announcement (the hook runs under the completion mutex, which that announcement needs).
+        int l2 = -1, e2 = -1, d2 = -1;
+        uint64_t k2 = 0;
+        for (const auto& x : ranked) {
+            if (x.first == L && x.second == E) continue;
+            if (f.t->find(x.first, x.second, d2, k2)) {
+                l2 = x.first;
+                e2 = x.second;
+                break;
+            }
+        }
+        CHECK(l2 >= 0 && e2 >= 0 && d2 >= 0);
+        g_read_gate.close();
+        inject_plan({kBlock});
+        std::vector<char> ok2;
+        std::vector<int> sl2;
+        f.w->st.begin(l2, &e2, 1, ok2, sl2);
+        CHECK(sl2[0] >= 0 && !f.w->st.loaded(sl2[0]));
+        obs.act = [&](const std::atomic<int>* left) {
+            g_read_gate.release();
+            const auto t0 = test_clock::now();
+            while (left->load(std::memory_order_acquire) != 0 && test_clock::now() - t0 < std::chrono::seconds(5))
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        };
+        obs.expect = f.t->queue(d2);
+        std::atomic<bool> returned2{false};
+        std::thread waiter2([&] {
+            f.w->st.wait_slots(sl2, ok2, 0, 1);
+            returned2 = true;
+        });
+        CHECK(wait_flag(returned2, 2000));
+        waiter2.join();
+        CHECK(ok2[0] == 1 && store_ok(*f.w, l2, e2));
+        CHECK(obs.wrong_queue == 0);
+        obs.act = nullptr;
+
+        inject_plan({});
+        set_env("DS4_TIER_WAKE", nullptr);
+        set_env("DS4_TIER_THREADS", "1");
+        unhook(f);
+        f.t->close();
+    }
+
+    // The default (mapped) path on the real store: the three copies of a tier hit are queued behind the held worker.  With the
+    // switch on the waiter sleeps on the tier queue; with it off it never touches that queue (the store queue's poll, as before).
+    for (int wake = 1; wake >= 0; --wake) {
+        set_env("DS4_TIER_THREADS", "1");
+        set_env("DS4_TIER_WAKE", wake ? "1" : nullptr);
+        Forced f;
+        CHECK(open_forced(base, wake ? "wake_mapped_on" : "wake_mapped_off", ranked, pack, prof, f));
+        f.w->st.set_tier_direct(nullptr);   // (every hit is the three mapped copies, as without DS4_TIER_DIRECT)
+        int d = -1;
+        uint64_t k = 0;
+        CHECK(f.t->find(L, E, d, k));
+        IoQueue* tq = f.t->queue(d);
+        CHECK(tq != nullptr);
+        SlotWaitObs obs;
+        obs.expect = tq;
+        SlotWaitScope scope(obs);
+        const uint64_t wait0 = f.t->stats()[(size_t) d].wait_ns;
+
+        WorkerHold hold(f.w->shard);
+        hold.hold(tq);   // (the queue's only worker is in the gate)
+
+        const int es[1] = {E};
+        std::vector<char> ok;
+        std::vector<int> sl;
+        f.w->st.begin(L, es, 1, ok, sl);   // (three copy jobs behind the held read)
+        CHECK(sl[0] >= 0 && !f.w->st.loaded(sl[0]));
+        std::atomic<bool> returned{false};
+        std::thread waiter([&] {
+            f.w->st.wait_slots(sl, ok, 0, 1);
+            returned = true;
+        });
+        if (wake) CHECK(obs.await_calls(1, 2000));   // (on the tier queue)
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        CHECK(!returned.load());   // (the copies cannot run: the one worker is held)
+        CHECK(obs.early == 0 && obs.wrong_queue == 0);
+        if (wake) CHECK(obs.queue == tq && obs.calls_now() >= 1);
+        else CHECK(obs.calls_now() == 0);   // (off: the store's queue; the tier queue was never waited on)
+        g_read_gate.release();
+        waiter.join();
+        CHECK(returned.load());
+        CHECK(ok[0] == 1 && store_ok(*f.w, L, E));
+        CHECK(hold.done(5000));
+        CHECK(obs.early == 0 && obs.wrong_queue == 0);
+        CHECK(nonzero_wait(f, d, wait0));   // (the accounting is the same on or off)
+        {
+            const ExpertTierSet::DeviceStats a = f.t->stats()[(size_t) d];
+            CHECK(a.completed_jobs == 3 && a.demand_jobs == 3);   // (three mapped copies, no direct slot read of the expert's)
+        }
+        inject_plan({});
+        set_env("DS4_TIER_WAKE", nullptr);
+        unhook(f);
+        f.t->close();
+    }
+
+    // preload() waits for each slot it started, on its own: the tier queue with the switch on, the store queue (never the tier's)
+    // with it off.  Three experts of one device, their copies behind the held worker; preload returns when all are ready.
+    for (int wake = 1; wake >= 0; --wake) {
+        set_env("DS4_TIER_THREADS", "1");
+        set_env("DS4_TIER_WAKE", wake ? "1" : nullptr);
+        Forced f;
+        CHECK(open_forced(base, wake ? "wake_preload_on" : "wake_preload_off", ranked, pack, prof, f));
+        f.w->st.set_tier_direct(nullptr);
+        int d = -1;
+        uint64_t k = 0;
+        CHECK(f.t->find(L, E, d, k));
+        IoQueue* tq = f.t->queue(d);
+        CHECK(tq != nullptr);
+        std::vector<std::pair<int, int>> list;
+        for (const auto& x : ranked) {
+            int dd = -1;
+            uint64_t kk = 0;
+            if (f.t->find(x.first, x.second, dd, kk) && dd == d) list.push_back({x.first, x.second});
+            if (list.size() == 3) break;
+        }
+        CHECK(list.size() == 3);
+        SlotWaitObs obs;
+        obs.expect = tq;
+        SlotWaitScope scope(obs);
+        WorkerHold hold(f.w->shard);
+        hold.hold(tq);
+        std::atomic<bool> returned{false};
+        size_t got = 0;
+        std::thread t([&] {
+            got = f.w->st.preload(list, 0);
+            returned = true;
+        });
+        if (wake) CHECK(obs.await_calls(1, 2000));
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        CHECK(!returned.load());   // (the copies cannot run: the one worker is held)
+        if (wake) CHECK(obs.queue == tq);
+        else CHECK(obs.calls_now() == 0);
+        g_read_gate.release();
+        t.join();
+        CHECK(returned.load() && got == 3);
+        for (const auto& x : list) CHECK(store_ok(*f.w, x.first, x.second));   // (found, so ready, with the file's bytes)
+        CHECK(f.w->st.stats().tier_hits.load() == 3 && f.w->st.stats().bytes_read.load() == 0);
+        CHECK(obs.wrong_queue == 0);   // (not `early`: preload waits slot after slot, so its waits legitimately follow each other)
+        CHECK(hold.done(5000));
+        inject_plan({});
+        set_env("DS4_TIER_WAKE", nullptr);
+        unhook(f);
+        f.t->close();
+    }
+
+    // A slot the GPU put in (put_begin) has no tier device: its waiter keeps the store's queue, and put_done ends the wait.
+    {
+        set_env("DS4_TIER_THREADS", "1");
+        set_env("DS4_TIER_WAKE", "1");
+        Forced f;
+        CHECK(open_forced(base, "wake_put", ranked, pack, prof, f));
+        int d = -1;
+        uint64_t k = 0;
+        CHECK(f.t->find(L, E, d, k));   // (the tier holds this expert: a lookup by the expert would pick its queue)
+        SlotWaitObs obs;
+        SlotWaitScope scope(obs);
+        uint8_t* blob = f.w->st.put_begin(L, E);
+        CHECK(blob != nullptr);
+        const int es[1] = {E};
+        std::vector<char> ok;
+        std::vector<int> sl;
+        f.w->st.begin(L, es, 1, ok, sl);   // (the slot, loading: left 1)
+        CHECK(sl[0] >= 0 && !f.w->st.loaded(sl[0]));
+        std::atomic<bool> returned{false};
+        std::thread waiter([&] {
+            f.w->st.wait_slots(sl, ok, 0, 1);
+            returned = true;
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        CHECK(!returned.load());
+        for (int r = 0; r < 3; ++r)   // (the caller fills the blob itself: the expert's bytes)
+            for (uint64_t i = 0; i < (uint64_t) MB4; ++i) blob[(size_t) r * (MB4 + 8192) + i] = shard_byte(src_pos(L, E, r, i));
+        f.w->st.put_done(L, E, true);
+        CHECK(wait_flag(returned, 2000));   // (within the store queue's poll: a hang is a failure, not a stuck test)
+        waiter.join();
+        CHECK(ok[0] == 1 && store_ok(*f.w, L, E));
+        CHECK(obs.calls_now() == 0);   // (never on a tier queue)
+        set_env("DS4_TIER_WAKE", nullptr);
         unhook(f);
         f.t->close();
     }
@@ -1621,6 +2125,7 @@ int main() {
         set_env("DS4_TIER_THREADS", nullptr);
     }
 
+    queue_wait_checks();   // IoQueue::wait_until_zero on a bare queue (DS4_TIER_WAKE's wait)
 #if !defined(_WIN32)
     direct_checks(base, ranked, packA, profA);   // DS4_TIER_DIRECT (opt-in): see the section above
 #endif

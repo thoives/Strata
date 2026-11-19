@@ -134,7 +134,8 @@ private:
 /// streamed experts (each part of an expert a job), unbuffered where the job has a direct descriptor and its range is
 /// not all in the page cache already (the disk straight into dst, the cache neither used nor disturbed), buffered
 /// otherwise or when the unbuffered read fails - the bytes land at dst + off % os::kDirectAlign either way.  A job's `left` is
-/// counted down when it is done (`bad` set if it failed); wait_any() sleeps until some job finished or the timeout.
+/// counted down when it is done (`bad` set if it failed); wait_any() sleeps until some job finished or the timeout, and
+/// wait_until_zero() sleeps until the named counter is zero.
 // DS4_TIER_LOG: one tier device's runtime copy counters.  The tier's runtime reads are memcpy's from its
 // mapping (ds4_store.hpp's tier hit), not pread() calls, so DS4_IO_STATS does not see them.  The histograms
 // are fixed-size and updated with relaxed atomics: one job is three matrices, so the overhead is per expert,
@@ -310,6 +311,32 @@ public:
         std::unique_lock<std::mutex> lk(done_mu_);
         const uint64_t seen = done_;
         done_cv_.wait_for(lk, std::chrono::microseconds(us), [&] { return done_ != seen; });
+    }
+#ifdef DS4_IOQUEUE_TEST_HOOKS
+    /// Test builds only (the test target defines DS4_IOQUEUE_TEST_HOOKS; production has no hook, no static and no pointer
+    /// load): called at the start of each wait_until_zero(), with the queue waited on and the counter, while the
+    /// completion mutex is held.  No completion can be announced between the call and the sleep, so a test that acts here
+    /// knows the waiter is about to sleep.  It must not call into this queue.
+    using SlotWaitHook = void (*)(const IoQueue*, const std::atomic<int>*);
+    static SlotWaitHook& slot_wait_hook() {
+        static SlotWaitHook f = nullptr;
+        return f;
+    }
+#endif
+    /// Blocks until `left` is zero or below (returns true) or `timeout_us` has passed (returns false).  Only the counter
+    /// ends the wait: an unrelated job finishing, or one of several reads of the same slot, wakes the waiter to look and it
+    /// sleeps again.  The counter is read under the completion mutex, and a job counts it down before it takes that mutex to
+    /// announce itself, so a read that finishes just before the waiter sleeps cannot lose its wake-up.  The timeout is a
+    /// safety net only: a counter that something else brings to zero (no job of this queue, so no notification) is seen
+    /// at most `timeout_us` late.  A slot that is done already returns at once.
+    /// The caller keeps `left`'s owner alive and the slot pinned (not recycled) until this returns, and the queue too.
+    bool wait_until_zero(const std::atomic<int>& left, int timeout_us = 50'000) {
+        std::unique_lock<std::mutex> lk(done_mu_);
+#ifdef DS4_IOQUEUE_TEST_HOOKS
+        if (SlotWaitHook f = slot_wait_hook()) f(this, &left);
+#endif
+        return done_cv_.wait_for(lk, std::chrono::microseconds(timeout_us),
+                                 [&] { return left.load(std::memory_order_acquire) <= 0; });
     }
     double busy_ms() const { return busy_us_.load(std::memory_order_relaxed) / 1000.0; }
     uint64_t direct_bytes() const { return direct_.load(std::memory_order_relaxed); }

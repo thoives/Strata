@@ -103,6 +103,11 @@ public:
         // DS4_TIER_DIRECT (null: every tier hit is a mapped copy, as before): the whole slot of a tier hit as one direct read,
         // when the device can take it now (false: the mapped copies, as before)
         std::function<bool(int dev, uint64_t slot, TierDirect& out)> tier_direct;
+        // DS4_TIER_WAKE (opt-in; env read once in init(), "1" on, "0" off; unset keeps this value, false): a caller waiting for a
+        // tier-backed slot sleeps on that device's own queue until the slot's reads are done (IoQueue::wait_until_zero), where
+        // the copies run, and not on the store's queue, which none of them signals.  Off: the store queue's 2 ms poll, as in the
+        // last release.  Not yet measured faster: see docs/EXPERT_TIER_DSV41_PLAN.md §8.2.
+        bool tier_wake = false;
     };
 
     void set_pfds(const std::vector<os::fd_t>& pfds) { pfds_ = pfds; }   // (the fallback handles were reopened)
@@ -165,6 +170,7 @@ public:
     }
     bool init(const Cfg& c, const std::vector<LayerGeo>& layers, const std::vector<os::fd_t>& dfds, const std::vector<os::fd_t>& pfds) {
         cfg_ = c;
+        if (const char* tw = std::getenv("DS4_TIER_WAKE")) cfg_.tier_wake = std::atoi(tw) != 0;
         geo_ = layers;
         dfds_ = dfds;
         pfds_ = pfds;
@@ -290,7 +296,7 @@ public:
             if (sp.left.load(std::memory_order_acquire) > 0) {
                 const int tdev = sp.src_dev;
                 const auto tw0 = std::chrono::steady_clock::now();
-                while (sp.left.load(std::memory_order_acquire) > 0) io_->wait_any(2000);
+                wait_left(sp);
                 if (tdev >= 0 && cfg_.tier_note_wait)
                     cfg_.tier_note_wait(tdev, (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
                         std::chrono::steady_clock::now() - tw0).count());
@@ -330,10 +336,12 @@ public:
     /// `leave` slots; returns how many were read.
     size_t preload(const std::vector<std::pair<int, int>>& list, size_t leave) {
         size_t n = 0;
+        std::vector<int> started;   // the slots this call's reads were started for
         {
             std::lock_guard<std::mutex> lk(mu_);
             const size_t room = nmax_ > leave ? nmax_ - leave : 0;
             const size_t take = std::min(list.size(), room);
+            started.reserve(take);
             for (size_t k = take; k-- > 0;) {   // (coldest first: the hottest get the newest ticks)
                 const int layer = list[k].first, e = list[k].second;
                 if (layer < 0 || layer >= (int) geo_.size() || e < 0 || e >= geo_[(size_t) layer].n_exp) continue;
@@ -341,10 +349,23 @@ public:
                 const int s = start_fill(layer, e, false);
                 if (s < 0) break;
                 slots_[(size_t) s].prefetch = false;   // (warm, not a guess)
+                started.push_back(s);
                 ++n;
             }
         }
-        for (size_t i = 0;; ++i) {   // until every read is done
+        // Each started slot is waited for on its own (outside the lock), then made ready.  The old wait took every slot of the
+        // arena through again at each wake (nalloc_ slots a wake: quadratic in a long warm list).
+        for (const int s : started) {
+            Slot& sp = slots_[(size_t) s];
+            wait_left(sp);
+            std::lock_guard<std::mutex> lk(mu_);
+            if (sp.state.load(std::memory_order_acquire) == kLoading && sp.left.load(std::memory_order_acquire) == 0) {
+                try_ready(sp);
+                if (sp.state.load(std::memory_order_acquire) == kLoading) finish(sp);
+            }
+        }
+        for (;;) {   // until every read is done: still every loading slot of the arena, as before (the ones above are ready, so
+                     // this finds nothing busy; it holds for another thread's reads, and for a slot given up and filled again)
             bool busy = false;
             {
                 std::lock_guard<std::mutex> lk(mu_);
@@ -550,7 +571,8 @@ private:
     struct Slot {
         uint8_t* base = nullptr;   // the blob's first byte
         int layer = -1, expert = -1, pin = 0;
-        int src_dev = -1;          // (>= 0: this slot's bytes came from tier device src_dev: a failure marks that device, §9)
+        std::atomic<int> src_dev{-1};   // (>= 0: this slot's bytes came from tier device src_dev: a failure marks that device, §9;
+                                        //  atomic: wait_left() reads it outside mu_, for a slot preload() does not pin)
         bool prefetch = false, visible = false;
         std::atomic<int> state{kFree}, left{0};
         std::atomic<bool> bad{false}, cancel{false};
@@ -683,6 +705,25 @@ private:
         if (tdev >= 0) tq->push(jobs, 3, !demand);   // (the tier device's own queue: demand at the front, guess at the back)
         else io_->push(jobs, 3, !demand);            // (a guess waits behind every demand read)
         return s;
+    }
+    // Waits until the slot's reads are all done (`left` zero).  Call it without mu_.  wait_slots() has the slot pinned.  preload()
+    // does not: once its reads are done another thread may give the slot up and fill it again, and this then waits for that
+    // fill (the slots array never moves, and src_dev is atomic); preload() looks at the state again under mu_ afterwards.
+    // DS4_TIER_WAKE off (the default): the store queue's 2 ms poll, as in the last release.  On: a tier-backed slot's copies run
+    // on its device's queue (§8.2/E3), which the store queue never hears of, so the caller sleeps there until the slot's own
+    // count is zero.  The queue is looked up again at every turn (a device that closed in the meantime falls back to the store's
+    // queue), and the wait there is bounded: a lost wake-up costs the bound, not a hang.  A slot read from the files and a slot
+    // the GPU put in (put_begin) have no tier device and keep the store queue.
+    void wait_left(Slot& sp) {
+        while (sp.left.load(std::memory_order_acquire) > 0) {
+            IoQueue* tq = nullptr;
+            if (cfg_.tier_wake) {
+                const int dev = sp.src_dev;
+                if (dev >= 0 && cfg_.tier_queue) tq = cfg_.tier_queue(dev);
+            }
+            if (tq != nullptr) tq->wait_until_zero(sp.left);   // (returns when done, or after the 50 ms bound)
+            else io_->wait_any(2000);
+        }
     }
     // loading -> ready once its reads are done and whole (lock-free; a failed one is cleaned up by finish / take_slot)
     void try_ready(Slot& sp) const {
