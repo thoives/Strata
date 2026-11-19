@@ -416,21 +416,26 @@ public:
         return sp.base;
     }
     void put_done(int layer, int e, bool ok) {
-        std::lock_guard<std::mutex> lk(mu_);
-        const int s = where_[(size_t) layer][(size_t) e];
-        if (s < 0) return;
-        Slot& sp = slots_[(size_t) s];
-        if (sp.pin > 0) sp.pin--;
-        if (ok) {
-            sp.left.store(0, std::memory_order_release);
-            sp.state.store(kReady, std::memory_order_release);
-        } else {
-            where_[(size_t) layer][(size_t) e] = -1;
-            sp.layer = sp.expert = -1;
-            sp.left.store(0, std::memory_order_release);
-            sp.state.store(kFree, std::memory_order_release);
-            free_hint_ = std::min<size_t>(free_hint_, (size_t) s);
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            const int s = where_[(size_t) layer][(size_t) e];
+            if (s < 0) return;
+            Slot& sp = slots_[(size_t) s];
+            if (sp.pin > 0) sp.pin--;
+            if (ok) {
+                sp.left.store(0, std::memory_order_release);
+                sp.state.store(kReady, std::memory_order_release);
+            } else {
+                where_[(size_t) layer][(size_t) e] = -1;
+                sp.layer = sp.expert = -1;
+                sp.left.store(0, std::memory_order_release);
+                sp.state.store(kFree, std::memory_order_release);
+                free_hint_ = std::min<size_t>(free_hint_, (size_t) s);
+            }
         }
+        // No job of the store's queue counted this slot down: a caller waiting for it (wait_left on the store queue) is woken now
+        // and not at its next 2 ms look.  With DS4_TIER_WAKE only: the default path is as in the last release.
+        if (cfg_.tier_wake && io_) io_->notify_done();
     }
     /// Guesses still waiting in the queue for a layer the token is past: dropped unread (their slots free once the queue has gone by)
     void cancel_stale(int layer_now) {

@@ -436,6 +436,29 @@ static void queue_wait_checks() {
         CHECK(elapsed_us.load() >= 19'000 && elapsed_us.load() < 2'000'000);
     }
 
+    // notify_done(): a completion that no job made wakes a wait_any() sleeper; its timeout here is twenty seconds.  The notice is
+    // repeated while the test waits, so a sleeper that was not asleep yet when the first came cannot fail it.
+    {
+        std::vector<uint8_t> dummy(4096, 0);
+        IoQueue q(1);
+        std::atomic<bool> returned{false};
+        std::thread sleeper([&] {
+            q.wait_any(20'000'000);
+            returned = true;
+        });
+        const auto t0 = test_clock::now();
+        while (!returned.load() && test_clock::now() - t0 < std::chrono::seconds(2)) {
+            q.notify_done();
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        CHECK(returned.load());
+        if (!returned.load()) {   // (a notice that does nothing: any completion of the queue ends the sleep, so the thread joins)
+            IoQueue::Job nudge = copy_job(dummy.data(), nullptr);
+            q.push(&nudge, 1, false);
+        }
+        sleeper.join();
+    }
+
     // A slot that is done already returns at once, with a long timeout; so does a count that reaches zero (no signal) after the
     // waiter took the mutex and before it sleeps: a wait that slept first and looked later would take the five seconds.
     {

@@ -338,6 +338,15 @@ public:
         return done_cv_.wait_for(lk, std::chrono::microseconds(timeout_us),
                                  [&] { return left.load(std::memory_order_acquire) <= 0; });
     }
+    /// Counts a completion that no job of this queue made (a slot the caller filled itself: ExpertStore::put_done), so a
+    /// wait_any() sleeper looks now and not at its timeout.
+    void notify_done() {
+        {
+            std::lock_guard<std::mutex> lk(done_mu_);
+            ++done_;
+        }
+        done_cv_.notify_all();
+    }
     double busy_ms() const { return busy_us_.load(std::memory_order_relaxed) / 1000.0; }
     uint64_t direct_bytes() const { return direct_.load(std::memory_order_relaxed); }
     uint64_t buffered_bytes() const { return buffered_.load(std::memory_order_relaxed); }
