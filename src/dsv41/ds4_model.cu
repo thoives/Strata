@@ -9118,7 +9118,8 @@ struct Model::Impl {
             const double a = now_ms();
             left.store((int) jobs.size());
             c.io->push(jobs.data(), (int) jobs.size());
-            while (left.load(std::memory_order_acquire) != 0) c.io->wait_any(500);
+            // (the timed wait: it ends when this counter is zero, not at the next 0.5 ms look - the 0.5 ms is only the safety net)
+            while (left.load(std::memory_order_acquire) != 0) c.io->wait_until_zero(left, 500);
             return now_ms() - a;
         };
         {
