@@ -2,9 +2,11 @@
 // No device and no file: the codecs are pure, so the round trip and the torn-header rules run anywhere.
 #include "strata/core/expert_tier_layout.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -100,11 +102,48 @@ static void chunk_table_codec() {
     require(back == crcs, "chunk table round trip");
 }
 
+// The CRC32C forms must agree byte for byte: the table loop is the reference; the hardware form (when this CPU has
+// SSE4.2) is checked against it for every length and alignment that matters, and for streamed feeds split at random
+// points.  The dispatched form (tier_crc32c) is checked too; it is the hardware form only under STRATA_TIER_HW_CRC=1.
+static void crc32c_forms_agree() {
+    const std::string check = "123456789";
+    require(tier_crc32c(check.data(), check.size()) == 0xE3069283u, "CRC32C check value (dispatch)");
+    require(tier_crc32c_finish(tier_crc32c_feed_portable(kCrc32cInit, check.data(), check.size())) == 0xE3069283u,
+            "CRC32C check value (table)");
+    std::mt19937 rng(20260122u);
+    std::vector<uint8_t> buf((1u << 20) + 16);
+    for (auto& b : buf) b = (uint8_t) rng();
+    const bool hw = tier_crc32c_hw_available();
+    if (!hw) std::cout << "expert_tier_layout_test: no SSE4.2 on this CPU: the hardware form is not checked\n";
+    const size_t lengths[] = {0, 1, 2, 3, 7, 8, 9, 15, 16, 17, 31, 63, 64, 65, 255, 4096, 4097, 65536, (1u << 20) - 3, 1u << 20};
+    for (size_t n : lengths)
+        for (size_t off : {size_t(0), size_t(1), size_t(3), size_t(7)}) {
+            const uint8_t* p = buf.data() + off;
+            const uint32_t want = tier_crc32c_finish(tier_crc32c_feed_portable(kCrc32cInit, p, n));
+            require(tier_crc32c(p, n) == want, "the dispatched CRC32C differs from the table");
+            if (hw)
+                require(tier_crc32c_finish(tier_crc32c_feed_hw(kCrc32cInit, p, n)) == want, "the hardware CRC32C differs from the table");
+            // streamed: the same bytes fed in random pieces, alternating the forms, give the same result
+            uint32_t r = kCrc32cInit;
+            size_t left = n, at = 0;
+            bool use_hw = hw;
+            while (left > 0) {
+                const size_t take = std::min<size_t>(left, 1 + (size_t) (rng() % 300));
+                r = (use_hw ? tier_crc32c_feed_hw(r, p + at, take) : tier_crc32c_feed_portable(r, p + at, take));
+                if (hw) use_hw = !use_hw;
+                at += take;
+                left -= take;
+            }
+            require(tier_crc32c_finish(r) == want, "a streamed CRC32C (mixed forms) differs from the one-shot table value");
+        }
+}
+
 int main() {
     try {
         header_round_trip();
         placement_table_codec();
         chunk_table_codec();
+        crc32c_forms_agree();
         std::cout << "expert_tier_layout_test: PASS\n";
         return 0;
     } catch (const std::exception& error) {

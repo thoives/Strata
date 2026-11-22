@@ -32,6 +32,13 @@ The names may be in any case. The numbers are plain digits: no sign, no spaces, 
 in a row, or a comma at the end) is refused. Both engines, setup and `strata launch` follow these same rules, and setup
 writes each entry back in one standard spelling.
 
+**A faster checksum (opt-in).** The tier's checksums are CRC32C. The default is a plain table loop. On an x86-64 CPU
+with SSE4.2 you can set `STRATA_TIER_HW_CRC=1` before you start, and the checksums use the processor's CRC instruction
+instead. The checksums are the same bytes, so a tier written either way is read either way. This is off by default
+because it has been measured only on a development machine, not on the machine a tier is filled on. A fill with the
+checksum in the table loop took about 1.5 s for 768 MiB in that test, and about 0.3 s with the instruction (both from a
+RAM-backed source; your drives and model files will change the numbers).
+
 **When it helps.** A big model spreads its experts over the GPU, RAM and, in the end, the model files on the SSD. A tier
 puts the experts the GPU and RAM cannot keep on the device you gave, once, and reads them from there for every answer.
 Setup never adds a tier by itself: it checks the devices you give and says what they carry. The experts the tier cannot

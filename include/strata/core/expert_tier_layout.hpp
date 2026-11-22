@@ -13,8 +13,19 @@
 
 #include <array>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
+
+// (Not in a GPU's device pass: the host's CPU builtins and intrinsics do not exist there; the table is used.)
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(__CUDA_ARCH__) && !defined(__HIP_DEVICE_COMPILE__) && !defined(__SYCL_DEVICE_ONLY__)
+#define STRATA_TIER_CRC_X86 1
+#include <nmmintrin.h>   // SSE4.2: _mm_crc32_u64 / _mm_crc32_u8 (the hardware CRC32C form)
+#if defined(_MSC_VER)
+#include <intrin.h>      // __cpuid
+#endif
+#endif
 
 namespace strata::core {
 
@@ -68,11 +79,59 @@ constexpr std::array<uint32_t, 256> make_crc32c_table() {
 // Streaming form: feed bytes in order (the fill's chunk CRCs are computed as the blobs are written, §6.4/§6.5),
 // then `tier_crc32c_finish` closes it.  `tier_crc32c` is this pair with empty state.
 constexpr uint32_t kCrc32cInit = 0xFFFFFFFFu;
-inline uint32_t tier_crc32c_feed(uint32_t r, const void* data, size_t n) {
+// The table loop: the reference form every other form must match byte for byte.
+inline uint32_t tier_crc32c_feed_portable(uint32_t r, const void* data, size_t n) {
     constexpr auto table = make_crc32c_table();
     const uint8_t* p = (const uint8_t*) data;
     for (size_t i = 0; i < n; ++i) r = table[(r ^ p[i]) & 0xFF] ^ (r >> 8);
     return r;
+}
+// The hardware form (x86-64, SSE4.2's crc32 instruction): the same CRC32C, with no inversion of the state, so the
+// state passes straight through exactly as the table loop passes it.  Eight bytes an instruction, little-endian.
+// Opt-in at run time: STRATA_TIER_HW_CRC=1 (read once) and a CPU that reports SSE4.2.  Everything else is the table loop.
+#if defined(STRATA_TIER_CRC_X86)
+inline bool tier_crc32c_hw_available() {
+#if defined(_MSC_VER)
+    int info[4];
+    __cpuid(info, 1);
+    return (info[2] & (1 << 20)) != 0;   // ECX bit 20: SSE4.2
+#else
+    __builtin_cpu_init();
+    return __builtin_cpu_supports("sse4.2") != 0;
+#endif
+}
+#if defined(_MSC_VER)
+inline uint32_t tier_crc32c_feed_hw(uint32_t r, const void* data, size_t n) {
+#else
+__attribute__((target("sse4.2"))) inline uint32_t tier_crc32c_feed_hw(uint32_t r, const void* data, size_t n) {
+#endif
+    const uint8_t* p = (const uint8_t*) data;
+    uint64_t c = r;
+    while (n >= 8) {
+        uint64_t v;
+        std::memcpy(&v, p, 8);
+        c = _mm_crc32_u64(c, v);
+        p += 8;
+        n -= 8;
+    }
+    uint32_t c32 = (uint32_t) c;
+    while (n--) c32 = _mm_crc32_u8(c32, *p++);
+    return c32;
+}
+#else
+inline bool tier_crc32c_hw_available() { return false; }
+inline uint32_t tier_crc32c_feed_hw(uint32_t r, const void* data, size_t n) { return tier_crc32c_feed_portable(r, data, n); }
+#endif
+// The dispatch: the hardware form when STRATA_TIER_HW_CRC=1 is set and the CPU has it; the table loop otherwise.
+inline bool tier_crc32c_use_hw() {
+    static const bool on = [] {
+        const char* e = std::getenv("STRATA_TIER_HW_CRC");
+        return e != nullptr && e[0] == '1' && e[1] == '\0' && tier_crc32c_hw_available();
+    }();
+    return on;
+}
+inline uint32_t tier_crc32c_feed(uint32_t r, const void* data, size_t n) {
+    return tier_crc32c_use_hw() ? tier_crc32c_feed_hw(r, data, n) : tier_crc32c_feed_portable(r, data, n);
 }
 inline uint32_t tier_crc32c_finish(uint32_t r) { return r ^ 0xFFFFFFFFu; }
 inline uint32_t tier_crc32c(const void* data, size_t n) { return tier_crc32c_finish(tier_crc32c_feed(kCrc32cInit, data, n)); }
