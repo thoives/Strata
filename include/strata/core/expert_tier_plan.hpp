@@ -50,4 +50,30 @@ std::vector<std::pair<int32_t, int32_t>> tier_ranked_rest(
     const std::vector<std::pair<int32_t, int32_t>>& profile, int64_t n_layers, int64_t n_expert,
     const std::function<bool(int64_t, int64_t)>& held_elsewhere);
 
+// ---- the striped layout (docs/EXPERT_TIER.md, "The layout"): each expert's blob is cut into stripes of `stripe_bytes`,
+// stripe k goes to device (start + k) mod D, and the stripes a device holds for one expert sit back to back in one piece
+// of that device's data region.  Only the blob's last stripe can be short.  A blob no longer than one stripe is one piece.
+
+/// One expert's striped placement.  `start == -1`: not placed (the file tier keeps it, with the colder experts after it).
+struct StripedPlacement {
+    int32_t start = -1;           // the device of stripe 0; the rotation runs from it in device order
+    std::vector<uint64_t> offset; // per device: the piece's byte offset in that device's data region (4 KiB aligned; 0 when empty)
+};
+
+/// Bytes device `device` holds of a blob of `blob_bytes`, cut into `stripe_bytes` units from device `start` over `n_devices`.
+/// 0 when the device gets no stripe of this blob.  The pieces of all devices add up to `blob_bytes`.
+uint64_t striped_piece_bytes(uint64_t blob_bytes, uint64_t stripe_bytes, uint32_t n_devices, int32_t start, uint32_t device);
+
+/// Deal `ranked_rest` (same order and meaning as plan_expert_tiers) with every device in the stripe set.  Expert i starts its
+/// rotation on the i-th placed device (placed count mod D).  For each device, the piece's offset is the next 4 KiB boundary
+/// after what that device already holds; an expert is placed only when every one of its pieces fits its device's `capacity_bytes`.
+/// The first expert that does not fit stops the deal (the rank-prefix rule), so no colder expert takes a place before a hotter one.
+/// No device is dropped from the rotation: a full or small device stops the deal, and what it leaves unused is the caller's to report.
+/// `stripe_bytes` must be a multiple of 4 KiB and `devices` must be non-empty; otherwise nothing is placed.
+std::vector<StripedPlacement> plan_expert_tiers_striped(
+    const std::vector<std::pair<int32_t, int32_t>>& ranked_rest,
+    const std::vector<uint64_t>& layer_blob_bytes,
+    const std::vector<TierDevice>& devices,
+    uint64_t stripe_bytes);
+
 }  // namespace strata::core

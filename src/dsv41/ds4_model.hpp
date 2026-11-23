@@ -13,6 +13,8 @@
 // compressed KV and index keys included, which a checkpoint leaves in place - through a file or a host buffer.
 #pragma once
 
+#include "ds4_tier_stats.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -51,6 +53,8 @@ struct Options {
     // yet (open item 1).
     std::vector<std::string> expert_tiers;   // one entry per --expert-tier flag, in the order given (the order is part of the placement, §7.4)
     bool expert_tier_refill = false;         // --expert-tier-refill: write the tier again whatever its headers say
+    bool expert_tier_striped = false;        // --expert-tier-layout striped: each expert cut into stripes over every device (docs/EXPERT_TIER.md)
+    uint32_t expert_tier_stripe_kib = 256;   // --expert-tier-stripe-kib: the stripe unit of the striped layout (KiB)
     // dspark_auto: the drafter is loaded only where the routed experts fit the GPUs (more than 1.5x what they have, the verify rounds
     // read 3.3x the bytes of a token and measured no faster than plain decoding, and the drafter's 7 GB of experts take the VRAM the
     // trunk's hottest would have had); --dspark on / off / none says it outright
@@ -101,12 +105,13 @@ struct TierDeviceStats {
     double queue_p50_ms = 0.0, queue_p95_ms = 0.0;
     double service_p50_ms = 0.0, service_p95_ms = 0.0;
     double cold_service_p50_ms = 0.0, cold_service_p95_ms = 0.0;
-    // DS4_TIER_DIRECT (empty: the mode is off): "mapped", "direct" or "fallback"; whole-slot jobs, apart from the copies above
+    // DS4_TIER_DIRECT (empty: off): "mapped", "direct" or "fallback"; whole-slot or stripe jobs, apart from mapped copies
     std::string direct_mode;
     int64_t direct_jobs = 0, direct_ok = 0, direct_fallbacks = 0, direct_failed = 0;
     int64_t direct_slot_bytes = 0, direct_slot_ok_bytes = 0, direct_payload_ok_bytes = 0;
     double direct_queue_ms = 0.0, direct_service_ms = 0.0;
     double direct_service_p50_ms = 0.0, direct_service_p95_ms = 0.0;
+    StripeIoStats stripe;
 };
 
 struct Stats {
@@ -138,6 +143,8 @@ struct Stats {
     // statistic, §9).  With no tier these stay 0 (§7.4/acceptance criterion 1).
     int64_t tier_hits = 0, tier_bytes = 0, tier_experts = 0, tier_devices = 0;
     double tier_fill_s = 0.0;
+    bool tier_striped = false;
+    StripeHitStats tier_striped_hits;
     std::vector<TierDeviceStats> tier_dev_stats;   // (DS4_TIER_LOG: one snapshot per device)
     int64_t store_zc = 0, store_zc_visible = 0;   // experts the GPU computed from the store (zero-copy over PCIe); slots it may read
     double store_wait_ms = 0.0, store_busy_ms = 0.0;

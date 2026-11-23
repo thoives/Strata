@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "ds4_os.hpp"
+#include "ds4_tier_stats.hpp"
 #if defined(_MSC_VER)
 #include <intrin.h>
 #endif
@@ -194,7 +195,23 @@ struct IoLatencyHist {
         return max_ns.load(std::memory_order_relaxed);
     }
 };
+struct AtomicStripeCount {
+    std::atomic<uint64_t> jobs{0}, bytes{0};
+    void add(uint64_t n) { jobs.fetch_add(1, std::memory_order_relaxed); bytes.fetch_add(n, std::memory_order_relaxed); }
+    StripeJobCount snapshot() const { return {jobs.load(std::memory_order_relaxed), bytes.load(std::memory_order_relaxed)}; }
+};
+struct AtomicStripeIoStats {
+    AtomicStripeCount mapped_submitted, direct_submitted;
+    AtomicStripeCount mapped_ok, mapped_failed, mapped_cancelled;
+    AtomicStripeCount direct_ok, direct_fallback, direct_failed, direct_cancelled;
+    StripeIoStats snapshot() const {
+        return {mapped_submitted.snapshot(), direct_submitted.snapshot(), mapped_ok.snapshot(), mapped_failed.snapshot(),
+                mapped_cancelled.snapshot(), direct_ok.snapshot(), direct_fallback.snapshot(), direct_failed.snapshot(),
+                direct_cancelled.snapshot()};
+    }
+};
 struct TierIoStats {
+    AtomicStripeIoStats stripe;
     std::atomic<uint64_t> started_experts{0}, started_bytes{0};
     std::atomic<uint64_t> demand_experts{0}, demand_bytes{0};
     std::atomic<uint64_t> prefetch_experts{0}, prefetch_bytes{0};
@@ -292,6 +309,7 @@ public:
         std::chrono::steady_clock::time_point pushed{};   // (DS4_IO_STATS: when it was queued)
         bool tier_copy = false;   // DS4_TIER_LOG: a runtime copy from a tier device's mapping
         bool demand = false;      // ... and it is a demand copy, not a lookahead guess
+        bool tier_stripe = false; // striped runtime job, counted separately when tier tracing is enabled
         // DS4_TIER_DIRECT: a tier slot read whole through `dfd` (off, len: the device's offset alignment `align`; dst: its
         // memory alignment `mem_align`), straight into the store's slot, one job a slot.  A refusal copies `fallback` (the same
         // slot in the tier's mapping) and sets `refused`, so the device is not asked again.  `payload` is the matrices' bytes
@@ -326,6 +344,8 @@ public:
                 (low ? ql_ : q_).push_back(jobs[i]);
                 (low ? ql_ : q_).back().pushed = std::chrono::steady_clock::now();
                 traced = traced || jobs[i].tier_copy;
+                if (trace_ && jobs[i].tier_stripe)
+                    (jobs[i].tier_direct ? trace_->stripe.direct_submitted : trace_->stripe.mapped_submitted).add(jobs[i].len);
             }
             if (trace_ && traced) trace_->note_depth((uint64_t) (q_.size() + ql_.size()));
         }
@@ -401,6 +421,8 @@ private:
                 if (hub_) hub = hub_;
             }
             if (j.cancel != nullptr && j.cancel->load(std::memory_order_acquire)) {   // (dropped unread)
+                if (trace_ && j.tier_stripe)
+                    (j.tier_direct ? trace_->stripe.direct_cancelled : trace_->stripe.mapped_cancelled).add(j.len);
                 if (j.bad != nullptr) j.bad->store(true, std::memory_order_release);
                 if (j.left != nullptr) j.left->fetch_sub(1, std::memory_order_acq_rel);
                 {
@@ -466,6 +488,14 @@ private:
             }
             const auto t_rd = std::chrono::steady_clock::now();
             if (ok && j.keep != nullptr && j.mem == nullptr) std::memmove(j.keep, j.exact ? j.dst : j.dst + lead, (size_t) j.len);   // (keep may overlap dst: the store reads in place and moves up)
+            if (trace_ && j.tier_stripe) {
+                if (j.tier_direct) {
+                    if (direct_hit) trace_->stripe.direct_ok.add(j.len);
+                    else if (direct_fb) trace_->stripe.direct_fallback.add(j.len);
+                    else trace_->stripe.direct_failed.add(j.len);
+                } else if (ok) trace_->stripe.mapped_ok.add(j.len);
+                else trace_->stripe.mapped_failed.add(j.len);
+            }
             if (j.tier_direct && trace_ != nullptr) {
                 using ns = std::chrono::nanoseconds;
                 trace_->note_direct(j.payload, j.len, direct_hit, direct_fb,

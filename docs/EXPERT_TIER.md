@@ -44,13 +44,70 @@ puts the experts the GPU and RAM cannot keep on the device you gave, once, and r
 Setup never adds a tier by itself: it checks the devices you give and says what they carry. The experts the tier cannot
 hold keep the usual file path.
 
+**The layout: whole or striped (opt-in).** With more than one device you choose how the tier spreads each expert over them:
+
+- `whole` (the default): each expert is stored on one device. The experts are dealt round-robin over the devices, hottest
+  first. This is the layout of earlier versions, and a tier written this way is reused as before.
+- `striped` (opt-in, Qwen and DeepSeek engines): each expert is cut into stripes, and the stripes are dealt over the devices in turn.
+  The stripe size is `--expert-tier-stripe-kib N` (default 256 KiB; a multiple of 4 KiB, from 4 to 16384).
+
+```sh
+strata launch --family qwen --model q2_0 \
+  --expert-tier /drive-a/experts.tier,mib=65536 \
+  --expert-tier /drive-b/experts.tier,mib=65536 \
+  --expert-tier-layout striped --expert-tier-stripe-kib 256 --yes --no-tui
+```
+
+For DeepSeek, select `--family deepseek41 --model ist-das-2.00bpw` instead. The same layout flags apply; setup also
+needs a suitable RAM-store size, as described in the DeepSeek section below.
+
+The rules, in plain words:
+
+- The layout applies to every `--expert-tier` device. Striped needs 2 to 8 devices. A layout option with no device is refused
+  (it would do nothing), and a stripe size with `whole` is refused.
+- With striped, the smallest device can limit how much the tier holds. Larger devices may have unused space. The plan and
+  the log say how much (the estimate is before the headers and tables, and is not a measured number).
+- An expert is placed only when every one of its pieces fits. The first expert that does not fit stops the placement, and the
+  colder experts after it stay on the file tier, as with whole.
+- An expert no larger than one stripe sits on one device, and the devices take such experts in turn.
+- A change of layout, of stripe size, or of the device order refills the whole tier at the next start. A refill rewrites the
+  tier's area on every device, as a first fill does. The layout change never permits writing over other data: the device checks
+  above still apply.
+- With `verify=full`, a bad chunk sends every expert that has a stripe in that chunk to the file tier, and marks the device for a refill.
+
+**Three words for a striped expert in the Qwen engine.** The engine keeps these apart:
+
+- **Held**: a valid copy of the expert is on the tier.
+- **Pointer-addressable**: the tier gives one stable address for the expert's bytes. Only a `whole` expert is. A striped expert
+  is not pointer-addressable through the tier, even when it fits on one device.
+- **Needs gathering**: serving the expert means putting its stripes together in a buffer. Every held striped expert needs it.
+
+**Where a Qwen read comes from.** For one expert the engine takes the first source that holds it: the copy in RAM, then a staged exchange
+copy, then the tier, then the model files. The batched reads follow the same order. The bytes are the same from every source,
+so only the counters show which one served a read.
+
+- In the prompt, a striped expert the RAM copy does not hold is gathered from the devices into the prompt's own buffer.
+- In decoding, a striped expert the RAM copy does not hold is gathered from the devices into a staging slot in RAM: each device's
+  pieces are read into their places in that slot. The slot is the pool's ordinary staging slot, so it keeps the same lifetime
+  as a staged file blob: the pointer holds until the next call (and through the layer it was asked in), and the GPU copies that
+  read a page-locked slot are recorded so the slot is not reused under them. A refused gather is read from the files instead.
+- The pointer for a copy that runs later (`blob_stable`) and the refill of a lent cache slot keep the model files for a striped
+  expert. Neither is a staging slot, so neither can be recycled under a copy that is still running.
+
+**DeepSeek reads and formats.** `strata-dsv41` gathers the stripes of a tier-held expert into its RAM store. Qwen and DeepSeek
+use different tier headers: Qwen writes version 2 for whole and version 3 for striped; DeepSeek writes version 1 for whole and
+version 2 for striped. Changing the layout refills the tier.
+
+**Limits.** In Qwen, a lent-cache refill reads the model files rather than the striped tier. GPU validation and a speed
+benefit for striping are not established here. Compare `whole` and `striped` on the same hardware and workload before
+making a speed claim.
+
 **The first start and every start after.** At the start that fills the tier, the engine copies those experts to it once —
 the log says how many bytes it wrote and how long the fill took on your PC. Later starts read the tier's header: if the
 model, the device and the order you gave are unchanged, the tier is reused and nothing is copied. Anything different —
 another model, another device, a device whose last fill did not finish — writes the tier again. A fill counts as
 finished only once all its bytes are safely on the device. If the disk reports a write error, the tier is marked
-unfinished and written again at the next start. A tier made by an earlier test version of this engine (header version 1)
-is written again once.
+unfinished and written again at the next start.
 
 **A refill.** If the tier's data is damaged or belongs to another model, the engine does not guess: it refills the tier at
 the next start. With `verify=full` a bad piece is found at the start, that expert is read from the model files for now,
@@ -100,21 +157,31 @@ Differences from the Qwen engine, in plain words:
 - **A per-device breakdown.** `DS4_TIER_LOG=1` (off by default; unset or `0` disables) makes `strata-dsv41` print one line per tier device at
   the end of a decode: copies and MB a token, the queue and copy times, the cold share, and the CPU lane's wait for
   that device. It is a diagnostic; the residency probe it adds runs only when the variable is set.
-- **Direct reads (experimental, Linux, off by default).** `DS4_TIER_DIRECT=1` lets a tier hit read its whole slot straight
-  into the RAM store with one unbuffered read, instead of three memory copies from the tier's mapping. Unset or `0` keeps
-  the copies, as before. Any other value stops the start with a message. The variable is read when the engine starts, so
-  it must be set in that process's environment. A device that cannot do unbuffered reads, or that refuses one while it
-  runs, keeps (or goes back to) the copies, and the log says which. Its output has not been compared with the copies on
-  real hardware yet: no speed claim is made, and the tier format is unchanged.
-- **Direct read span (experimental, off by default).** With `DS4_TIER_DIRECT=1`, `DS4_TIER_DIRECT_SPAN=1` makes that read
-  cover only the part of the slot the three matrices take, from the first matrix to the end of the last. The slot's padding
-  before and after is not read, so fewer bytes come off the device for each hit. Unset or `0` reads the whole slot. If the
-  shorter read cannot meet the device's alignment or the slot's bounds, the whole slot is read. The tier format is unchanged.
-  The bytes are checked in the host test; the bytes saved on real hardware are not measured yet.
-- **How the CPU lane waits (experimental, off by default).** `DS4_TIER_WAKE=1` makes the CPU lane sleep on the tier
-  device's own queue while it waits for a tier copy, and wake when that copy is done. Unset or `0` keeps the wait of the
-  last release (a look every 2 ms). The variable is read when the engine starts. It has not been measured on real
-  hardware yet: no speed claim is made, and the tier format is unchanged.
+- **Direct reads (experimental, Linux, off by default).** Set `DS4_TIER_DIRECT=1` in the engine's environment at start to
+  allow unbuffered tier reads into the RAM store. With `whole`, a tier hit can read its slot in one operation. With
+  `striped`, each stripe can be read directly from its device into its place in the store. Unset or `0` keeps mapped copies;
+  any other value stops the start with a message. The tier format does not change.
+  - Each direct read must meet the device's offset and length alignment, the destination's memory alignment and the store's
+    bounds. A stripe is not rounded into a neighboring stripe. If a stripe cannot meet these rules, it uses a mapped copy;
+    one expert can therefore use both direct reads and mapped copies. A device without usable direct reads stays mapped.
+  - If a device reports that a direct read is unsupported while running, that read falls back to a mapped copy and later reads
+    from that device use copies. Other read failures are not treated as an unsupported-direct fallback.
+  - At startup the log reports each device's direct or mapped capability and, for direct devices, its alignment. With
+    `DS4_TIER_LOG=1`, the striped report counts logical expert fills separately from each device's direct and mapped stripe
+    jobs, their outcomes, bytes, and queue and service times. A direct job is one stripe. Capability alone does not mean
+    every stripe was read directly; mapped stripes that never qualified for a direct attempt are not direct-job fallbacks.
+    Job bytes are requested ranges, not measured disk traffic. Counts can include cancelled or in-flight work.
+  - Host tests include real Linux direct reads where the test filesystem supports them. GPU output checks and a performance
+    comparison on the intended hardware are still needed; no speed benefit is claimed.
+- **Direct read span (experimental, off by default, whole layout only).** With `DS4_TIER_DIRECT=1`,
+  `DS4_TIER_DIRECT_SPAN=1` tries an aligned span covering the three matrices instead of the whole slot. Unset or `0` uses the
+  whole slot. If the span cannot meet alignment or bounds, the engine tries the whole slot; if that cannot be read directly,
+  it uses mapped copies. The option does not change striped reads or the tier format. Any reduction in bytes read or benefit
+  on real hardware is unproven.
+- **How the CPU lane waits (experimental, off by default).** `DS4_TIER_WAKE=1` makes the CPU lane sleep while it waits
+  for a tier read. Whole-layout reads use the device's queue; striped reads use a shared signal from all participating
+  queues. Unset or `0` keeps the wait of the last release (a look every 2 ms). The variable is read when the engine starts.
+  It has not been measured on real hardware yet: no speed claim is made, and the tier format is unchanged.
 - **Waiting for any of the CPU lane's reads (experimental, off by default).** `DS4_LANE_WAKE=1` lets the CPU lane compute
   whichever of its experts is ready first, instead of waiting for the first one it asked for. Unset or `0` keeps the
   old order. Not measured on real hardware yet.

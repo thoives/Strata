@@ -106,4 +106,74 @@ inline std::string tier_spec_canonical(const TierSpec& s) {
     return out;
 }
 
+// ---- the layout of the whole --expert-tier set (docs/EXPERT_TIER.md, "The layout").  It applies to every device given:
+//   --expert-tier-layout whole|striped   whole (the default): each expert is stored on one device
+//   --expert-tier-stripe-kib N           striped only: the stripe unit, a multiple of 4 KiB from 4 to 16384; default 256
+// Refused before anything is written: a layout option with no --expert-tier (a typo would otherwise look as if it took
+// effect), a stripe size with the whole layout, and striped with fewer than 2 or more than kTierStripedMaxDevices devices.
+// strata_control/expert_tier.py follows the same rules (tests/core/expert_tier_spec_test.cpp and the Python tests check them).
+enum class TierLayout : uint8_t { Whole = 0, Striped = 1 };
+constexpr uint32_t kTierStripeKibDefault = 256;
+constexpr uint32_t kTierStripeKibMin = 4;
+constexpr uint32_t kTierStripeKibMax = 16384;
+constexpr size_t kTierStripedMaxDevices = 8;   // bounds the placement table: 12 + 8 bytes per device for each expert
+
+struct TierLayoutOpts {
+    TierLayout layout = TierLayout::Whole;
+    bool layout_given = false;   // --expert-tier-layout was given (whole or striped)
+    uint32_t stripe_kib = 0;     // --expert-tier-stripe-kib as given; 0: not given
+};
+
+/// The stripe unit in KiB that a striped set uses (the default when the flag was not given).
+inline uint32_t tier_stripe_kib(const TierLayoutOpts& o) { return o.stripe_kib ? o.stripe_kib : kTierStripeKibDefault; }
+
+/// "whole" or "striped", in any case. False for anything else.
+inline bool parse_tier_layout_name(const std::string& raw, TierLayout& out) {
+    const std::string v = tier_spec_detail::lower(raw);
+    if (v == "whole") { out = TierLayout::Whole; return true; }
+    if (v == "striped") { out = TierLayout::Striped; return true; }
+    return false;
+}
+
+/// A stripe size in KiB: digits only, a multiple of 4 and from kTierStripeKibMin to kTierStripeKibMax. False with `why`.
+inline bool parse_stripe_kib(const std::string& v, uint32_t& out, std::string& why) {
+    uint64_t n = 0;
+    if (!tier_spec_detail::mib_number(v, n) || n > kTierStripeKibMax) {
+        why = "--expert-tier-stripe-kib takes a whole number of KiB from " + std::to_string(kTierStripeKibMin) + " to " +
+              std::to_string(kTierStripeKibMax) + " (a multiple of 4), not '" + v + "'";
+        return false;
+    }
+    if (n < kTierStripeKibMin || n % 4 != 0) {
+        why = "--expert-tier-stripe-kib must be a multiple of 4 KiB, from " + std::to_string(kTierStripeKibMin) + " to " +
+              std::to_string(kTierStripeKibMax) + ", not '" + v + "'";
+        return false;
+    }
+    out = (uint32_t) n;
+    return true;
+}
+
+/// Whether the layout options are usable with `n_devices` --expert-tier entries. Nothing given is always fine (whole, as before).
+inline bool validate_tier_layout(const TierLayoutOpts& o, size_t n_devices, std::string& why) {
+    if (!o.layout_given && o.stripe_kib == 0) return true;
+    if (n_devices == 0) {
+        why = "--expert-tier-layout and --expert-tier-stripe-kib need at least one --expert-tier (with no tier they would do nothing)";
+        return false;
+    }
+    if (o.stripe_kib != 0 && o.layout != TierLayout::Striped) {
+        why = "--expert-tier-stripe-kib is for --expert-tier-layout striped (the whole layout has no stripes)";
+        return false;
+    }
+    if (o.layout == TierLayout::Striped) {
+        if (n_devices < 2) {
+            why = "--expert-tier-layout striped needs at least two --expert-tier devices (it spreads each expert over them)";
+            return false;
+        }
+        if (n_devices > kTierStripedMaxDevices) {
+            why = "--expert-tier-layout striped takes at most " + std::to_string(kTierStripedMaxDevices) + " --expert-tier devices";
+            return false;
+        }
+    }
+    return true;
+}
+
 }  // namespace strata::core

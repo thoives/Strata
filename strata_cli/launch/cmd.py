@@ -124,6 +124,12 @@ def add_parsers(sp: argparse._SubParsersAction) -> list[argparse.ArgumentParser]
                         "keeps the experts your card and RAM do not hold there once, and reads them over that device from "
                         "then on; any change to the device or the model's identity writes it again (see docs/EXPERT_TIER.md). "
                         "The first start WRITES OVER the device, up to mib")
+    g.add_argument("--expert-tier-layout", metavar="whole|striped", default=None,
+                   help="how the expert tier spreads each expert over its --expert-tier devices: whole (the default: one device per "
+                        "expert) or striped (each expert cut into stripes over all of them; the Qwen engine only). It applies to every "
+                        "device, and a change refills the tier (docs/EXPERT_TIER.md, The layout)")
+    g.add_argument("--expert-tier-stripe-kib", metavar="KIB", default=None,
+                   help="the stripe unit of --expert-tier-layout striped, a multiple of 4 KiB from 4 to 16384 (default 256)")
     g.add_argument("--expert-tier-overwrite", action="store_true",
                    help="a --expert-tier device that holds data that is not an expert tier may be written over (its data is lost). "
                         "Without it Strata asks in a terminal and stops elsewhere; --yes alone does not say this")
@@ -300,6 +306,28 @@ def settings_from_args(a: argparse.Namespace, catalog=None) -> tuple[S.LaunchSet
             notices.append(S.Notice("error", bad[0] + ".", f"Each --expert-tier is {expert_tier.GRAMMAR}, one flag per device."))
         else:
             s.expert_tiers = [expert_tier.canonical(expert_tier.absolute(t)) for t in specs]   # absolute: setup and the engine get this same path
+    if getattr(a, "expert_tier_layout", None) is not None or getattr(a, "expert_tier_stripe_kib", None) is not None:
+        # the layout of the whole set (docs/EXPERT_TIER.md, "The layout"): checked against the devices the run will use, and kept
+        # only when it is not the whole layout (the default is written nowhere, so an ordinary run's config is unchanged)
+        from strata_control import expert_tier
+        layout, kib, refused = None, None, False
+        if a.expert_tier_layout is not None:
+            layout, why = expert_tier.parse_layout(a.expert_tier_layout)
+            if layout is None:
+                notices.append(S.Notice("error", why + ".", "The layout is whole (the default) or striped."))
+                refused = True
+        if a.expert_tier_stripe_kib is not None:
+            kib, why = expert_tier.parse_stripe_kib(a.expert_tier_stripe_kib)
+            if kib is None:
+                notices.append(S.Notice("error", why + ".", "The stripe unit is a multiple of 4 KiB, from 4 to 16384."))
+                refused = True
+        if not refused:
+            why = expert_tier.layout_problem(layout, kib, len(s.expert_tiers))
+            if why:
+                notices.append(S.Notice("error", why + ".", "Give --expert-tier devices with --expert-tier-layout striped, or leave the layout out."))
+            else:
+                s.expert_tier_layout = "striped" if layout == "striped" else None
+                s.expert_tier_stripe_kib = expert_tier.striped_stripe_kib("striped", kib) if s.expert_tier_layout else None
     if a.dspark:
         s.extra = {**s.extra, "--dspark": a.dspark}
         if a.dspark == "on" and sys.platform == "darwin":

@@ -33,6 +33,8 @@ FASTER_VRAM_GIB = 16.0                        # the engine's rule (src/dsv41/ds4
 FASTER_NOTE = "Faster uses 5 of 6 experts per word: a small quality change, usually not noticeable."
 
 
+DEFAULT_STRIPE_KIB = 256   # the stripe unit of --expert-tier-layout striped (strata_control/expert_tier.py DEFAULT_STRIPE_KIB)
+
 def faster_default(total_vram_gb: float | None) -> bool:
     """Mirrors the engine's `--experts auto`: Faster (5 experts) when the cards the launch uses total 16 GiB (17,179,869,184 bytes) or less.
     The engine decides at its start; this only says the same thing in the screens and in --plan, so the two never disagree."""
@@ -121,6 +123,8 @@ class LaunchSettings:
     no_key: bool = False                       # served beyond this computer without a key, on purpose (--no-api-key); a warning, never a refusal
     extra: dict[str, str] = field(default_factory=dict)    # Advanced: --set key=value (flags and STRATA_* variables)
     expert_tiers: list[str] = field(default_factory=list)   # --expert-tier: one entry per device, kept in order (§5.1)
+    expert_tier_layout: str | None = None      # --expert-tier-layout striped (docs/EXPERT_TIER.md); None: whole, the default, written nowhere
+    expert_tier_stripe_kib: int | None = None  # --expert-tier-stripe-kib: striped only; None: the default stripe (256 KiB)
     # filled in by the run, kept in the preset
     tuned_preset: str | None = None            # id of the tuning preset the tuner saved
     tuned_at: str | None = None
@@ -135,6 +139,10 @@ class LaunchSettings:
 
     def to_dict(self, *, with_key: bool = True) -> dict[str, Any]:
         d = {"schema": SCHEMA, **asdict(self)}
+        # the expert-tier fields are written only when set: a run without a tier keeps the same settings and plan as before they existed
+        for k in ("expert_tiers", "expert_tier_layout", "expert_tier_stripe_kib"):
+            if not d.get(k):
+                d.pop(k, None)
         if not with_key:
             d["api_key"] = "set" if self.api_key else None
         return d
@@ -151,6 +159,10 @@ class LaunchSettings:
             clean["expert_tiers"] = [str(v) for v in clean["expert_tiers"]]
         else:
             clean.pop("expert_tiers", None)
+        layout = clean.get("expert_tier_layout")   # the whole layout is the default: stored as None, never written as a flag
+        clean["expert_tier_layout"] = None if layout in (None, "", "whole") else str(layout).lower()
+        kib = clean.get("expert_tier_stripe_kib")
+        clean["expert_tier_stripe_kib"] = int(kib) if isinstance(kib, int) and not isinstance(kib, bool) and kib > 0 else None
         return cls(**clean)
 
     def copy(self, **changes: Any) -> "LaunchSettings":
@@ -348,6 +360,11 @@ def flags_text(s: LaunchSettings, *, preset: str | None = None) -> str:
             parts.append("--tune-allow-small")
         parts.append(f"--access {s.access}")
         parts.append(f"--port {s.port}")
+        for raw in s.expert_tiers:                    # the devices, in order (the copyable line says what the run does)
+            parts.append(f'--expert-tier "{raw}"')
+        if s.expert_tier_layout == "striped":
+            parts.append("--expert-tier-layout striped")
+            parts.append(f"--expert-tier-stripe-kib {s.expert_tier_stripe_kib or DEFAULT_STRIPE_KIB}")
         if s.gpu_roles:
             parts.append("--gpu-roles " + ",".join(f"{k}={v}" for k, v in sorted(s.gpu_roles.items(), key=lambda kv: int(kv[0]))))
         elif s.gpus:

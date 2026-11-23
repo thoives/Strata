@@ -371,6 +371,7 @@ bool PeerExperts::adapt(const float* usage, const int32_t* res0, int max_swaps, 
         if (!ck(cudaMemcpyAsync(cache_.device_slot(slot), b, (size_t) lay.blob_bytes(s.layer), cudaMemcpyHostToDevice,
                                 refill_), "refill", err))
             return false;
+        src_->note_async_read(b, refill_);     // #1237: the queued copy reads a stage buffer (a striped blob's slot), not recycled under it
         res_[out] = kNotResident;              // evicted now: the CPU computes it meanwhile
         pending_.emplace_back((int32_t) in, slot);
         ++swaps_;

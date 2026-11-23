@@ -460,3 +460,11 @@ Two decisions made here should go back into [EXPERT_TIER_PLAN.md](EXPERT_TIER_PL
    by measurement, as in the Strata plan.
 5. **Prompt path confirmation.** §8.5 says the prompt path's reads go through `ensure` and `begin`. That is to be
    confirmed by reading its call sites in D2.
+
+## Striped layout: status
+
+`strata-dsv41` accepts `--expert-tier-layout striped` as an opt-in alternative to the default whole layout. A tier-held
+striped expert is gathered into the RAM store. DeepSeek uses its own tier header, with version 1 for whole and version 2
+for striped. See [EXPERT_TIER.md](EXPERT_TIER.md#the-layout-whole-or-striped-opt-in) for the user-facing rules and
+[EXPERT_TIER_PLAN.md](EXPERT_TIER_PLAN.md#striped-layout-status) for the wider status. No speed benefit is claimed.
+

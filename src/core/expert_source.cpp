@@ -1890,6 +1890,8 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahea
             uint64_t avail = 0;
             want_pin = STAGE_PIN_DEFAULT && available_memory_bytes(avail) && avail >= (uint64_t) stage_blob_ + kStagePinFloor;
         }
+        if (stage_blob_ == 0)   // a source opened without the GGUF, direct or io paths: the largest blob sizes the slots
+            for (uint64_t b : layer_blob_bytes_) stage_blob_ = std::max(stage_blob_, b);
         void* p = nullptr;
         cudaError_t pin_err = cudaSuccess;
         if (want_pin) pin_err = cudaHostAlloc(&p, (size_t) stage_blob_, cudaHostAllocDefault);
@@ -2055,18 +2057,34 @@ void FileExpertSource::gate_capacity() {
 }
 
 // Fills buffer `v` (reserved by claim_stage) outside the lock, then publishes it.
+bool FileExpertSource::striped_tier_holds(int64_t layer, int64_t expert) const {
+    return tier_ != nullptr && tier_->striped() && tier_->held(layer, expert);
+}
+
 bool FileExpertSource::fill_stage(size_t v, int64_t layer, int64_t expert, uint8_t* dst) {
     const auto t0 = std::chrono::steady_clock::now();
-    const bool ok = copy_from_files(layer, expert, dst);
-    publish_stage(v, layer, ok, std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
+    // A striped tier expert: each device's pieces are read into their places in this slot (the same bytes as the file). A refused
+    // gather is served from the files, as a missing expert is; the slot's lifetime is the staging pool's either way.
+    bool ok = striped_tier_holds(layer, expert) && tier_->gather(layer, expert, dst);
+    const bool from_tier = ok;
+    if (!ok) ok = copy_from_files(layer, expert, dst);
+    publish_stage(v, layer, ok, std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count(), from_tier);
     return ok;
 }
 
-void FileExpertSource::publish_stage(size_t v, int64_t layer, bool ok, double us) {
-    file_us_.fetch_add((uint64_t) us, std::memory_order_relaxed);
-    if (ok) {
-        file_read_bytes_.fetch_add(layer_blob_bytes_[(size_t) layer], std::memory_order_relaxed);
-        file_blob_bytes_.fetch_add(layer_blob_bytes_[(size_t) layer], std::memory_order_relaxed);
+void FileExpertSource::publish_stage(size_t v, int64_t layer, bool ok, double us, bool from_tier) {
+    if (from_tier) {
+        tier_us_.fetch_add((uint64_t) us, std::memory_order_relaxed);
+        if (ok) {
+            tier_reads_.fetch_add(1, std::memory_order_relaxed);
+            tier_read_bytes_.fetch_add(layer_blob_bytes_[(size_t) layer], std::memory_order_relaxed);
+        }
+    } else {
+        file_us_.fetch_add((uint64_t) us, std::memory_order_relaxed);
+        if (ok) {
+            file_read_bytes_.fetch_add(layer_blob_bytes_[(size_t) layer], std::memory_order_relaxed);
+            file_blob_bytes_.fetch_add(layer_blob_bytes_[(size_t) layer], std::memory_order_relaxed);
+        }
     }
     {
         std::lock_guard<std::mutex> lk(stage_mu_);
@@ -2286,8 +2304,11 @@ int64_t FileExpertSource::prefetch_begin(int64_t layer, const int64_t* experts, 
         if (direct) {
             for (size_t at; (at = async_next_.fetch_add(16)) < todo.size();) {
                 const size_t k = std::min<size_t>(16, todo.size() - at);
+                // a striped tier expert is not at its file offset: a chunk that holds one is filled expert by expert (fill_stage gathers it)
+                bool tier_in_chunk = false;
+                for (size_t i = at; i < at + k && !tier_in_chunk; ++i) tier_in_chunk = striped_tier_holds(todo[i].layer, todo[i].e);
                 const auto t0 = std::chrono::steady_clock::now();
-                const bool ok = read_direct(todo.data() + at, k);
+                const bool ok = !tier_in_chunk && read_direct(todo.data() + at, k);
                 const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
                 for (size_t i = at; i < at + k; ++i) {
                     const Fill& f = todo[i];
@@ -3355,9 +3376,14 @@ void FileExpertSource::begin_layer(int64_t layer, const int32_t* ids, int64_t k)
 
 bool FileExpertSource::transient(int64_t layer, int64_t expert) const {
     if (tier_ && tier_->has(layer, expert)) return false;   // §7.6: the tier's pointers are stable while it is open
+    // A striped tier expert has no pointer (has() is false), so the prompt path must copy it: copy_blob gathers it from the
+    // devices. Without this, blob_stable() would return the file's bytes and every such expert would be a silent file read.
+    // It is transient unless the RAM copy or an exchange override takes it first (blob()'s order), as for a file blob below.
+    const bool striped_held = tier_ != nullptr && tier_->striped() && tier_->held(layer, expert);
     // the io-prefetch staging of the experts.bin tier is the decode's: the prompt path keeps reading the mapping
     // (its own read-ahead hints), so this answers as it did without io prefetch
-    if ((role_ptr_.empty() && direct_.empty()) || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return false;
+    if (!striped_held && (role_ptr_.empty() && direct_.empty())) return false;
+    if (layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return false;
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
     if (complement_ready_ && resident_blob(index) != nullptr)
         return false;
@@ -3420,6 +3446,18 @@ bool FileExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
             tier_read_bytes_.fetch_add(bytes, std::memory_order_relaxed);
             return true;
         }
+        // A striped expert has no contiguous blob: its stripes are gathered from the devices into dst (the same bytes and
+        // counters as a whole blob). A tier-held expert that fails to gather falls through to the files, as a missing one does.
+        if (tier_->striped() && tier_->held(layer, expert)) {
+            const auto tt0 = std::chrono::steady_clock::now();
+            if (tier_->gather(layer, expert, dst)) {
+                tier_us_.fetch_add((uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - tt0).count(),
+                                   std::memory_order_relaxed);
+                tier_reads_.fetch_add(1, std::memory_order_relaxed);
+                tier_read_bytes_.fetch_add(bytes, std::memory_order_relaxed);
+                return true;
+            }
+        }
     }
     const auto t0 = std::chrono::steady_clock::now();
     if (!copy_from_files(layer, expert, dst)) return false;
@@ -3464,13 +3502,18 @@ bool FileExpertSource::copy_blobs(const int32_t* layers, const int32_t* experts,
     // §7.3 (docs/EXPERT_TIER_PLAN.md): a tier is open.  Split the batch into its tier share and its file share.
     // The tier share runs on the tier's own per-device copy workers (one per device, up to the cap, §7.3) while
     // this thread reads the file share as before, so the batch's wait is the slower of the two.  Same bytes either
-    // way.
+    // way.  held() (not has()): a striped expert is on the devices but has no pointer, and the tier gathers it.
+    // Precedence (the same as copy_blob and blob()): the RAM copy, then an exchange override, then the tier, then the files.
+    // An expert the RAM copy or an override holds goes to the file share, whose copy_blob takes it from there.
     std::vector<int32_t> t_layer, t_expert, f_layer, f_expert;
     std::vector<uint8_t*> t_dst, f_dst;
     for (size_t i = 0; i < n; ++i) {
         const int64_t l = layers[i], e = experts[i];
         if (base_ == nullptr || dst[i] == nullptr || l < 0 || e < 0 || l >= n_layers_ || e >= n_expert_) return false;
-        if (tier_->has(l, e)) {
+        const size_t index = (size_t) l * (size_t) n_expert_ + (size_t) e;
+        const bool ram_first = complement_ready_ &&
+                               (resident_blob(index) != nullptr || (!override_.empty() && override_[index] != nullptr));
+        if (!ram_first && tier_->held(l, e)) {
             t_layer.push_back((int32_t) l); t_expert.push_back((int32_t) e); t_dst.push_back(dst[i]);
         } else {
             f_layer.push_back((int32_t) l); f_expert.push_back((int32_t) e); f_dst.push_back(dst[i]);
@@ -3515,11 +3558,18 @@ bool FileExpertSource::copy_blobs(const int32_t* layers, const int32_t* experts,
         }
     }
     if (tier_worker.joinable()) tier_worker.join();
-    if (!t_layer.empty()) {
+    if (!t_layer.empty() && tier_ok) {
         tier_reads_.fetch_add(t_layer.size(), std::memory_order_relaxed);
         tier_read_bytes_.fetch_add(t_bytes, std::memory_order_relaxed);
         tier_us_.fetch_add((uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count(),
                            std::memory_order_relaxed);
+    }
+    // A tier share that did not complete (a gather refused, which the tier does before it writes anything) is served from the
+    // files instead: the same bytes, and the destinations are complete when this returns. Those blobs count as file reads.
+    if (!t_layer.empty() && !tier_ok) {
+        for (size_t i = 0; i < t_layer.size() && file_ok; ++i)
+            if (!copy_from_files(t_layer[i], t_expert[i], t_dst[i])) file_ok = false;
+        tier_ok = true;
     }
     return file_ok && tier_ok;
 }
@@ -4699,6 +4749,15 @@ bool FileExpertSource::has_tier(int64_t layer, int64_t expert) const {
 const uint8_t* FileExpertSource::blob_stable(int64_t layer, int64_t expert) {
     if (tier_ && layer >= 0 && expert >= 0 && layer < n_layers_ && expert < n_expert_ && tier_->has(layer, expert))
         return blob(layer, expert);   // §7.2: the tier pointer is stable while the tier is open (§7.1)
+    // A striped tier expert with no RAM copy or override: its pointer must not be a staging slot (recycled after kStageAge layers),
+    // so it is the file's mapping, as before. Without a mapping (unbuffered reads) the staged blob is the fallback, as it always was.
+    if (layer >= 0 && expert >= 0 && layer < n_layers_ && expert < n_expert_ && striped_tier_holds(layer, expert) &&
+        blob_source(layer, expert) == BlobSource::File) {
+        if (const uint8_t* b = mapped_blob(layer, expert)) {
+            file_read_bytes_.fetch_add(layer_blob_bytes_[(size_t) layer], std::memory_order_relaxed);
+            return b;
+        }
+    }
     if (io_pf_ && role_ptr_.empty() && direct_.empty()) {
         if (complement_ready_ && layer >= 0 && expert >= 0 && layer < n_layers_ && expert < n_expert_) {
             const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
@@ -4721,6 +4780,8 @@ int FileExpertSource::blob_parts(int64_t layer, int64_t expert, BlobPart* out) {
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
     if (complement_ready_ && (resident_blob(index) != nullptr || (!override_.empty() && override_[index] != nullptr))) return 0;
     if (tier_ && tier_->has(layer, expert)) return 0;   // §7.2: a tier blob is contiguous in the device mapping
+    // a striped tier expert is gathered from its devices (copy_blob), not read as the file's parts
+    if (tier_ && tier_->striped() && tier_->held(layer, expert)) return 0;
     Span sp[3];
     const int ns = spans(layer, expert, sp);
     for (int i = 0; i < ns; ++i) out[i] = {sp[i].p, sp[i].n, sp[i].at};
@@ -4755,23 +4816,29 @@ const uint8_t* FileExpertSource::blob(int64_t layer, int64_t expert) {
                 from_files = false;
             }
         }
-        if (from_files)
-        if (io_pf_ && role_ptr_.empty() && direct_.empty()) {
-            result = io_blob(layer, expert);              // staged when it had to be read, the mapping when cached
-        } else if (staged()) {
-            result = staged_blob(layer, expert);          // counts its bytes
-        } else {
-            result = mapped_blob(layer, expert);
-            if (result != nullptr) {
-                file_read_bytes_.fetch_add(layer_blob_bytes_[(size_t) layer], std::memory_order_relaxed);
+        if (from_files && striped_tier_holds(layer, expert)) {
+            // A striped tier expert has no contiguous copy: its pieces are gathered from the devices into a staging slot (fill_stage),
+            // which holds the pointer for the same span as a staged file blob (kStageAge). Its reads are tier reads, counted there.
+            result = staged_blob(layer, expert);
+            from_files = false;
+        } else if (from_files) {
+            if (io_pf_ && role_ptr_.empty() && direct_.empty()) {
+                result = io_blob(layer, expert);              // staged when it had to be read, the mapping when cached
+            } else if (staged()) {
+                result = staged_blob(layer, expert);          // counts its bytes
+            } else {
+                result = mapped_blob(layer, expert);
+                if (result != nullptr) {
+                    file_read_bytes_.fetch_add(layer_blob_bytes_[(size_t) layer], std::memory_order_relaxed);
 #if defined(__linux__)
-                if (io_stats_) {   // STRATA_IO_STATS=1: what the page cache held when the kernels were handed the blob
-                    uint64_t total = 0;
-                    const uint64_t c = cached_bytes(layer, expert, total);
-                    io_cached_.fetch_add(c, std::memory_order_relaxed);
-                    io_uncached_.fetch_add(total - c, std::memory_order_relaxed);
-                }
+                    if (io_stats_) {   // STRATA_IO_STATS=1: what the page cache held when the kernels were handed the blob
+                        uint64_t total = 0;
+                        const uint64_t c = cached_bytes(layer, expert, total);
+                        io_cached_.fetch_add(c, std::memory_order_relaxed);
+                        io_uncached_.fetch_add(total - c, std::memory_order_relaxed);
+                    }
 #endif
+                }
             }
         }
         if (complement_ready_ && from_files && result != nullptr) file_reads_.fetch_add(1, std::memory_order_relaxed);

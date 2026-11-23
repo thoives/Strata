@@ -1933,6 +1933,17 @@ int main(int argc, char **argv) try {
             }
             o.expert_tiers.push_back(s);
         }
+        else if (a == "--expert-tier-layout" || a == "--expert-tier-stripe-kib") {
+            // docs/EXPERT_TIER.md, "The layout": the striped layout is not built into this engine yet, so it is refused here, before
+            // any tier device is written. `whole` (the default) is accepted, so a launch that names it runs as before.
+            const char* v = next(a.c_str());
+            if (a == "--expert-tier-stripe-kib" || std::strcmp(v, "whole") != 0) {
+                std::fprintf(stderr, "strata generate: %s %s: the Intel Arc (SYCL) engine has only the whole expert-tier layout (the "
+                                     "striped one is not built here). Leave %s out, or use the CUDA or HIP engine.\n",
+                             a.c_str(), v, a.c_str());
+                return 2;
+            }
+        }
         else if (a == "--vram-reserve-mib") { o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib")); o.vram_reserve_given = true; }
         else if (a == "--vram-reserve-later-mib")
             o.vram_reserve_later_mib = std::atoi(next("--vram-reserve-later-mib"));

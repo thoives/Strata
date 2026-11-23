@@ -114,7 +114,11 @@ bool decode_header(const uint8_t* buf, TierHeader& h, std::string& why) {
     const uint8_t* b = buf + 8;
     const uint32_t version = get_u32(b); b += 4;
     // the version first: a header of another layout says so instead of "crc mismatch" (its crc covers other bytes)
-    if (version != kTierLayoutVersion) { why = "layout version " + std::to_string(version) + ", this engine reads " + std::to_string(kTierLayoutVersion); return false; }
+    if (version != kTierLayoutVersion && version != kTierLayoutVersionStriped) {
+        why = "layout version " + std::to_string(version) + ", this engine reads " + std::to_string(kTierLayoutVersion) + " and " +
+              std::to_string(kTierLayoutVersionStriped);
+        return false;
+    }
     if (tier_crc32c(buf, (size_t) kTierHeaderCrcBytes) != get_u32(buf + kTierHeaderCrcBytes)) {
         why = "header_crc does not match its fields";
         return false;
@@ -192,6 +196,43 @@ bool decode_placement_table(const uint8_t* bytes, uint64_t len, int entry_bytes,
         if (e.device < 0) { why = "placement entry names device " + std::to_string(e.device); return false; }
         if (e.offset % kTierAlign != 0) { why = "placement entry offset is not 4 KiB aligned"; return false; }
         entries.push_back(e);
+    }
+    return true;
+}
+
+std::vector<uint8_t> encode_striped_table(const std::vector<StripedTableEntry>& entries, uint32_t n_devices) {
+    const size_t eb = (size_t) striped_entry_bytes(n_devices);
+    std::vector<uint8_t> out(entries.size() * eb);
+    for (size_t i = 0; i < entries.size(); ++i) {
+        uint8_t* b = out.data() + i * eb;
+        const StripedTableEntry& e = entries[i];
+        put_i32(b, e.layer); put_i32(b + 4, e.expert); put_i32(b + 8, e.start);
+        for (uint32_t d = 0; d < n_devices; ++d)
+            put_u64(b + 12 + 8 * (size_t) d, d < e.offset.size() ? e.offset[d] : 0);
+    }
+    return out;
+}
+
+bool decode_striped_table(const uint8_t* bytes, uint64_t len, uint32_t n_devices, std::vector<StripedTableEntry>& entries,
+                          std::string& why) {
+    if (n_devices == 0) { why = "internal: a striped table needs at least one device"; return false; }
+    const uint64_t eb = striped_entry_bytes(n_devices);
+    if (len % eb != 0) { why = "striped placement table length is not a whole number of entries"; return false; }
+    entries.clear();
+    entries.reserve((size_t) (len / eb));
+    for (uint64_t i = 0; i < len; i += eb) {
+        const uint8_t* b = bytes + i;
+        StripedTableEntry e;
+        e.layer = get_i32(b);
+        e.expert = get_i32(b + 4);
+        e.start = get_i32(b + 8);
+        if (e.start < 0 || (uint32_t) e.start >= n_devices) { why = "striped placement entry starts on device " + std::to_string(e.start); return false; }
+        e.offset.resize(n_devices);
+        for (uint32_t d = 0; d < n_devices; ++d) {
+            e.offset[d] = get_u64(b + 12 + 8 * (size_t) d);
+            if (e.offset[d] % kTierAlign != 0) { why = "striped placement entry offset is not 4 KiB aligned"; return false; }
+        }
+        entries.push_back(std::move(e));
     }
     return true;
 }
@@ -556,6 +597,75 @@ struct ChunkCrc {
     }
 };
 
+// Moves one device piece of an expert between the expert's contiguous blob and the piece's bytes on the device. The whole
+// layout's piece is the whole blob. The striped layout's piece on device `d` holds stripes k = j0, j0 + D, ... of the blob
+// (j0 = the device's first stripe, (d - start) mod D), back to back; only the blob's last stripe can be short. `to_piece`
+// writes the blob to the piece (fill); otherwise the piece is read into the blob (gather).
+static void move_piece(bool striped, uint64_t stripe, uint32_t n_devices, int32_t start, size_t d, uint64_t blob_bytes,
+                       uint8_t* blob, uint8_t* piece, bool to_piece) {
+    if (!striped) {
+        if (to_piece) std::memcpy(piece, blob, (size_t) blob_bytes);
+        else std::memcpy(blob, piece, (size_t) blob_bytes);
+        return;
+    }
+    const uint64_t n = (blob_bytes + stripe - 1) / stripe;
+    const uint64_t j0 = (d + n_devices - (uint32_t) start) % n_devices;
+    uint64_t m = 0;   // this device's stripe index: its piece holds the stripes one after another
+    for (uint64_t k = j0; k < n; k += n_devices, ++m) {
+        const uint64_t len = std::min<uint64_t>(stripe, blob_bytes - k * stripe);
+        if (to_piece) std::memcpy(piece + m * stripe, blob + k * stripe, (size_t) len);
+        else std::memcpy(blob + k * stripe, piece + m * stripe, (size_t) len);
+    }
+}
+
+void ExpertTierSet::set_layout(bool striped, uint64_t stripe_bytes) {
+    striped_ = striped;
+    stripe_bytes_ = striped ? stripe_bytes : 0;
+}
+
+void ExpertTierSet::pieces_of(size_t idx, std::vector<TierPiece>& out) const {
+    out.clear();
+    if (id_.n_expert <= 0 || idx >= (size_t) id_.n_layers * (size_t) id_.n_expert) return;
+    const uint64_t bytes = id_.layer_blob_bytes[idx / (size_t) id_.n_expert];
+    if (!striped_) {
+        if (idx < dev_of_.size() && dev_of_[idx] >= 0) out.push_back({(size_t) dev_of_[idx], off_of_[idx], bytes});
+        return;
+    }
+    if (idx >= start_of_.size() || start_of_[idx] < 0) return;
+    const uint32_t D = (uint32_t) tiers_.size();
+    for (uint32_t d = 0; d < D; ++d) {
+        const uint64_t len = striped_piece_bytes(bytes, stripe_bytes_, D, start_of_[idx], d);
+        if (len) out.push_back({d, soff_[idx * D + d], len});
+    }
+}
+
+bool ExpertTierSet::held(int64_t layer, int64_t expert) const {
+    if (layer < 0 || expert < 0 || layer >= id_.n_layers || expert >= id_.n_expert) return false;
+    const size_t idx = (size_t) layer * (size_t) id_.n_expert + (size_t) expert;
+    if (striped_) return idx < start_of_.size() && start_of_[idx] >= 0 && idx < valid_.size() && valid_[idx];
+    return idx < dev_of_.size() && dev_of_[idx] >= 0 && idx < valid_.size() && valid_[idx];
+}
+
+bool ExpertTierSet::gather(int64_t layer, int64_t expert, uint8_t* dst) const {
+    if (dst == nullptr || !held(layer, expert)) return false;
+    if (!striped_) {
+        const uint8_t* p = blob(layer, expert);
+        if (p == nullptr) return false;
+        std::memcpy(dst, p, (size_t) id_.layer_blob_bytes[(size_t) layer]);
+        return true;
+    }
+    const size_t idx = (size_t) layer * (size_t) id_.n_expert + (size_t) expert;
+    const uint32_t D = (uint32_t) tiers_.size();
+    const uint64_t bytes = id_.layer_blob_bytes[(size_t) layer];
+    for (uint32_t d = 0; d < D; ++d) {
+        if (striped_piece_bytes(bytes, stripe_bytes_, D, start_of_[idx], d) == 0) continue;
+        const uint8_t* b = tiers_[d]->base();
+        if (b == nullptr) return false;
+        move_piece(true, stripe_bytes_, D, start_of_[idx], d, bytes, dst, (uint8_t*) (b + data_off_[d] + soff_[idx * D + d]), false);
+    }
+    return true;
+}
+
 void ExpertTierSet::set_flush_fault(std::function<bool(size_t)> f) {
     flush_fault_ = std::move(f);
     for (size_t d = 0; d < tiers_.size(); ++d)
@@ -567,6 +677,12 @@ bool ExpertTierSet::open(const std::vector<TierSpec>& specs, const TierIdentity&
     id_ = id;
     tiers_.clear();
     if (specs.empty()) { err = "expert tier: no --expert-tier entries"; return false; }
+    if (striped_ && (specs.size() < 2 || specs.size() > kTierStripedMaxDevices || stripe_bytes_ == 0 ||
+                     stripe_bytes_ % kTierAlign != 0 || stripe_bytes_ > (uint64_t) kTierStripeKibMax * 1024)) {
+        err = "expert tier: the striped layout needs 2 to " + std::to_string(kTierStripedMaxDevices) +
+              " devices and a stripe unit that is a multiple of 4 KiB (at most " + std::to_string(kTierStripeKibMax) + " KiB)";
+        return false;
+    }
     for (size_t i = 0; i < specs.size(); ++i)
         for (size_t j = i + 1; j < specs.size(); ++j)
             if (specs[i].path == specs[j].path) {
@@ -610,6 +726,7 @@ bool ExpertTierSet::open(const std::vector<TierSpec>& specs, const TierIdentity&
     // §6.3: every header valid, the identity the same everywhere, the placement tables identical, fill_state 2.
     reused = true;
     const int entry_bytes = tier_placement_entry_bytes(id.n_layers, id.n_expert, (int) specs.size());
+    const uint64_t table_entry_bytes = striped_ ? striped_entry_bytes((uint32_t) specs.size()) : (uint64_t) entry_bytes;
     char pack_field[32], profile_field[32];
     id_to_field(id.pack_id, pack_field);
     id_to_field(id.profile_id, profile_field);
@@ -628,8 +745,26 @@ bool ExpertTierSet::open(const std::vector<TierSpec>& specs, const TierIdentity&
             reused = false;
             continue;
         }
-        if (h.n_layers != (uint64_t) id.n_layers || h.n_expert != (uint64_t) id.n_expert || h.version != kTierLayoutVersion) {
-            notes_.push_back("tier " + specs[i].path + ": header shape/version is for another model -> refill");
+        // the layout first: a tier written in the other layout is refilled, never read as this one (docs/EXPERT_TIER.md)
+        const uint32_t want_version = striped_ ? kTierLayoutVersionStriped : kTierLayoutVersion;
+        if (h.version != want_version) {
+            const bool other_layout = h.version == kTierLayoutVersion || h.version == kTierLayoutVersionStriped;
+            notes_.push_back("tier " + specs[i].path + ": " +
+                             (other_layout ? std::string("written in the ") + (h.version == kTierLayoutVersionStriped ? "striped" : "whole") +
+                                                 " layout, this start uses the " + (striped_ ? "striped" : "whole") + " layout"
+                                           : std::string("header version ") + std::to_string(h.version) + " is not read") +
+                             " -> refill");
+            reused = false;
+            continue;
+        }
+        if (striped_ && h.reserved0 != (uint32_t) stripe_bytes_) {
+            notes_.push_back("tier " + specs[i].path + ": stripe unit of " + std::to_string(h.reserved0 / 1024) + " KiB, this start uses " +
+                             std::to_string(stripe_bytes_ / 1024) + " KiB -> refill");
+            reused = false;
+            continue;
+        }
+        if (h.n_layers != (uint64_t) id.n_layers || h.n_expert != (uint64_t) id.n_expert) {
+            notes_.push_back("tier " + specs[i].path + ": header shape is for another model -> refill");
             reused = false;
             continue;
         }
@@ -643,7 +778,7 @@ bool ExpertTierSet::open(const std::vector<TierSpec>& specs, const TierIdentity&
             reused = false;
             continue;
         }
-        if (h.placement_len % (uint64_t) entry_bytes != 0) {
+        if (h.placement_len % table_entry_bytes != 0) {
             notes_.push_back("tier " + specs[i].path + ": placement table size does not match this shape -> refill");
             reused = false;
             continue;
@@ -675,11 +810,14 @@ bool ExpertTierSet::open(const std::vector<TierSpec>& specs, const TierIdentity&
     }
     if (reused) {
         std::vector<TierPlacementEntry> entries;
+        std::vector<StripedTableEntry> striped_entries;
         std::string why;
-        if (!decode_placement_table(tables[0].data(), tables[0].size(), entry_bytes, entries, why)) {
-            notes_.push_back("placement table: " + why + " -> refill");
-            reused = false;
-        } else if (!build_lookup(entries, entry_bytes, why)) {
+        const bool decoded = striped_
+            ? decode_striped_table(tables[0].data(), tables[0].size(), (uint32_t) specs.size(), striped_entries, why) &&
+                  build_lookup_striped(striped_entries, why)
+            : decode_placement_table(tables[0].data(), tables[0].size(), entry_bytes, entries, why) &&
+                  build_lookup(entries, entry_bytes, why);
+        if (!decoded) {
             notes_.push_back("placement table: " + why + " -> refill");
             clear_lookup();
             reused = false;
@@ -691,6 +829,12 @@ bool ExpertTierSet::open(const std::vector<TierSpec>& specs, const TierIdentity&
             for (const TierSpec& s : specs)
                 if (s.verify_full) { verify_chunks(); break; }
         }
+    }
+    if (striped_) {
+        char lbuf[160];
+        std::snprintf(lbuf, sizeof lbuf, "expert tier: striped layout, %llu KiB stripes over %zu devices (in the order given)",
+                      (unsigned long long) (stripe_bytes_ / 1024), tiers_.size());
+        notes_.push_back(lbuf);
     }
     for (size_t i = 0; i < tiers_.size(); ++i) {
         char buf[256];
@@ -705,6 +849,8 @@ bool ExpertTierSet::open(const std::vector<TierSpec>& specs, const TierIdentity&
 void ExpertTierSet::clear_lookup() {
     dev_of_.clear();
     off_of_.clear();
+    start_of_.clear();
+    soff_.clear();
     valid_.clear();
     data_off_.clear();
     used_.clear();
@@ -752,16 +898,67 @@ bool ExpertTierSet::build_lookup(const std::vector<TierPlacementEntry>& entries,
     return true;
 }
 
+// The striped form of build_lookup: the same checks on the entries' shape, and each expert's start device and per-device piece
+// offsets.  The data region of each device starts after the same header areas and tables as in the whole layout; its used
+// bytes are the furthest end of its pieces, which the chunk table then covers.
+bool ExpertTierSet::build_lookup_striped(const std::vector<StripedTableEntry>& entries, std::string& why) {
+    const uint32_t D = (uint32_t) tiers_.size();
+    const size_t total = (size_t) id_.n_layers * (size_t) id_.n_expert;
+    dev_of_.clear();
+    off_of_.clear();
+    start_of_.assign(total, -1);
+    soff_.assign(total * D, 0);
+    valid_.assign(total, 0);
+    data_off_.assign(D, 0);
+    used_.assign(D, 0);
+    bad_chunk_.assign(D, {});
+    bytes_held_ = 0;
+    experts_held_ = 0;
+    for (const auto& e : entries) {
+        if (e.layer < 0 || e.layer >= id_.n_layers || e.expert < 0 || e.expert >= id_.n_expert || e.start < 0 || (uint32_t) e.start >= D ||
+            e.offset.size() != D) {
+            why = "an entry names layer " + std::to_string(e.layer) + ", expert " + std::to_string(e.expert) + ", start device " +
+                  std::to_string(e.start) + " outside this start's shape";
+            return false;
+        }
+        const size_t idx = (size_t) e.layer * (size_t) id_.n_expert + (size_t) e.expert;
+        if (valid_[idx]) {
+            why = "layer " + std::to_string(e.layer) + ", expert " + std::to_string(e.expert) + " is placed twice";
+            return false;
+        }
+        const uint64_t bytes = id_.layer_blob_bytes[(size_t) e.layer];
+        start_of_[idx] = e.start;
+        valid_[idx] = 1;
+        ++experts_held_;
+        bytes_held_ += bytes;
+        for (uint32_t d = 0; d < D; ++d) {
+            soff_[idx * D + d] = e.offset[d];
+            const uint64_t len = striped_piece_bytes(bytes, stripe_bytes_, D, e.start, d);
+            if (len) used_[d] = std::max(used_[d], e.offset[d] + len);
+        }
+    }
+    const uint64_t placement_len = (uint64_t) entries.size() * striped_entry_bytes(D);
+    for (size_t d = 0; d < D; ++d) {
+        const uint64_t chunk_count = (used_[d] + kTierChunk - 1) / kTierChunk;
+        data_off_[d] = (2 * kTierHeaderArea + placement_len + chunk_count * 4 + kTierAlign - 1) / kTierAlign * kTierAlign;
+    }
+    return true;
+}
+
 // A reused placement is read straight out of the mapping, so before it is trusted every blob must lie inside its
 // device's configured capacity, and each device's chunk table must be where, and as long as, this start computes it.
+// (Each piece is checked on its own device: a striped expert's pieces sit on several devices.)
 bool ExpertTierSet::check_geometry(std::string& why) {
-    for (size_t idx = 0; idx < dev_of_.size(); ++idx) {
+    std::vector<TierPiece> pieces;
+    for (size_t idx = 0; idx < valid_.size(); ++idx) {
         if (!valid_[idx]) continue;
-        const size_t d = (size_t) dev_of_[idx];
-        const uint64_t bytes = id_.layer_blob_bytes[idx / (size_t) id_.n_expert];
-        if (data_off_[d] + off_of_[idx] + bytes > tiers_[d]->capacity() || data_off_[d] + off_of_[idx] + bytes > tiers_[d]->size()) {
-            why = tiers_[d]->path() + ": a blob reaches past the device's capacity";
-            return false;
+        pieces_of(idx, pieces);
+        for (const TierPiece& p : pieces) {
+            const uint64_t end = data_off_[p.dev] + p.off + p.len;
+            if (end > tiers_[p.dev]->capacity() || end > tiers_[p.dev]->size()) {
+                why = tiers_[p.dev]->path() + ": a blob reaches past the device's capacity";
+                return false;
+            }
         }
     }
     for (size_t d = 0; d < tiers_.size(); ++d) {
@@ -807,31 +1004,42 @@ void ExpertTierSet::verify_chunks() {
         notes_.push_back(buf);
         tiers_[d]->note_refill();
     }
-    // invalidate every held entry that touches a bad chunk (§6.4: the blob is served from the file tier instead)
-    for (size_t idx = 0; idx < dev_of_.size(); ++idx) {
-        if (dev_of_[idx] < 0 || !valid_[idx]) continue;
-        const size_t d = (size_t) dev_of_[idx];
-        if (bad_chunk_[d].empty()) continue;
-        const uint64_t bytes = id_.layer_blob_bytes[idx / (size_t) id_.n_expert];
-        const uint64_t lo = off_of_[idx], hi = off_of_[idx] + bytes;
-        for (uint64_t c = lo / kTierChunk; c * kTierChunk < hi; ++c)
-            if (c < bad_chunk_[d].size() && bad_chunk_[d][(size_t) c]) { valid_[idx] = 0; break; }
+    // invalidate every held entry that touches a bad chunk (§6.4: the blob is served from the file tier instead). A striped
+    // expert is invalid when any one of its pieces touches a bad chunk: its blob is then not whole on the devices.
+    // The experts_held / bytes_held counts drop with them: they describe what the tier still serves (the startup log's shares).
+    std::vector<TierPiece> pieces;
+    for (size_t idx = 0; idx < valid_.size(); ++idx) {
+        if (!valid_[idx]) continue;
+        pieces_of(idx, pieces);
+        bool touched = false;
+        for (const TierPiece& p : pieces) {
+            if (bad_chunk_[p.dev].empty()) continue;
+            const uint64_t lo = p.off, hi = p.off + p.len;
+            for (uint64_t c = lo / kTierChunk; c * kTierChunk < hi && !touched; ++c)
+                touched = c < bad_chunk_[p.dev].size() && bad_chunk_[p.dev][(size_t) c];
+            if (touched) break;
+        }
+        if (!touched) continue;
+        valid_[idx] = 0;
+        --experts_held_;
+        bytes_held_ -= id_.layer_blob_bytes[idx / (size_t) id_.n_expert];
     }
 }
 
 ExpertTier::~ExpertTier() { close(); }
-
-static uint64_t entries_bytes(const std::vector<TierPlacementEntry>& entries, const TierIdentity& id) {
-    uint64_t total = 0;
-    for (const auto& e : entries) total += id.layer_blob_bytes[(size_t) e.layer];
-    return total;
-}
 
 bool ExpertTierSet::fill(ExpertSource& src, const std::vector<std::pair<int32_t, int32_t>>& ranked_rest,
                          const TierIdentity& id, std::string& err) {
     id_ = id;
     if (tiers_.empty()) { err = "expert tier fill: the tier is not open"; return false; }
     const int entry_bytes = tier_placement_entry_bytes(id.n_layers, id.n_expert, (int) tiers_.size());
+    const uint32_t D = (uint32_t) tiers_.size();
+    const uint64_t table_entry_bytes = striped_ ? striped_entry_bytes(D) : (uint64_t) entry_bytes;
+    if (striped_ && (D < 2 || D > kTierStripedMaxDevices || stripe_bytes_ == 0 || stripe_bytes_ % kTierAlign != 0)) {
+        err = "expert tier fill: the striped layout needs 2 to " + std::to_string(kTierStripedMaxDevices) +
+              " devices and a stripe unit that is a multiple of 4 KiB";
+        return false;
+    }
     if (id.layer_blob_bytes.size() < (size_t) id.n_layers) { err = "expert tier fill: the layout is missing blob sizes"; return false; }
 
     // §5.2: the header areas, the placement table and the chunk table are overhead on the device; the planner
@@ -840,7 +1048,7 @@ bool ExpertTierSet::fill(ExpertSource& src, const std::vector<std::pair<int32_t,
     for (const auto& pr : ranked_rest)
         min_blob = std::min(min_blob, id.layer_blob_bytes[(size_t) pr.first]);
     if (ranked_rest.empty()) min_blob = 0;
-    const uint64_t placement_max = (uint64_t) ranked_rest.size() * (uint64_t) entry_bytes;
+    const uint64_t placement_max = (uint64_t) ranked_rest.size() * table_entry_bytes;
     std::vector<TierDevice> devices(tiers_.size());
     for (size_t d = 0; d < tiers_.size(); ++d) {
         const uint64_t cap = tiers_[d]->capacity();
@@ -850,17 +1058,63 @@ bool ExpertTierSet::fill(ExpertSource& src, const std::vector<std::pair<int32_t,
         const uint64_t overhead = (2 * kTierHeaderArea + placement_max + chunk_max * 4 + kTierAlign - 1) / kTierAlign * kTierAlign;
         devices[d].capacity_bytes = cap > overhead ? cap - overhead : 0;
     }
-    const auto pl = plan_expert_tiers(ranked_rest, id.layer_blob_bytes, devices);
-
-    // the placement table: tier-held entries in rank order, identical on every device (§6.1)
-    std::vector<TierPlacementEntry> entries;
+    // The committed experts in rank order, each with its pieces. The whole layout puts a blob on one device; the striped layout
+    // cuts it over all of them. `used[d]` is the end of what device d holds in its data region.
+    struct Commit {
+        int64_t layer, expert;
+        int32_t start;                    // striped: the rotation's first device (-1: whole, unused)
+        std::vector<TierPiece> pieces;    // one per device that holds bytes of the expert (whole: its one device)
+    };
+    std::vector<Commit> commits;
     std::vector<uint64_t> used(tiers_.size(), 0);
+    std::vector<StripedPlacement> spl;
+    std::vector<TierPlacement> pl;
+    if (striped_) spl = plan_expert_tiers_striped(ranked_rest, id.layer_blob_bytes, devices, stripe_bytes_);
+    else pl = plan_expert_tiers(ranked_rest, id.layer_blob_bytes, devices);
     for (size_t i = 0; i < ranked_rest.size(); ++i) {
-        if (pl[i].device < 0) continue;
-        entries.push_back({ranked_rest[i].first, ranked_rest[i].second, pl[i].device, pl[i].offset});
-        used[(size_t) pl[i].device] = std::max(used[(size_t) pl[i].device], pl[i].offset + id.layer_blob_bytes[(size_t) ranked_rest[i].first]);
+        const int64_t l = ranked_rest[i].first, e = ranked_rest[i].second;
+        const uint64_t bytes = id.layer_blob_bytes[(size_t) l];
+        Commit c{l, e, -1, {}};
+        if (striped_) {
+            if (spl[i].start < 0) continue;
+            c.start = spl[i].start;
+            for (uint32_t d = 0; d < D; ++d) {
+                const uint64_t len = striped_piece_bytes(bytes, stripe_bytes_, D, c.start, d);
+                if (len == 0) continue;
+                c.pieces.push_back({d, spl[i].offset[d], len});
+                used[d] = std::max(used[d], spl[i].offset[d] + len);
+            }
+        } else {
+            if (pl[i].device < 0) continue;
+            c.pieces.push_back({(size_t) pl[i].device, pl[i].offset, bytes});
+            used[(size_t) pl[i].device] = std::max(used[(size_t) pl[i].device], pl[i].offset + bytes);
+        }
+        commits.push_back(std::move(c));
     }
-    const uint64_t placement_bytes = (uint64_t) entries.size() * (uint64_t) entry_bytes;
+
+    // the placement table: the committed experts in rank order, identical on every device (§6.1)
+    const uint64_t placement_bytes = (uint64_t) commits.size() * table_entry_bytes;
+    std::vector<uint8_t> placement_table;
+    if (striped_) {
+        std::vector<StripedTableEntry> se;
+        se.reserve(commits.size());
+        for (const Commit& c : commits) {
+            StripedTableEntry t;
+            t.layer = (int32_t) c.layer;
+            t.expert = (int32_t) c.expert;
+            t.start = c.start;
+            t.offset.assign(D, 0);
+            for (const TierPiece& p : c.pieces) t.offset[p.dev] = p.off;
+            se.push_back(std::move(t));
+        }
+        placement_table = encode_striped_table(se, D);
+    } else {
+        std::vector<TierPlacementEntry> te;
+        te.reserve(commits.size());
+        for (const Commit& c : commits)
+            te.push_back({(int32_t) c.layer, (int32_t) c.expert, (int32_t) c.pieces[0].dev, c.pieces[0].off});
+        placement_table = encode_placement_table(te, entry_bytes);
+    }
     std::vector<uint32_t> chunk_count(tiers_.size(), 0);
     for (size_t d = 0; d < tiers_.size(); ++d) chunk_count[d] = (uint32_t) ((used[d] + kTierChunk - 1) / kTierChunk);
 
@@ -878,11 +1132,11 @@ bool ExpertTierSet::fill(ExpertSource& src, const std::vector<std::pair<int32_t,
         data_off_[d] = (2 * kTierHeaderArea + placement_bytes + (uint64_t) chunk_count[d] * 4 + kTierAlign - 1) / kTierAlign * kTierAlign;
 
     // pass 1: identity headers with fill_state = 1, so a fill interrupted anywhere is found and refilled (§6.4)
-    const std::vector<uint8_t> placement_table = encode_placement_table(entries, entry_bytes);
     for (size_t d = 0; d < tiers_.size(); ++d) {
         TierHeader h{};
         std::memcpy(h.magic, kTierMagic, 8);
-        h.version = kTierLayoutVersion;
+        h.version = striped_ ? kTierLayoutVersionStriped : kTierLayoutVersion;
+        h.reserved0 = striped_ ? (uint32_t) stripe_bytes_ : 0;   // the stripe unit (striped); whole tiers keep 0
         h.device_index = (uint32_t) d;
         h.device_count = (uint32_t) tiers_.size();
         id_to_field(id.pack_id, h.pack_id);
@@ -914,23 +1168,28 @@ bool ExpertTierSet::fill(ExpertSource& src, const std::vector<std::pair<int32_t,
     for (size_t d = 0; d < tiers_.size(); ++d) crcs.emplace_back((size_t) chunk_count[d]);
     std::vector<uint64_t> cursor(tiers_.size(), 0);
     const auto t0 = std::chrono::steady_clock::now();
-    for (const auto& e : entries) {
-        uint8_t* dev_base = (uint8_t*) tiers_[(size_t) e.device]->base();
-        const uint64_t bytes = id.layer_blob_bytes[(size_t) e.layer];
-        if (!src.copy_blob(e.layer, e.expert, stage.data())) {
-            err = "expert tier fill: the file tier cannot serve (layer " + std::to_string(e.layer) + ", expert " + std::to_string(e.expert) + ")";
+    // Each committed expert is read once (copy_blob), then its pieces are written to their devices: a whole blob to its one
+    // device, or its stripes to each device in turn. A device's pieces come in offset order (the planner's cursor per device),
+    // so the chunk CRCs are fed in the bytes' order, the gaps as zeros.
+    for (const Commit& c : commits) {
+        const uint64_t bytes = id.layer_blob_bytes[(size_t) c.layer];
+        if (!src.copy_blob(c.layer, c.expert, stage.data())) {
+            err = "expert tier fill: the file tier cannot serve (layer " + std::to_string(c.layer) + ", expert " + std::to_string(c.expert) + ")";
             abandon();
             return false;
         }
-        if (e.offset > cursor[(size_t) e.device]) {
-            uint8_t* gap = dev_base + (size_t) (data_off_[(size_t) e.device] + cursor[(size_t) e.device]);
-            std::memset(gap, 0, (size_t) (e.offset - cursor[(size_t) e.device]));
-            crcs[(size_t) e.device].feed(gap, (size_t) (e.offset - cursor[(size_t) e.device]));
+        for (const TierPiece& p : c.pieces) {
+            uint8_t* dev_base = (uint8_t*) tiers_[p.dev]->base();
+            if (p.off > cursor[p.dev]) {
+                uint8_t* gap = dev_base + (size_t) (data_off_[p.dev] + cursor[p.dev]);
+                std::memset(gap, 0, (size_t) (p.off - cursor[p.dev]));
+                crcs[p.dev].feed(gap, (size_t) (p.off - cursor[p.dev]));
+            }
+            uint8_t* dst = dev_base + (size_t) (data_off_[p.dev] + p.off);
+            move_piece(striped_, stripe_bytes_, D, c.start, p.dev, bytes, stage.data(), dst, true);
+            crcs[p.dev].feed(dst, (size_t) p.len);
+            cursor[p.dev] = p.off + p.len;
         }
-        uint8_t* dst = dev_base + (size_t) (data_off_[(size_t) e.device] + e.offset);
-        std::memcpy(dst, stage.data(), (size_t) bytes);
-        crcs[(size_t) e.device].feed(dst, (size_t) bytes);
-        cursor[(size_t) e.device] = e.offset + bytes;
     }
 
     // §6.4's write order: the data, the placement table and the chunk checksums of EVERY device are on the disk (flushed, the
@@ -962,14 +1221,33 @@ bool ExpertTierSet::fill(ExpertSource& src, const std::vector<std::pair<int32_t,
     }
 
     fill_s_ = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    fill_b_ = entries_bytes(entries, id);
+    fill_b_ = 0;
+    for (const Commit& c : commits) fill_b_ += id.layer_blob_bytes[(size_t) c.layer];
+    // the lookup comes from the table just written, read back the way a reuse reads it (§6.3), so both paths agree
     std::string lwhy;
-    if (!build_lookup(entries, entry_bytes, lwhy)) { err = "expert tier fill: the placement just written is not usable: " + lwhy; clear_lookup(); return false; }
+    std::vector<TierPlacementEntry> te;
+    std::vector<StripedTableEntry> se;
+    const bool built = striped_
+        ? decode_striped_table(placement_table.data(), placement_table.size(), D, se, lwhy) && build_lookup_striped(se, lwhy)
+        : decode_placement_table(placement_table.data(), placement_table.size(), entry_bytes, te, lwhy) &&
+              build_lookup(te, entry_bytes, lwhy);
+    if (!built) { err = "expert tier fill: the placement just written is not usable: " + lwhy; clear_lookup(); return false; }
+    if (striped_) {   // what the layout did, per device: the smallest device sets the stripe deal, the rest of the larger ones stay unused
+        char buf[320];
+        for (size_t d = 0; d < tiers_.size(); ++d) {
+            const double usable = (double) devices[d].capacity_bytes, held = (double) used[d];
+            std::snprintf(buf, sizeof buf, "expert tier: %s stripes use %.2f GiB of %.2f GiB usable (%.2f GiB unused)",
+                          tiers_[d]->path().c_str(), held / 1073741824.0, usable / 1073741824.0,
+                          (usable - held > 0 ? usable - held : 0.0) / 1073741824.0);
+            notes_.push_back(buf);
+        }
+    }
     return true;
 }
 
 const uint8_t* ExpertTierSet::blob(int64_t layer, int64_t expert) const {
-    if (layer < 0 || expert < 0 || layer >= id_.n_layers || expert >= id_.n_expert || dev_of_.empty()) return nullptr;
+    // a striped expert has no contiguous blob in any one mapping: the callers that need a pointer read it from the file tier
+    if (striped_ || layer < 0 || expert < 0 || layer >= id_.n_layers || expert >= id_.n_expert || dev_of_.empty()) return nullptr;
     const size_t idx = (size_t) layer * (size_t) id_.n_expert + (size_t) expert;
     if (dev_of_[idx] < 0 || !valid_[idx]) return nullptr;
     const size_t d = (size_t) dev_of_[idx];
@@ -996,10 +1274,58 @@ void ExpertTierSet::set_worker_cap(int n) { worker_cap_ = n < 1 ? 1 : n; }
 
 // §7.3: the prompt path's tier share.  One worker thread per device, up to the cap, each copying its device's
 // share of the batch in layer order; the parallelism across devices is the point (§7.3, §12.4).
+// The striped share of a batch: every held expert's stripes are gathered from the devices that hold them. The work is split by
+// device (one worker per device, up to the cap, each doing that device's pieces of every expert), so the devices read in
+// parallel; all workers are joined before the call returns, so each dst is complete.
+bool ExpertTierSet::copy_blobs_striped(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, size_t n,
+                                       uint64_t& bytes_out) {
+    bytes_out = 0;
+    const uint32_t D = (uint32_t) tiers_.size();
+    struct Task { size_t i; size_t idx; };   // batch entry i, its lookup index
+    std::vector<std::vector<Task>> by_dev(D);
+    uint64_t total = 0;
+    std::vector<TierPiece> pieces;
+    for (size_t i = 0; i < n; ++i) {
+        const int64_t l = layers[i], e = experts[i];
+        if (l < 0 || e < 0 || l >= id_.n_layers || e >= id_.n_expert || dst[i] == nullptr) return false;
+        if (!held(l, e)) return false;   // the caller routes non-held blobs to the file path
+        const size_t idx = (size_t) l * (size_t) id_.n_expert + (size_t) e;
+        total += id_.layer_blob_bytes[(size_t) l];
+        pieces_of(idx, pieces);
+        for (const TierPiece& p : pieces) by_dev[p.dev].push_back({i, idx});
+    }
+    std::vector<std::thread> workers;
+    for (uint32_t d = 0; d < D; ++d) {
+        auto& list = by_dev[d];
+        if (list.empty()) continue;
+        // layer order for the device's share, as the whole layout does
+        std::sort(list.begin(), list.end(), [&](const Task& a, const Task& b) { return a.idx < b.idx; });
+        const int w = std::min<int>(worker_cap_, (int) list.size());
+        for (int t = 0; t < w; ++t) {
+            workers.emplace_back([this, d, D, &list, t, w, layers, experts, dst] {
+                for (size_t j = (size_t) t; j < list.size(); j += (size_t) w) {
+                    const Task& k = list[j];
+                    const int32_t start = start_of_[k.idx];
+                    const uint64_t bytes = id_.layer_blob_bytes[(size_t) layers[k.i]];
+                    const uint64_t len = striped_piece_bytes(bytes, stripe_bytes_, D, start, d);
+                    const uint8_t* b = tiers_[d]->base();
+                    if (b == nullptr || len == 0) continue;
+                    uint8_t* piece = (uint8_t*) (b + data_off_[d] + soff_[k.idx * D + d]);
+                    move_piece(true, stripe_bytes_, D, start, d, bytes, dst[k.i], piece, false);
+                }
+            });
+        }
+    }
+    for (auto& w : workers) w.join();
+    bytes_out = total;
+    return true;
+}
+
 bool ExpertTierSet::copy_blobs(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, size_t n,
                                uint64_t& bytes_out) {
     bytes_out = 0;
     if (tiers_.empty()) return false;
+    if (striped_) return copy_blobs_striped(layers, experts, dst, n, bytes_out);
     std::vector<std::vector<size_t>> by_dev(tiers_.size());
     for (size_t i = 0; i < n; ++i) {
         const int64_t l = layers[i], e = experts[i];

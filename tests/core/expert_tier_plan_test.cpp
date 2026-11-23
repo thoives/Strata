@@ -3,7 +3,9 @@
 // runs anywhere (§10: development without hardware).
 #include "strata/core/expert_tier_plan.hpp"
 
+#include <algorithm>
 #include <cstdint>
+#include <random>
 #include <set>
 #include <iostream>
 #include <stdexcept>
@@ -238,6 +240,137 @@ static void test_ranked_rest_with_a_profile() {
     require(r2.size() == 10, "profile of held experts only: the tier lost the rest");
 }
 
+
+// ---- the striped layout (docs/EXPERT_TIER.md, "The layout") ----------------------------------------------------------
+
+// striped_piece_bytes agrees with a plain enumeration of the stripes for every blob, stripe, device count and start,
+// and the pieces of one blob add up to the blob.
+static void test_striped_pieces_match_enumeration() {
+    for (uint64_t blob : {1ull, 4095ull, 4096ull, 4097ull, 12288ull, 12289ull, 40000ull, 262244ull}) {
+        for (uint64_t S : {4096ull, 8192ull, 65536ull}) {
+            for (uint32_t D = 1; D <= 5; ++D) {
+                for (int32_t start = 0; start < (int32_t) D; ++start) {
+                    std::vector<uint64_t> manual(D, 0);
+                    const uint64_t n = (blob + S - 1) / S;
+                    for (uint64_t k = 0; k < n; ++k) manual[(size_t) ((start + k) % D)] += std::min<uint64_t>(S, blob - k * S);
+                    uint64_t total = 0;
+                    for (uint32_t d = 0; d < D; ++d) {
+                        const uint64_t got = striped_piece_bytes(blob, S, D, start, d);
+                        require(got == manual[d], "a piece differs from the stripe enumeration");
+                        total += got;
+                    }
+                    require(total == blob, "the pieces do not add up to the blob");
+                }
+            }
+        }
+    }
+    require(striped_piece_bytes(0, 4096, 2, 0, 0) == 0, "a zero blob has no pieces");
+    require(striped_piece_bytes(100, 4096, 2, 2, 0) == 0, "a start device outside the set has no pieces");
+    require(striped_piece_bytes(100, 4096, 2, 0, 2) == 0, "a device outside the set has no piece");
+}
+
+// Two devices, 4 KiB stripes, 3-stripe blobs: expert i starts on device i mod 2; each device's pieces follow the one before.
+static void test_striped_rotation_and_offsets() {
+    const std::vector<uint64_t> blob(2, 3 * 4096);
+    const std::vector<std::pair<int32_t, int32_t>> r = {{0, 0}, {0, 1}, {1, 0}};
+    const auto p = plan_expert_tiers_striped(r, blob, devs({1u << 20, 1u << 20}), 4096);
+    // expert 0 (start 0): device 0 holds stripes 0 and 2 (8 KiB) at 0; device 1 holds stripe 1 (4 KiB) at 0
+    require(p[0].start == 0 && p[0].offset[0] == 0 && p[0].offset[1] == 0, "expert 0 placement");
+    // expert 1 (start 1): device 1 holds stripes 0 and 2 (8 KiB) at 4096; device 0 holds stripe 1 at 8192
+    require(p[1].start == 1 && p[1].offset[1] == 4096 && p[1].offset[0] == 8192, "expert 1 placement");
+    // expert 2 (start 0): device 0 at 12288, device 1 at 12288
+    require(p[2].start == 0 && p[2].offset[0] == 12288 && p[2].offset[1] == 12288, "expert 2 placement");
+}
+
+// A blob no longer than one stripe takes one device: the rotation spreads such experts over the devices in turn.
+static void test_striped_short_blobs_take_one_device() {
+    const std::vector<uint64_t> blob(1, 4096);
+    const std::vector<std::pair<int32_t, int32_t>> r = {{0, 0}, {0, 1}, {0, 2}, {0, 3}};
+    const auto p = plan_expert_tiers_striped(r, blob, devs({1u << 20, 1u << 20, 1u << 20}), 4096);
+    for (size_t i = 0; i < r.size(); ++i)
+        require(p[i].start == (int32_t) (i % 3), "a short blob's start device does not rotate");
+    // experts 0 and 3 share device 0 (4 KiB each): the second one follows the first; the other devices hold nothing of them
+    require(p[0].offset[0] == 0 && p[3].offset[0] == 4096, "the second expert on a device does not follow the first");
+    require(p[1].offset[1] == 0 && p[2].offset[2] == 0, "a short blob's first device is not where its piece sits");
+    require(p[0].offset[1] == 0 && p[0].offset[2] == 0, "a short blob's other devices were given an offset");
+}
+
+// The deal stops at the first expert that does not fit every one of its pieces, and never skips ahead to a smaller one.
+static void test_striped_stop_is_a_prefix() {
+    // a 2-stripe blob each (8 KiB); 12 KiB per device: three experts fit, the fourth does not
+    std::vector<uint64_t> blob(1, 8192);
+    std::vector<std::pair<int32_t, int32_t>> r = {{0, 0}, {0, 1}, {0, 2}, {0, 3}, {0, 4}};
+    auto p = plan_expert_tiers_striped(r, blob, devs({12288, 12288}), 4096);
+    size_t placed = 0;
+    for (; placed < r.size() && p[placed].start >= 0; ++placed) {}
+    require(placed == 3, "three 8 KiB experts should fit 12 KiB devices");
+    for (size_t i = placed; i < r.size(); ++i) require(p[i].start < 0, "an expert after the stop was placed");
+
+    // a big expert that does not fit stops the deal: the smaller colder one after it stays on the file tier
+    const std::vector<uint64_t> two = {1u << 20, 4096};
+    const std::vector<std::pair<int32_t, int32_t>> rr = {{0, 0}, {1, 0}};
+    const auto q = plan_expert_tiers_striped(rr, two, devs({65536, 65536}), 4096);
+    require(q[0].start < 0 && q[1].start < 0, "a colder expert was placed before a hotter one that does not fit");
+}
+
+// No device is dropped: a device that cannot take a piece stops the deal, and a zero-capacity device places nothing.
+static void test_striped_no_device_is_dropped() {
+    const std::vector<uint64_t> blob(1, 3 * 4096);
+    const std::vector<std::pair<int32_t, int32_t>> r = {{0, 0}, {0, 1}};
+    const auto zero = plan_expert_tiers_striped(r, blob, devs({0, 1u << 20}), 4096);
+    require(zero[0].start < 0 && zero[1].start < 0, "a zero-capacity device must stop the striped deal, not be skipped");
+    const auto tiny = plan_expert_tiers_striped(r, blob, devs({4096, 1u << 20}), 4096);
+    require(tiny[0].start < 0, "a device too small for its piece must stop the deal");
+}
+
+// Invalid arguments place nothing: a stripe that is not a 4 KiB multiple, no devices, no blobs.
+static void test_striped_invalid_arguments_place_nothing() {
+    const std::vector<uint64_t> blob(1, 8192);
+    const std::vector<std::pair<int32_t, int32_t>> r = {{0, 0}};
+    for (const auto& p : plan_expert_tiers_striped(r, blob, devs({1u << 20, 1u << 20}), 1000)) require(p.start < 0, "a stripe of 1000 bytes was placed");
+    for (const auto& p : plan_expert_tiers_striped(r, blob, devs({}), 4096)) require(p.start < 0, "no devices placed an expert");
+    for (const auto& p : plan_expert_tiers_striped({}, blob, devs({1u << 20}), 4096)) require(p.start < 0, "nothing ranked placed");
+}
+
+// Random shapes: every piece is 4 KiB aligned, fits its device, never overlaps another piece on its device; placed experts are
+// a prefix of the ranked list; the pieces of each expert add up to its blob.
+static void test_striped_fuzz_never_overfills() {
+    std::mt19937 rng(20261123);
+    for (int round = 0; round < 300; ++round) {
+        const uint32_t D = 1 + rng() % 4;
+        const uint64_t S = std::vector<uint64_t>{4096, 8192, 65536}[rng() % 3];
+        std::vector<uint64_t> blob(4);
+        for (auto& b : blob) b = 1 + rng() % 300000;
+        std::vector<TierDevice> dv(D);
+        for (auto& d : dv) d.capacity_bytes = rng() % 2000000;
+        std::vector<std::pair<int32_t, int32_t>> r;
+        for (int i = 0; i < 60; ++i) r.push_back({(int32_t) (rng() % 4), (int32_t) (rng() % 16)});
+        const auto p = plan_expert_tiers_striped(r, blob, dv, S);
+        require(p.size() == r.size(), "one placement per ranked expert");
+        bool stopped = false;
+        std::vector<std::vector<std::pair<uint64_t, uint64_t>>> spans(D);   // per device: [offset, offset + len)
+        for (size_t i = 0; i < r.size(); ++i) {
+            if (p[i].start < 0) { stopped = true; continue; }
+            require(!stopped, "an expert was placed after the deal stopped");
+            const uint64_t bytes = blob[(size_t) r[i].first];
+            uint64_t total = 0;
+            for (uint32_t d = 0; d < D; ++d) {
+                const uint64_t len = striped_piece_bytes(bytes, S, D, p[i].start, d);
+                total += len;
+                if (len == 0) continue;
+                require(p[i].offset[d] % 4096 == 0, "a piece offset is not 4 KiB aligned");
+                require(p[i].offset[d] + len <= dv[d].capacity_bytes, "a piece reaches past its device's capacity");
+                spans[d].push_back({p[i].offset[d], p[i].offset[d] + len});
+            }
+            require(total == bytes, "an expert's pieces do not add up to its blob");
+        }
+        for (auto& sp : spans) {
+            std::sort(sp.begin(), sp.end());
+            for (size_t j = 1; j < sp.size(); ++j) require(sp[j - 1].second <= sp[j].first, "two pieces overlap on one device");
+        }
+    }
+}
+
 int main() {
     try {
         test_empty();
@@ -255,6 +388,13 @@ int main() {
         test_fuzz_never_overfills();
         test_ranked_rest_without_a_profile();
         test_ranked_rest_with_a_profile();
+        test_striped_pieces_match_enumeration();
+        test_striped_rotation_and_offsets();
+        test_striped_short_blobs_take_one_device();
+        test_striped_stop_is_a_prefix();
+        test_striped_no_device_is_dropped();
+        test_striped_invalid_arguments_place_nothing();
+        test_striped_fuzz_never_overfills();
         std::cout << "expert_tier_plan_test: PASS\n";
         return 0;
     } catch (const std::exception& error) {

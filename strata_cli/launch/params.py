@@ -241,6 +241,9 @@ DSV41_FLAGS = {
     "--expert-tier": ("PATH,mib=N[,reserve=M][,verify=header|full]",
                      "The experts your card and RAM do not keep are written there once and read from that device after the fill "
                      "(docs/EXPERT_TIER_DSV41_PLAN.md)."),
+    "--expert-tier-layout": ("whole|striped", "How the expert tier spreads each expert over its devices: whole (the default, one device "
+                                              "per expert) or striped (cut over all of them; Qwen engine; docs/EXPERT_TIER.md)."),
+    "--expert-tier-stripe-kib": ("KIB", "The stripe unit of a striped expert tier, a multiple of 4 KiB from 4 to 16384 (default 256)."),
     "--ssd-policy": ("lru|lfu|lfulru", "Which experts the RAM store drops first."),
     "--prefill-chunk": ("N", "How many prompt words are read at once (the fast prompt path)."),
     "--threads": ("on|off", "Read long prompts layer by layer on all CPU threads."),

@@ -5888,6 +5888,7 @@ struct Model::Impl {
         for (const std::string& f : strata::core::tier_pack_files(pk.dir)) protect.push_back(f);
         if (!o.profile.empty() && o.profile != "none") protect.push_back(o.profile);
         auto tt = std::make_unique<ExpertTierSet>();
+        tt->set_layout(o.expert_tier_striped, (uint64_t) o.expert_tier_stripe_kib * 1024);   // (before open: a striped tier's header says so)
         if (!tt->open(specs, err, protect)) { std::fprintf(stderr, "ds4: expert tier: %s\n", err.c_str()); std::exit(2); }
         tier = std::move(tt);
         // §5.2's guards: the VRAM share counts only when --vram-experts was given (auto promises nothing: the tier
@@ -5939,19 +5940,34 @@ struct Model::Impl {
                         [this](int dev) { return tier->queue(dev); },
                         [this](int dev) { tier->note_refill(dev); },
                         [this]() { if (tier) tier->drain(); });   // (the store's destructor: every queued tier copy lands before the arena is released)
-        // DS4_TIER_DIRECT (opt-in, Linux; ds4_tier.hpp): a tier hit may be one whole-slot unbuffered read into the store's slot.
+        // DS4_TIER_DIRECT (opt-in, Linux; ds4_tier.hpp): a tier hit may use unbuffered reads into the store's slot.
         // The arena is then not inherited by a fork (MADV_DONTFORK): a direct read into private memory that a fork shares can
         // land in the wrong copy.  Set here, before any read: the tier's devices are open and known to be direct or mapped.
+        // the striped tier's stripes (stripe_refs answers only for a striped tier: the whole layout keeps its path)
+        store->set_tier_stripes([this](int layer, int e, std::vector<ExpertStore::TierStripe>& out) {
+            std::vector<ExpertTierSet::StripeRef> refs;
+            if (!tier || !tier->stripe_refs(layer, e, refs)) return false;
+            out.clear();
+            for (const auto& r : refs) out.push_back(ExpertStore::TierStripe{ r.dev, r.src, r.blob_off, r.len, r.device_off });
+            return true;
+        });
         if (tier->direct_active()) {   // (mode off, or no device direct: no hook, the path is the mapped one as before)
-            if (store->no_fork_arena())
+            if (store->no_fork_arena()) {
                 store->set_tier_direct([this](int dev, uint64_t slot, ExpertStore::TierDirect& out) { return tier->direct_slot(dev, slot, out); });
-            else
+                store->set_tier_stripe_direct([this](int dev, uint64_t off, uint64_t len, ExpertStore::TierDirect& out) {
+                    return tier->direct_stripe(dev, off, len, out);
+                });
+            } else
                 std::fprintf(stderr, "ds4: expert tier: DS4_TIER_DIRECT: the RAM store's arena could not be kept from forks: every tier hit stays a mapped copy\n");
         }
         if (tier->tracing()) {
             store->set_tier_trace(
                 [this](int dev, uint64_t bytes, bool demand) { tier->note_copy_start(dev, bytes, demand); },
                 [this](int dev, uint64_t ns) { tier->note_copy_wait(dev, ns); });
+            if (tier->striped()) store->set_tier_striped_trace([this](bool demand, bool direct, bool mapped) {
+                tier->note_striped_hit(demand, direct, mapped);
+            });
+
         }
     }
     // §9: the fill reads every tier-held expert once from the model's files onto its device: rank order, on the
@@ -11332,11 +11348,14 @@ const Stats& Model::stats() const {
         st.tier_experts = p_->tier->experts_held();
         st.tier_devices = (int64_t) p_->tier->device_count();
         st.tier_fill_s = p_->tier_fill_s;
+        st.tier_striped = p_->tier->striped();
+        st.tier_striped_hits = p_->tier->striped_hit_stats();
         st.tier_dev_stats.clear();
         if (p_->tier->tracing()) {   // (the normal path allocates nothing: these counters exist only under DS4_TIER_LOG)
             for (const ExpertTierSet::DeviceStats& d : p_->tier->stats()) {
                 TierDeviceStats x;
                 x.path = d.path;
+                x.stripe = d.stripe;
                 x.started_experts = (int64_t) d.started_experts;
                 x.started_bytes = (int64_t) d.started_bytes;
                 x.demand_experts = (int64_t) d.demand_experts;

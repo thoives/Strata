@@ -122,7 +122,10 @@ See [connection instructions and limits](TERMINAL_LAUNCH.md#connect-your-apps-st
 
 A model's experts can sit in four places at once: the GPU's cache, a copy in RAM, an optional expert tier on a disk device
 the user gives (`--expert-tier PATH,mib=N[,reserve=M][,verify=header|full]`, repeated once per device, in order), and the
-file tier (the model files themselves). Without an expert tier nothing about the tier applies: every path is byte-identical
+file tier (the model files themselves). With two or more devices, `--expert-tier-layout whole|striped` chooses how each expert is
+spread (whole is the default; striped, with `--expert-tier-stripe-kib N`, is opt-in for Qwen and DeepSeek). Reads can gather
+striped experts from the tier; some Qwen paths still use the files. See [EXPERT_TIER.md](EXPERT_TIER.md#the-layout-whole-or-striped-opt-in).
+Without an expert tier nothing about the tier applies: every path is byte-identical
 to earlier engines. Setup never adds devices by itself: the user chooses them; setup checks each device (its size must cover
 `mib`), reports whether an existing header will be reused or refilled, and recommends tier capacity only as an option
 when the model would otherwise read much of its experts from the SSD. The first start writes over each device. An agent

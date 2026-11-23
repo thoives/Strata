@@ -6,6 +6,7 @@
 // DS4_TIER_DIRECT (opt-in, Linux): the read policy with injected errno values and short reads, the store and queue on a forced
 // direct tier (any filesystem), and a real O_DIRECT read of the tier's slots.  The real read is SKIPPED (reported, not counted)
 // where the test directory refuses O_DIRECT reads or the device gives no alignment; set DS4_TIER_TEST_DIR to one that does.
+// Striped direct reads: forced direct descriptors exercise both devices, refusal and failure; a real O_DIRECT case skips when unavailable.
 // DS4_TIER_WAKE (opt-in): IoQueue::wait_until_zero on a bare queue (a partial completion, a lost notification, a completion just
 // before the sleep), and the store's wait_slots() on a held tier queue - the mapped copies and the direct read - which must
 // wait on the device's queue (and on the store's queue with the switch off), end only with its own slot, and fall back to the
@@ -343,6 +344,25 @@ struct SlotWaitScope {
 
 // The wait on a bare queue: no store, no tier, no files.  A mem job is a plain copy that counts its `left` down.
 static void queue_wait_checks() {
+    {   // Both kinds of stripe can be cancelled without running; their range bytes are still accounted for.
+        strata::ds4::TierIoStats trace;
+        IoQueue q(1, &trace);
+        std::atomic<bool> cancel{true};
+        std::atomic<int> left{2};
+        IoQueue::Job j[2];
+        j[0].tier_stripe = j[1].tier_stripe = true;
+        j[1].tier_direct = true;
+        j[0].len = 4096; j[1].len = 8192;
+        for (auto& x : j) { x.cancel = &cancel; x.left = &left; }
+        q.push(j, 2);
+        CHECK(q.wait_until_zero(left, 5'000'000));
+        const auto st = trace.stripe.snapshot();
+        CHECK(st.mapped_submitted.jobs == 1 && st.mapped_submitted.bytes == 4096);
+        CHECK(st.direct_submitted.jobs == 1 && st.direct_submitted.bytes == 8192);
+        CHECK(st.mapped_cancelled.jobs == 1 && st.mapped_cancelled.bytes == 4096);
+        CHECK(st.direct_cancelled.jobs == 1 && st.direct_cancelled.bytes == 8192);
+        CHECK(st.mapped_ok.jobs == 0 && st.direct_ok.jobs == 0);
+    }
     const std::vector<uint8_t> src(4096, 3);
     auto copy_job = [&](uint8_t* dst, std::atomic<int>* left) {
         IoQueue::Job j;
@@ -677,15 +697,20 @@ static void unhook(Forced& f) {   // the store lets go of the tier before the ti
     f.w->st.set_tier(nullptr, nullptr, nullptr, nullptr);
     f.w->st.set_tier_direct(nullptr);
     f.w->st.set_tier_trace(nullptr, nullptr);
+    f.w->st.set_tier_striped_trace(nullptr);
 }
 
 // (as ds4_model.cu's init_tier: the drain, the direct hook, and the trace hooks when DS4_TIER_LOG is set)
 static void wire(Forced& f) {
     tier_hooks_drain(*f.w, f.t.get(), &f.fails);
     f.w->st.set_tier_direct([&f](int dev, uint64_t s, ExpertStore::TierDirect& o) { return f.t->direct_slot(dev, s, o); });
-    if (f.t->tracing())
+    if (f.t->tracing()) {
         f.w->st.set_tier_trace([&f](int dev, uint64_t bytes, bool demand) { f.t->note_copy_start(dev, bytes, demand); },
                                [&f](int dev, uint64_t ns) { f.t->note_copy_wait(dev, ns); });
+        if (f.t->striped()) f.w->st.set_tier_striped_trace([&f](bool demand, bool direct, bool mapped) {
+            f.t->note_striped_hit(demand, direct, mapped);
+        });
+    }
 }
 
 // Opens the tier over a new world (its devices forced direct), decides, and fills it (unless `fill` is false: the caller fills).
@@ -2053,12 +2078,753 @@ static void ram_pressure_checks(const fs::path& base) {
     set_env("DS4_STORE_CHUNK_SLOTS", nullptr);
 }
 
+// The striped layout (docs/EXPERT_TIER.md): every expert is cut into stripes over both devices. A gathered blob carries the file's
+// three matrices; a second start reuses the placement with nothing copied; verify=full catches a flipped byte and refills; a stripe
+// unit change and a whole-layout start on striped devices both refill (their headers say so).
+static int check_striped_gather(ExpertTierSet& t, const std::vector<std::pair<int32_t, int32_t>>& ranked, const char* what) {
+    int held = 0;
+    std::vector<uint8_t> blob((size_t) BLOB);
+    std::vector<ExpertTierSet::StripeRef> refs;
+    CHECK(t.blob_bytes() == BLOB);
+    for (const auto& x : ranked) {
+        if (!t.stripe_refs(x.first, x.second, refs)) continue;
+        ++held;
+        std::fill(blob.begin(), blob.end(), (uint8_t) 0xEE);
+        if (!t.gather(x.first, x.second, blob.data())) {
+            std::printf("FAIL %s: gather refused a held expert %d,%d\n", what, x.first, x.second);
+            ++fails;
+            continue;
+        }
+        for (int r = 0; r < 3; ++r)
+            if (!same_matrix(blob.data() + (size_t) r * (MB4 + 8192), x.first, x.second, r)) {
+                std::printf("FAIL %s: gathered matrix %d of expert %d,%d differs from the file\n", what, r, x.first, x.second);
+                ++fails;
+            }
+    }
+    return held;
+}
+
+static std::unique_ptr<ExpertTierSet> open_striped(World& w, const std::vector<TierSpec>& specs, uint64_t stripe_bytes, bool striped = true) {
+    auto t = std::make_unique<ExpertTierSet>();
+    t->set_layout(striped, stripe_bytes);
+    std::string err;
+    if (!t->open(specs, err)) { std::printf("FAIL open striped: %s\n", err.c_str()); ++fails; }
+    (void) w;
+    return t;
+}
+
+static void striped_checks(const fs::path& base) {
+    std::vector<std::pair<int32_t, int32_t>> ranked;
+    for (int l = 0; l < NL; ++l)
+        for (int e = 0; e < NE; ++e) ranked.push_back({l, e});
+    const std::string pack = "sha:" + strata::core::tier_sha256_hex((const uint8_t*) "packS", 5);
+    const std::string prof = "sha:" + strata::core::tier_sha256_hex((const uint8_t*) "profS", 4);
+    std::string why;
+    std::vector<std::string> notes;
+    bool reused = true;
+
+    // the first start: plan, fill, gather every held expert back and compare it with the file
+    std::unique_ptr<ExpertTierSet> t = std::make_unique<ExpertTierSet>();   // declared before the world: the store's drain hook uses it
+    World w(base, "striped", false);
+    t->set_layout(true, 4096);
+    std::string err;
+    CHECK(t->open(w.specs, err));
+    tier_hooks(w, t);
+    CHECK(t->decide(SLOT, 2, 4, NL, NE, pack, prof, false, ranked, reused, why, notes) && !reused);
+    ExpertTierSet::Fill fl{};
+    CHECK(do_fill(w, t.get(), fl));
+    CHECK(t->readable());
+    const int held = check_striped_gather(*t, ranked, "striped fill");
+    CHECK(held > 0 && fl.placed == held);
+    std::printf("striped: %d of %zu experts held, %lld placed by the fill\n", held, ranked.size(), (long long) fl.placed);
+    t->close();   // one process holds a tier at a time: the reuse checks open the devices again, after this
+
+    // a second start with the same shape reuses the placement: nothing copied, and every expert gathers the same
+    {
+        auto t2 = open_striped(w, w.specs, 4096);
+        CHECK(t2->decide(SLOT, 2, 4, NL, NE, pack, prof, false, ranked, reused, why, notes) && reused);
+        CHECK(check_striped_gather(*t2, ranked, "striped reuse") == held);
+        t2->close();
+    }
+
+    // verify=full: a clean tier is reused; a flipped byte in one stripe refills (the decide says which chunk)
+    std::vector<TierSpec> vs = w.specs;
+    vs[0].verify_full = vs[1].verify_full = true;
+    {
+        auto t3 = open_striped(w, vs, 4096);
+        CHECK(t3->decide(SLOT, 2, 4, NL, NE, pack, prof, false, ranked, reused, why, notes) && reused);
+        t3->close();
+    }
+    {   // flip a byte of ranked[0]'s first stripe through the mapping of a tier that is open, then close it
+        auto tm = open_striped(w, w.specs, 4096);
+        CHECK(tm->decide(SLOT, 2, 4, NL, NE, pack, prof, false, ranked, reused, why, notes) && reused);
+        std::vector<ExpertTierSet::StripeRef> refs;
+        CHECK(tm->stripe_refs(ranked[0].first, ranked[0].second, refs) && !refs.empty());
+        if (!refs.empty()) const_cast<uint8_t*>(refs[0].src)[5] ^= 0x5A;   // (the device mapping: the file changes with it)
+        tm->close();
+        auto t4 = open_striped(w, vs, 4096);
+        reused = true;
+        CHECK(t4->decide(SLOT, 2, 4, NL, NE, pack, prof, false, ranked, reused, why, notes) && !reused);
+        CHECK(why.find("crc") != std::string::npos);
+        t4->close();
+    }
+
+    // a second world: a stripe unit change, and a whole-layout start, both refill rather than read the other layout
+    World w2(base, "striped2", false);
+    {
+        auto ts = open_striped(w2, w2.specs, 4096);
+        std::string e2;
+        ExpertTierSet::Fill f2{};
+        tier_hooks(w2, ts);
+        CHECK(ts->decide(SLOT, 2, 4, NL, NE, pack, prof, false, ranked, reused, why, notes) && !reused);
+        CHECK(do_fill(w2, ts.get(), f2));
+        CHECK(check_striped_gather(*ts, ranked, "striped2 fill") > 0);
+    }
+    {
+        auto t8 = open_striped(w2, w2.specs, 8192);
+        reused = true;
+        CHECK(t8->decide(SLOT, 2, 4, NL, NE, pack, prof, false, ranked, reused, why, notes) && !reused);
+        CHECK(why.find("stripe unit") != std::string::npos);
+    }
+    {
+        World w3(base, "striped3", false);
+        auto tf = open_striped(w3, w3.specs, 4096);
+        CHECK(tf->decide(SLOT, 2, 4, NL, NE, pack, prof, false, ranked, reused, why, notes) && !reused);
+        ExpertTierSet::Fill f3{};
+        tier_hooks(w3, tf);
+        CHECK(do_fill(w3, tf.get(), f3));
+        tf.reset();
+        auto tw = open_striped(w3, w3.specs, 4096, /*striped=*/false);
+        reused = true;
+        CHECK(tw->decide(SLOT, 2, 4, NL, NE, pack, prof, false, ranked, reused, why, notes) && !reused);
+        CHECK(why.find("version") != std::string::npos);
+    }
+    // the store's own hit path over the striped tier: each expert is one copy job per stripe, and the slot is whole when they are down
+    {
+        std::unique_ptr<ExpertTierSet> t5 = std::make_unique<ExpertTierSet>();   // (before the world: its drain hook uses it)
+        World w5(base, "striped5", false);
+        t5->set_layout(true, 4096);
+        std::string e5;
+        CHECK(t5->open(w5.specs, e5));
+        tier_hooks(w5, t5);
+        w5.st.set_tier_stripes([&t5](int l, int e, std::vector<ExpertStore::TierStripe>& out) {
+            std::vector<ExpertTierSet::StripeRef> refs;
+            if (!t5->stripe_refs(l, e, refs)) return false;
+            out.clear();
+            for (const auto& r : refs) out.push_back(ExpertStore::TierStripe{ r.dev, r.src, r.blob_off, r.len });
+            return true;
+        });
+        bool ru = true;
+        std::string w5why;
+        std::vector<std::string> w5notes;
+        CHECK(t5->decide(SLOT, 2, 4, NL, NE, pack, prof, false, ranked, ru, w5why, w5notes) && !ru);
+        ExpertTierSet::Fill f5{};
+        CHECK(do_fill(w5, t5.get(), f5));
+        const std::vector<std::pair<int, int>> want = {{0, 0}, {1, 2}, {2, 5}, {0, 4}};
+        const auto hits0 = w5.st.stats().tier_hits.load();
+        CHECK(w5.st.preload(want, 0) == (int) want.size());
+        for (const auto& x : want) {
+            const int sl = w5.st.find(x.first, x.second);
+            CHECK(sl >= 0);
+            if (sl < 0) continue;
+            for (int r = 0; r < 3; ++r) CHECK(same_matrix(w5.st.mat(sl, r), x.first, x.second, r));
+        }
+        CHECK(w5.st.stats().tier_hits.load() - hits0 == (int64_t) want.size());
+        CHECK(w5.st.stats().bytes_read.load() == 0);   // (no file bytes: every stripe came from a device)
+        std::printf("striped store: %zu experts served from the stripes of both devices\n", want.size());
+    }
+    std::printf("striped checks done\n");
+}
+
+#if !defined(_WIN32)
+// This uses the same hooks as init_tier, rather than constructing queue jobs in the test. In particular, a successful
+// mapped gather is not evidence of direct I/O: the pread hook and the per-device direct counters must both advance.
+static void striped_direct_checks(const fs::path& base) {
+    set_env("DS4_TIER_DIRECT", "1");
+    set_env("DS4_TIER_LOG", "1");
+    set_env("DS4_TIER_THREADS", "1");
+    const os::DirectPreadFn saved_read = os::direct_pread_hook();
+    os::direct_pread_hook() = inject_pread;
+    std::vector<std::pair<int32_t, int32_t>> ranked;
+    for (int l = 0; l < NL; ++l)
+        for (int e = 0; e < NE; ++e) ranked.push_back({l, e});
+    const std::string pack = "sha:" + strata::core::tier_sha256_hex((const uint8_t*) "packS", 5);
+    const std::string prof = "sha:" + strata::core::tier_sha256_hex((const uint8_t*) "profS", 5);
+
+    auto run = [&](const fs::path& dir, const char* name, bool force, int fault, uint64_t stripe, bool mixed, bool mapped_only = false, bool log = true) {
+        set_env("DS4_TIER_LOG", log ? "1" : nullptr);
+        Forced f;
+        std::atomic<int> marked[2]{};
+        f.t = std::make_unique<ExpertTierSet>();
+        f.w = std::make_unique<World>(dir, name, false);
+        f.t->set_layout(true, stripe);
+        f.t->set_direct_test_force(force);
+        std::string err;
+        if (!f.t->open(f.w->specs, err)) {
+            std::printf("FAIL open %s: %s\n", name, err.c_str());
+            ++fails;
+            return;
+        }
+        bool all_direct = f.t->direct_active();
+        for (const auto& d : f.t->stats()) all_direct = all_direct && d.direct_mode == "direct";
+        if (!force && !all_direct) {
+            std::printf("SKIP real O_DIRECT striped reads: both devices need direct descriptors and usable alignment\n");
+            ++skips;
+            return;
+        }
+        CHECK(all_direct);
+        if (!f.w->st.no_fork_arena()) {
+            if (force) { std::printf("FAIL striped direct: cannot protect the store arena from fork\n"); ++fails; }
+            else { std::printf("SKIP real O_DIRECT striped reads: cannot protect the store arena from fork\n"); ++skips; }
+            return;
+        }
+        wire(f);
+        f.w->st.set_tier([&f](int l, int e, int& dev, uint64_t& slot) { return f.t->find(l, e, dev, slot); },
+                         [&f](int dev, uint64_t slot) { return f.t->slot_base(dev, slot); },
+                         [&f](int dev) { return f.t->queue(dev); },
+                         [&f, &marked](int dev) { if (dev >= 0 && dev < 2) ++marked[dev]; ++f.fails; f.t->note_refill(dev); },
+                         [&f]() { f.t->drain(); });
+        f.w->st.set_tier_stripe_direct([&f, mixed, mapped_only](int dev, uint64_t off, uint64_t len, ExpertStore::TierDirect& out) {
+            if (mapped_only || !f.t->direct_stripe(dev, off, len, out)) return false;
+            if (mixed && dev == 0) out.align = 2 * MB4;  // 4 KiB stripes cannot use this device's alignment.
+            return true;
+        });
+        f.w->st.set_tier_stripes([&f](int l, int e, std::vector<ExpertStore::TierStripe>& out) {
+            std::vector<ExpertTierSet::StripeRef> refs;
+            if (!f.t->stripe_refs(l, e, refs)) return false;
+            out.clear();
+            for (const auto& r : refs) out.push_back(ExpertStore::TierStripe{r.dev, r.src, r.blob_off, r.len, r.device_off});
+            return true;
+        });
+        bool reused = true;
+        std::string why;
+        std::vector<std::string> notes;
+        CHECK(f.t->decide(SLOT, 2, 4, NL, NE, pack, prof, false, ranked, reused, why, notes) && !reused);
+        ExpertTierSet::Fill fl{};
+        CHECK(do_fill(*f.w, f.t.get(), fl));
+        std::vector<ExpertTierSet::StripeRef> refs;
+        CHECK(f.t->stripe_refs(0, 0, refs));
+        bool seen[2] = {false, false};
+        uint64_t covered = 0;
+        for (const auto& r : refs) {
+            CHECK(r.blob_off == covered && r.len > 0 && r.len <= stripe);
+            CHECK(r.device_off % MB4 == 0);
+            covered += r.len;
+            if (r.dev >= 0 && r.dev < 2) seen[r.dev] = true;
+        }
+        CHECK(covered == BLOB && seen[0] && seen[1]);
+        if (stripe == 2 * MB4) CHECK(!refs.empty() && refs.back().len == MB4);
+
+        inject_plan(fault == kPass ? std::vector<int>{} : std::vector<int>{fault});
+        const int calls0 = inject_calls();
+        const bool got = fetch_ok(*f.w, 0, 0);
+        if (mapped_only) CHECK(inject_calls() == calls0);
+        else CHECK(inject_calls() > calls0);  // A mapped copy with correct bytes must not pass as a direct read.
+        if (fault == kEintr || fault == kShort4k) CHECK(inject_calls() - calls0 > (int) refs.size());
+        CHECK(got == (fault != kEio));
+        const auto ds = f.t->stats();
+        const auto logical = f.t->striped_hit_stats();
+        if (!log) {
+            CHECK(!f.t->tracing() && logical.hits == 0);
+            for (const auto& d : ds) CHECK(d.stripe.mapped_submitted.jobs == 0 && d.stripe.direct_submitted.jobs == 0);
+            inject_plan({});
+            f.w->st.set_tier_stripes(nullptr);
+            f.w->st.set_tier_stripe_direct(nullptr);
+            unhook(f);
+            f.t->close();
+            return;
+        }
+        CHECK(logical.hits == 1 && logical.demand == 1 && logical.prefetch == 0);
+        CHECK(logical.mixed == (mixed ? 1u : 0u) && logical.direct_only == (!mixed && !mapped_only ? 1u : 0u) &&
+              logical.mapped_only == (mapped_only ? 1u : 0u));
+        for (size_t d = 0; d < ds.size(); ++d) {
+            uint64_t jobs = 0, bytes = 0;
+            for (const auto& r : refs) if (r.dev == (int) d) { ++jobs; bytes += r.len; }
+            const auto& st = ds[d].stripe;
+            const bool mapped = mapped_only || (mixed && d == 0);
+            CHECK(st.mapped_submitted.jobs == (mapped ? jobs : 0) && st.mapped_submitted.bytes == (mapped ? bytes : 0));
+            CHECK(st.direct_submitted.jobs == (mapped ? 0 : jobs) && st.direct_submitted.bytes == (mapped ? 0 : bytes));
+            CHECK(st.mapped_submitted.jobs == st.mapped_ok.jobs + st.mapped_failed.jobs + st.mapped_cancelled.jobs);
+            CHECK(st.direct_submitted.jobs == st.direct_ok.jobs + st.direct_fallback.jobs + st.direct_failed.jobs + st.direct_cancelled.jobs);
+            CHECK(st.mapped_submitted.bytes == st.mapped_ok.bytes + st.mapped_failed.bytes + st.mapped_cancelled.bytes);
+            CHECK(st.direct_submitted.bytes == st.direct_ok.bytes + st.direct_fallback.bytes + st.direct_failed.bytes + st.direct_cancelled.bytes);
+            CHECK(st.mapped_ok.jobs == ds[d].completed_jobs && st.mapped_ok.bytes == ds[d].completed_bytes);
+            CHECK(st.direct_ok.jobs == ds[d].direct_ok && st.direct_ok.bytes == ds[d].direct_slot_ok_bytes);
+            CHECK(st.direct_fallback.jobs == ds[d].direct_fallbacks && st.direct_failed.jobs == ds[d].direct_failed);
+        }
+        uint64_t ok = 0, fallback = 0, failed = 0;
+        for (const auto& d : ds) {
+            ok += d.direct_ok;
+            fallback += d.direct_fallbacks;
+            failed += d.direct_failed;
+        }
+        if (fault == kPass || fault == kEintr || fault == kShort4k) {
+            CHECK(ds.size() == 2);
+            if (mapped_only) {
+                for (const auto& d : ds) CHECK(d.direct_ok == 0 && d.completed_jobs > 0);
+            } else if (ds.size() == 2 && mixed) {
+                CHECK(ds[0].direct_ok == 0 && ds[0].completed_jobs > 0);
+                CHECK(ds[1].direct_ok > 0 && ds[1].completed_jobs == 0);
+            } else if (!mixed) {
+                uint64_t bytes = 0;
+                for (const auto& d : ds) {
+                    CHECK(d.direct_ok > 0 && d.completed_jobs == 0);
+                    bytes += d.direct_slot_ok_bytes;
+                }
+                CHECK(ok == refs.size() && bytes == BLOB);
+            }
+            CHECK(fallback == 0 && failed == 0);
+        } else if (fault == kEinval) {
+            CHECK(fallback >= 1 && failed == 0 && f.fails.load() == 0);
+            bool refused = false;
+            for (const auto& d : ds) refused = refused || d.direct_mode == "fallback";
+            CHECK(refused);
+        } else {
+            CHECK(failed == 1 && f.fails.load() == 2);
+            CHECK(marked[0].load() == 1 && marked[1].load() == 1);  // One failed stripe marks every participating device.
+            CHECK(fetch_ok(*f.w, 0, 0));  // The failed tier is bypassed; the model file still serves the expert.
+        }
+        inject_plan({});
+        f.w->st.set_tier_stripes(nullptr);
+        f.w->st.set_tier_stripe_direct(nullptr);
+        unhook(f);
+        f.t->close();
+    };
+
+    run(base, "striped_direct_forced", true, kPass, MB4, false);
+    run(base, "striped_direct_partial", true, kPass, 2 * MB4, false);
+    run(base, "striped_direct_eintr", true, kEintr, MB4, false);
+    run(base, "striped_direct_short", true, kShort4k, 2 * MB4, false);
+    run(base, "striped_direct_mixed", true, kPass, MB4, true);
+    run(base, "striped_mapped_only", true, kPass, MB4, false, true);
+    run(base, "striped_log_off", true, kPass, MB4, false, false, false);
+    run(base, "striped_direct_refused", true, kEinval, MB4, false);
+    run(base, "striped_direct_failed", true, kEio, MB4, false);
+    const fs::path odir = std::getenv("DS4_TIER_TEST_DIR") ? fs::path(std::getenv("DS4_TIER_TEST_DIR")) : base;
+    if (!odirect_reads_ok(odir)) {
+        std::printf("SKIP real O_DIRECT striped reads: %s does not take O_DIRECT reads (set DS4_TIER_TEST_DIR)\n", odir.c_str());
+        ++skips;
+    } else {
+        run(odir, "striped_direct_real", false, kPass, MB4, false);
+    }
+    inject_plan({});
+    os::direct_pread_hook() = saved_read;
+    set_env("DS4_TIER_DIRECT", nullptr);
+    set_env("DS4_TIER_LOG", nullptr);
+    set_env("DS4_TIER_THREADS", nullptr);
+}
+// The direct-read hook identifies devices by the descriptor returned by the real stripe hook. One gate per device
+// makes the ordering independent of which queue the OS schedules first.
+struct StripedReads {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::map<int, int> devices;
+    bool gate[2] = {true, true};
+    bool entered[2] = {false, false};
+    bool partial = false;
+    int fail_dev = -1;
+    int partial_step = 0;
+    int calls[2] = {0, 0};
+    void add(int fd, int dev) {
+        std::lock_guard<std::mutex> lk(mu);
+        devices[fd] = dev;
+    }
+    bool both_entered() {
+        std::unique_lock<std::mutex> lk(mu);
+        return cv.wait_for(lk, std::chrono::seconds(5), [&] { return entered[0] && entered[1]; });
+    }
+    void release(int dev) {
+        { std::lock_guard<std::mutex> lk(mu); gate[dev] = false; }
+        cv.notify_all();
+    }
+    void release_all() { release(0); release(1); }
+};
+static StripedReads* g_striped_reads = nullptr;
+static ssize_t striped_pread(int fd, void* buf, size_t n, off_t off) {
+    StripedReads& s = *g_striped_reads;
+    {
+        std::unique_lock<std::mutex> lk(s.mu);
+        const auto it = s.devices.find(fd);
+        if (it != s.devices.end()) {
+            const int d = it->second;
+            ++s.calls[d];
+            s.entered[d] = true;
+            s.cv.notify_all();
+            s.cv.wait(lk, [&] { return !s.gate[d]; });
+            if (d == s.fail_dev) { errno = EIO; return -1; }
+            if (s.partial && d == 0 && s.partial_step == 0 && n > MB4) {
+                ++s.partial_step;
+                std::memset(buf, 0xA5, MB4);  // Poison the prefix: a suffix-only fallback cannot pass.
+                return MB4;
+            }
+            if (s.partial && d == 0 && s.partial_step == 1) {
+                ++s.partial_step;
+                errno = EINVAL;
+                return -1;
+            }
+        }
+    }
+    return ::pread(fd, buf, n, off);
+}
+
+struct StripedWait {
+    StripedReads* reads = nullptr;
+    ExpertStore* store = nullptr;
+    int slot = -1, last = -1;
+    bool race = false;
+    std::atomic<int> calls{0};
+    std::atomic<bool> completed_in_hook{false};
+};
+static StripedWait* g_striped_wait = nullptr;
+static void striped_wait_hook(const strata::ds4::CompletionHub*) {
+    StripedWait& w = *g_striped_wait;
+    if (w.calls.fetch_add(1) == 0 && w.race) {
+        // Called under the hub mutex after the predicate was false. The worker lowers left before taking this mutex,
+        // so this forces the last completion into the otherwise easy-to-miss test-to-sleep window.
+        w.reads->release(w.last);
+        w.completed_in_hook = poll_until([&] { return w.store->loaded(w.slot); }, 5000);
+    }
+}
+
+static void striped_concurrency_checks(const fs::path& base) {
+    set_env("DS4_TIER_DIRECT", "1");
+    set_env("DS4_TIER_LOG", "1");
+    set_env("DS4_TIER_THREADS", "1");
+    set_env("DS4_TIER_WAKE", "1");
+    set_env("DS4_LANE_WAKE", "1");
+    const auto saved_read = os::direct_pread_hook();
+    const auto saved_wait = strata::ds4::CompletionHub::wait_hook();
+    os::direct_pread_hook() = striped_pread;
+    std::vector<std::pair<int32_t, int32_t>> ranked;
+    for (int l = 0; l < NL; ++l)
+        for (int e = 0; e < NE; ++e) ranked.push_back({l, e});
+    const std::string pack = "sha:" + strata::core::tier_sha256_hex((const uint8_t*) "packS", 5);
+    const std::string prof = "sha:" + strata::core::tier_sha256_hex((const uint8_t*) "profS", 5);
+
+    // mode 0: lane wait, 1: wait_slots, 2: lost-wake window, 3: cancelled prefetch, 4: partial then EINVAL,
+    // 5: a real failure races with cancellation of the remaining queued stripes.
+    auto run = [&](int mode) {
+        StripedReads reads;
+        g_striped_reads = &reads;
+        Forced f;
+        f.t = std::make_unique<ExpertTierSet>();
+        f.w = std::make_unique<World>(base, "striped_concurrency_" + std::to_string(mode), false);
+        f.t->set_layout(true, (mode == 3 || mode == 5) ? MB4 : 4 * MB4);  // cancellation needs queued stripes
+        f.t->set_direct_test_force(true);
+        std::string err;
+        if (!f.t->open(f.w->specs, err)) { std::printf("FAIL striped concurrency open: %s\n", err.c_str()); ++fails; return; }
+        CHECK(f.t->direct_active() && f.w->st.lane_wake_on());
+        if (!f.w->st.no_fork_arena()) { CHECK(false); return; }
+        wire(f);
+        f.w->st.set_tier_stripes([&](int l, int e, std::vector<ExpertStore::TierStripe>& out) {
+            std::vector<ExpertTierSet::StripeRef> refs;
+            if (!f.t->stripe_refs(l, e, refs)) return false;
+            out.clear();
+            for (const auto& r : refs) out.push_back({r.dev, r.src, r.blob_off, r.len, r.device_off});
+            return true;
+        });
+        f.w->st.set_tier_stripe_direct([&](int dev, uint64_t off, uint64_t len, ExpertStore::TierDirect& out) {
+            if (!f.t->direct_stripe(dev, off, len, out)) return false;
+            reads.add((int) out.fd, dev);
+            return true;
+        });
+        bool reused = true;
+        std::string why;
+        std::vector<std::string> notes;
+        CHECK(f.t->decide(SLOT, 2, 4, NL, NE, pack, prof, false, ranked, reused, why, notes) && !reused);
+        ExpertTierSet::Fill fl{};
+        CHECK(do_fill(*f.w, f.t.get(), fl));
+        std::vector<ExpertTierSet::StripeRef> refs;
+        CHECK(f.t->stripe_refs(0, 0, refs) && refs.size() >= 2);
+        if (refs.size() < 2) { reads.release_all(); unhook(f); f.t->close(); return; }
+        if (mode != 3 && mode != 5) CHECK(refs.size() == 2);
+        CHECK(f.t->queue(0) != nullptr && f.t->queue(1) != nullptr && f.t->queue(0) != f.t->queue(1));
+        const int first = refs[0].dev, last = 1 - first;
+        CHECK(first >= 0 && first < 2 && refs[1].dev == last);
+        const int e = 0;
+        std::vector<char> ok;
+        std::vector<int> sl;
+        if (mode == 4) { reads.partial = true; reads.release_all(); }
+        if (mode == 5) reads.fail_dev = 0;
+        if (mode == 3 || mode == 5) f.w->st.prefetch(0, e);
+        else f.w->st.begin(0, &e, 1, ok, sl);
+        if (mode != 4) CHECK(reads.both_entered());  // Both device workers are inside their own direct read simultaneously.
+
+        if (mode == 3 || mode == 5) {
+            f.w->st.cancel_stale(0);
+            // Pin the already-cancelled guess, then wait for its dropped jobs through the shared completion hub.
+            f.w->st.begin(0, &e, 1, ok, sl);
+            CHECK(sl.size() == 1 && sl[0] >= 0 && !f.w->st.loaded(sl[0]));
+            StripedWait obs;
+            obs.reads = &reads; obs.store = &f.w->st; obs.slot = sl[0];
+            g_striped_wait = &obs;
+            strata::ds4::CompletionHub::wait_hook() = striped_wait_hook;
+            bool result = true;
+            std::thread waiter([&] { result = f.w->st.wait_slots(sl, ok, 0, 1); });
+            CHECK(poll_until([&] { return obs.calls.load() > 0; }, 5000));
+            // Low-priority sentinels follow every queued guess on each worker.
+            std::atomic<int> left{2};
+            uint8_t src[2] = {1, 2}, dst[2] = {};
+            IoQueue::Job jobs[2];
+            for (int d = 0; d < 2; ++d) {
+                jobs[d].mem = &src[d]; jobs[d].dst = &dst[d]; jobs[d].len = 1; jobs[d].left = &left;
+                f.t->queue(d)->push(&jobs[d], 1, true);
+            }
+            reads.release_all();
+            waiter.join();
+            strata::ds4::CompletionHub::wait_hook() = saved_wait;
+            g_striped_wait = nullptr;
+            CHECK(!result && !ok[0] && sl[0] < 0);
+            CHECK(wait_below(left, 0, 5000));
+            const auto logical = f.t->striped_hit_stats();
+            CHECK(logical.hits == 1 && logical.demand == 0 && logical.prefetch == 1 && logical.direct_only == 1);
+            uint64_t submitted = 0, cancelled = 0, failed = 0;
+            for (const auto& d : f.t->stats()) {
+                const auto& st = d.stripe;
+                submitted += st.direct_submitted.jobs;
+                cancelled += st.direct_cancelled.jobs;
+                failed += st.direct_failed.jobs;
+                CHECK(st.direct_submitted.jobs == st.direct_ok.jobs + st.direct_fallback.jobs + st.direct_failed.jobs + st.direct_cancelled.jobs);
+                CHECK(st.direct_submitted.bytes == st.direct_ok.bytes + st.direct_fallback.bytes + st.direct_failed.bytes + st.direct_cancelled.bytes);
+            }
+            CHECK(submitted == refs.size() && cancelled > 0 && failed == (mode == 5 ? 1u : 0u));
+            CHECK(f.w->st.find(0, e) < 0);
+            { std::lock_guard<std::mutex> lk(reads.mu); CHECK(reads.calls[0] == 1 && reads.calls[1] == 1); }
+            if (mode == 3) {
+                CHECK(f.w->st.stats().cancelled.load() == 1 && f.w->st.stats().fails.load() == 0);
+                CHECK(f.fails.load() == 0);
+                const auto hits = f.w->st.stats().tier_hits.load();
+                CHECK(f.t->stripe_refs(0, e, refs));
+                CHECK(fetch_ok(*f.w, 0, e));  // The tier remains readable after the dropped guess.
+                CHECK(f.w->st.stats().tier_hits.load() == hits + 1 && f.w->st.stats().bytes_read.load() == 0);
+            } else {
+                CHECK(f.w->st.stats().cancelled.load() == 0 && f.w->st.stats().fails.load() == 1);
+                CHECK(f.fails.load() == 2);  // A real failure marks both participants, despite cancelled stripes.
+                CHECK(!f.t->stripe_refs(0, e, refs));
+                CHECK(fetch_ok(*f.w, 0, e));
+            }
+        } else if (mode == 4) {
+            const auto target = std::find_if(refs.begin(), refs.end(), [](const auto& r) { return r.dev == 0; });
+            CHECK(target != refs.end());
+            if (target != refs.end()) {
+                std::vector<uint8_t> poison(MB4, 0xA5);
+                CHECK(std::memcmp(target->src, poison.data(), MB4) != 0);
+            }
+            CHECK(f.w->st.wait_slots(sl, ok, 0, 1));
+            CHECK(ok[0] && f.fails.load() == 0);
+            { std::lock_guard<std::mutex> lk(reads.mu); CHECK(reads.partial_step == 2); }
+            if (ok[0]) for (const auto& r : refs)
+                CHECK(std::memcmp(f.w->st.blob(sl[0]) + r.blob_off, r.src, (size_t) r.len) == 0);
+            uint64_t fallback = 0;
+            for (const auto& d : f.t->stats()) fallback += d.direct_fallbacks;
+            CHECK(fallback == 1);
+            f.w->st.release(0, &e, 1, ok);
+        } else {
+            CHECK(sl.size() == 1 && sl[0] >= 0);
+            // A high-priority sentinel behind the first device's only stripe proves it has completed and announced it.
+            std::atomic<int> left{1};
+            uint8_t src = 7, dst = 0;
+            IoQueue::Job done;
+            done.mem = &src; done.dst = &dst; done.len = 1; done.left = &left;
+            f.t->queue(first)->push(&done, 1, false);
+            reads.release(first);
+            CHECK(wait_below(left, 0, 5000));
+            CHECK(!f.w->st.loaded(sl[0]));
+            StripedWait obs;
+            obs.reads = &reads; obs.store = &f.w->st; obs.slot = sl[0]; obs.last = last; obs.race = mode == 2;
+            g_striped_wait = &obs;
+            strata::ds4::CompletionHub::wait_hook() = striped_wait_hook;
+            std::atomic<bool> finished{false};
+            bool result = false;
+            const auto t0 = test_clock::now();
+            std::thread waiter([&] {
+                if (mode == 1) result = f.w->st.wait_slots(sl, ok, 0, 1);
+                else result = f.w->st.wait_any_loaded(sl.data(), 1, 3'000'000);
+                finished = true;
+            });
+            CHECK(poll_until([&] { return obs.calls.load() > 0; }, 5000));
+            if (mode != 2) {
+                CHECK(!finished.load() && !f.w->st.loaded(sl[0]));
+                reads.release(last);
+            }
+            waiter.join();
+            CHECK(result && test_clock::now() - t0 < std::chrono::seconds(2));
+            if (mode == 2) CHECK(obs.completed_in_hook.load());
+            strata::ds4::CompletionHub::wait_hook() = saved_wait;
+            g_striped_wait = nullptr;
+            if (mode != 1) CHECK(f.w->st.wait_slots(sl, ok, 0, 1));
+            CHECK(ok[0] && store_ok(*f.w, 0, e) && f.fails.load() == 0);
+            f.w->st.release(0, &e, 1, ok);
+        }
+        reads.release_all();
+        f.w->st.set_tier_stripes(nullptr);
+        f.w->st.set_tier_stripe_direct(nullptr);
+        unhook(f);
+        f.t->close();
+    };
+    for (int mode = 0; mode < 6; ++mode) run(mode);
+    g_striped_reads = nullptr;
+    strata::ds4::CompletionHub::wait_hook() = saved_wait;
+    os::direct_pread_hook() = saved_read;
+    set_env("DS4_TIER_DIRECT", nullptr);
+    set_env("DS4_TIER_LOG", nullptr);
+    set_env("DS4_TIER_THREADS", nullptr);
+    set_env("DS4_TIER_WAKE", nullptr);
+    set_env("DS4_LANE_WAKE", nullptr);
+}
+
+// Reopen the same files with the opposite direct setting. The store is kept cold until after reuse, so its hits cannot hide disk reads.
+static void direct_mode_reuse_checks(const fs::path& base) {
+    set_env("DS4_TIER_LOG", "1");
+    set_env("DS4_TIER_THREADS", "1");
+    const auto saved_read = os::direct_pread_hook();
+    os::direct_pread_hook() = inject_pread;
+    inject_plan({});
+    std::vector<std::pair<int32_t, int32_t>> ranked;
+    for (int l = 0; l < NL; ++l)
+        for (int e = 0; e < NE; ++e) ranked.push_back({l, e});
+    const std::vector<std::pair<int, int>> want = {{0, 0}, {0, 1}, {1, 2}, {2, 5}};
+    const std::string pack = "sha:" + strata::core::tier_sha256_hex((const uint8_t*) "packS", 5);
+    const std::string prof = "sha:" + strata::core::tier_sha256_hex((const uint8_t*) "profS", 5);
+    auto contents = [](const std::string& path) {
+        std::vector<uint8_t> bytes;
+        std::FILE* file = std::fopen(path.c_str(), "rb");
+        if (!file) { CHECK(false); return bytes; }
+        CHECK(std::fseek(file, 0, SEEK_END) == 0);
+        const long size = std::ftell(file);
+        CHECK(size >= 0 && std::fseek(file, 0, SEEK_SET) == 0);
+        if (size >= 0) {
+            bytes.resize((size_t) size);
+            CHECK(std::fread(bytes.data(), 1, bytes.size(), file) == bytes.size());
+        }
+        CHECK(std::fclose(file) == 0);
+        return bytes;
+    };
+    for (bool striped : {false, true}) for (bool fill_direct : {false, true}) {
+        const bool read_direct = !fill_direct;
+        const std::string name = std::string(striped ? "stripe" : "whole") + (fill_direct ? "_on_to_off" : "_off_to_on");
+        set_env("DS4_TIER_DIRECT", fill_direct ? "1" : "0");
+        Forced f;
+        f.t = std::make_unique<ExpertTierSet>();
+        f.w = std::make_unique<World>(base, "direct_reuse_" + name, false);
+        f.t->set_layout(striped, MB4);
+        f.t->set_direct_test_force(true);  // Real pread jobs on ordinary descriptors, independent of filesystem O_DIRECT support.
+        std::string err;
+        if (!f.t->open(f.w->specs, err)) { std::printf("FAIL %s first open: %s\n", name.c_str(), err.c_str()); ++fails; continue; }
+        CHECK(f.t->direct_mode() == fill_direct && f.t->direct_active() == fill_direct);
+        wire(f);
+        bool reused = true;
+        std::string why;
+        std::vector<std::string> notes;
+        CHECK(f.t->decide(SLOT, 2, 4, NL, NE, pack, prof, false, ranked, reused, why, notes) && !reused);
+        ExpertTierSet::Fill fill{};
+        CHECK(do_fill(*f.w, f.t.get(), fill) && fill.placed == (int64_t) ranked.size());
+        for (const auto& d : f.t->stats()) CHECK(d.direct_jobs == 0);  // Fill reads the model, not the tier's direct path.
+        std::vector<std::vector<uint8_t>> originals(want.size(), std::vector<uint8_t>((size_t) BLOB));
+        for (size_t i = 0; i < want.size(); ++i) {
+            if (striped) {
+                CHECK(f.t->gather(want[i].first, want[i].second, originals[i].data()));
+            } else {
+                int dev = -1;
+                uint64_t slot = 0;
+                const bool held = f.t->find(want[i].first, want[i].second, dev, slot);
+                CHECK(held);
+                uint8_t* src = held ? f.t->slot_base(dev, slot) : nullptr;
+                CHECK(src != nullptr);
+                if (src) std::memcpy(originals[i].data(), src, (size_t) BLOB);
+            }
+            for (int r = 0; r < 3; ++r)
+                CHECK(same_matrix(originals[i].data() + (size_t) r * (MB4 + 8192), want[i].first, want[i].second, r));
+        }
+        unhook(f);
+        f.t->close();
+        const auto before_a = contents(f.w->devA), before_b = contents(f.w->devB);
+        CHECK(before_a.size() == (16u << 20) && before_b.size() == (12u << 20));
+
+        set_env("DS4_TIER_DIRECT", read_direct ? "1" : "0");
+        f.t = std::make_unique<ExpertTierSet>();
+        f.t->set_layout(striped, MB4);
+        f.t->set_direct_test_force(true);
+        if (!f.t->open(f.w->specs, err)) { std::printf("FAIL %s second open: %s\n", name.c_str(), err.c_str()); ++fails; continue; }
+        CHECK(f.t->direct_mode() == read_direct && f.t->direct_active() == read_direct);
+        if (read_direct && !f.w->st.no_fork_arena()) { CHECK(false); f.t->close(); continue; }
+        wire(f);
+        if (striped) {
+            f.w->st.set_tier_stripes([&f](int l, int e, std::vector<ExpertStore::TierStripe>& out) {
+                std::vector<ExpertTierSet::StripeRef> refs;
+                if (!f.t->stripe_refs(l, e, refs)) return false;
+                out.clear();
+                for (const auto& r : refs) out.push_back({r.dev, r.src, r.blob_off, r.len, r.device_off});
+                return true;
+            });
+            if (read_direct) f.w->st.set_tier_stripe_direct([&f](int dev, uint64_t off, uint64_t len, ExpertStore::TierDirect& out) {
+                return f.t->direct_stripe(dev, off, len, out);
+            });
+        }
+        reused = false;
+        CHECK(f.t->decide(SLOT, 2, 4, NL, NE, pack, prof, false, ranked, reused, why, notes) && reused);
+        CHECK(f.t->readable() && f.t->experts_held() == (int64_t) ranked.size());
+        const auto hits0 = f.w->st.stats().tier_hits.load();
+        const auto bytes0 = f.w->st.stats().bytes_read.load();
+        const int calls0 = inject_calls();
+        uint64_t expected_jobs[2] = {0, 0};
+        for (size_t i = 0; i < want.size(); ++i) {
+            const int l = want[i].first, e = want[i].second;
+            if (striped) {
+                std::vector<ExpertTierSet::StripeRef> refs;
+                CHECK(f.t->stripe_refs(l, e, refs));
+                for (const auto& r : refs) if (r.dev >= 0 && r.dev < 2) ++expected_jobs[r.dev];
+            } else {
+                int dev = -1; uint64_t slot = 0;
+                CHECK(f.t->find(l, e, dev, slot));
+                if (dev >= 0 && dev < 2) ++expected_jobs[dev];
+            }
+            std::vector<char> ok;
+            std::vector<int> sl;
+            f.w->st.begin(l, &e, 1, ok, sl);
+            const bool loaded = f.w->st.wait_slots(sl, ok, 0, 1);
+            CHECK(loaded && ok.size() == 1 && ok[0] && sl[0] >= 0);
+            if (loaded && ok[0] && sl[0] >= 0) {
+                if (striped) CHECK(std::memcmp(f.w->st.blob(sl[0]), originals[i].data(), (size_t) BLOB) == 0);
+                for (int r = 0; r < 3; ++r) {
+                    CHECK(std::memcmp(f.w->st.mat(sl[0], r), originals[i].data() + (size_t) r * (MB4 + 8192), MB4) == 0);
+                    CHECK(same_matrix(f.w->st.mat(sl[0], r), l, e, r));
+                }
+                f.w->st.release(l, &e, 1, ok);
+            }
+        }
+        CHECK(f.w->st.stats().tier_hits.load() - hits0 == (int64_t) want.size());
+        CHECK(f.w->st.stats().bytes_read.load() == bytes0 && f.fails.load() == 0);
+        CHECK((inject_calls() - calls0 == 0) == !read_direct);
+        const auto ds = f.t->stats();
+        CHECK(ds.size() == 2 && expected_jobs[0] > 0 && expected_jobs[1] > 0);
+        for (size_t d = 0; d < ds.size() && d < 2; ++d) {
+            CHECK(ds[d].direct_jobs == (read_direct ? expected_jobs[d] : 0));
+            CHECK(ds[d].direct_ok == (read_direct ? expected_jobs[d] : 0));
+            CHECK(ds[d].direct_fallbacks == 0 && ds[d].direct_failed == 0);
+            CHECK((ds[d].completed_jobs > 0) == !read_direct);
+        }
+        f.w->st.set_tier_stripes(nullptr);
+        f.w->st.set_tier_stripe_direct(nullptr);
+        unhook(f);
+        f.t->close();
+        CHECK(contents(f.w->devA) == before_a);
+        CHECK(contents(f.w->devB) == before_b);
+    }
+    os::direct_pread_hook() = saved_read;
+    set_env("DS4_TIER_DIRECT", nullptr);
+    set_env("DS4_TIER_LOG", nullptr);
+    set_env("DS4_TIER_THREADS", nullptr);
+}
+#endif
+
 int main() {
     const fs::path base = fs::temp_directory_path() /
                           ("ds4_tier_test_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     const std::string packA = "sha:" + strata::core::tier_sha256_hex((const uint8_t*) "packA", 5);
     const std::string packB = "sha:" + strata::core::tier_sha256_hex((const uint8_t*) "packB", 5);
     const std::string profA = "sha:" + strata::core::tier_sha256_hex((const uint8_t*) "profileA", 8);
+    striped_checks(base);
     const std::string profB = "sha:" + strata::core::tier_sha256_hex((const uint8_t*) "profileB", 8);
     // The planner's list: every expert in index order (the profile's heat would sort these first), the guards (vram 2 +
     // store 4) cutting the first six: (1,0) .. (2,5) remain, and the uniform deal alternates devices (§4.2).
@@ -2802,6 +3568,9 @@ int main() {
     ram_pressure_checks(base);  // preload's hottest prefix under a refused chunk; shrink_bytes by the chunks' own sizes
 #if !defined(_WIN32)
     direct_checks(base, ranked, packA, profA);   // DS4_TIER_DIRECT (opt-in): see the section above
+    striped_direct_checks(base);                 // striped store hits, forced faults and a real direct read when available
+    striped_concurrency_checks(base);            // multi-queue completion, lost wake, cancellation and partial-read fallback
+    direct_mode_reuse_checks(base);              // direct mode changes do not refill whole or striped tiers
     lane_wake_checks(base, ranked, packA, profA);   // DS4_LANE_WAKE: the lane on the real store, with held reads
 #endif
 

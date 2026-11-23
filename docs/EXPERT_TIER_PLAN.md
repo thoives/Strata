@@ -638,3 +638,15 @@ Open until hardware exists:
 - The copy method, the worker count, and whether a `touch` pass helps (P0-hw).
 - Whether reboot persistence behaves as the header assumes on the real device (P9).
 - The weighting of uneven devices (§4.3), once their bandwidth is measured.
+
+## Striped layout: status
+
+The plan above describes the whole layout, which stays the default. Qwen and DeepSeek also accept the opt-in striped
+layout. In Qwen, prompt copies and decode staging can gather striped experts from the tier; `blob_stable` and lent-cache
+refills still use the model files. In DeepSeek, the RAM store gathers a tier-held expert's stripes into a slot. The engines
+use different tier header versions; see [EXPERT_TIER.md](EXPERT_TIER.md#the-layout-whole-or-striped-opt-in) for the
+user-facing rules and [EXPERT_TIER_DSV41_PLAN.md](EXPERT_TIER_DSV41_PLAN.md#striped-layout-status) for DeepSeek.
+
+No speed benefit is claimed. Compare `whole` and `striped` on the same model, drives, backend and workload before making
+one, including fill, prompt, decode, latency, memory and device traffic.
+

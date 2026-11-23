@@ -32,6 +32,10 @@ namespace strata::core {
 constexpr const char kTierMagic[8] = {'S', 'T', 'R', 'P', 'T', 'I', 'E', 'R'};
 constexpr uint32_t kTierLayoutVersion = 2;          // header §5.2: started at 1; 2: header_crc covers fill_state too
                                                     // (a version 1 header is not read: such a tier refills once)
+// The striped layout (docs/EXPERT_TIER.md, "The layout") has its own version, so an engine that reads only the whole layout
+// refuses a striped device ("layout version 3") and refills it, instead of reading stripes as whole experts. The header
+// keeps its fixed fields; `reserved0` holds the stripe size in bytes. Whole tiers keep version 2 and reserved0 = 0.
+constexpr uint32_t kTierLayoutVersionStriped = 3;
 constexpr uint64_t kTierHeaderArea = 64ull << 10;   // the fixed fields' area, A then B
 constexpr uint64_t kTierChunk = 4ull << 20;         // the chunk checksum table's unit
 constexpr uint64_t kTierAlign = 4ull << 10;         // blob alignment
@@ -168,6 +172,19 @@ constexpr int tier_placement_entry_bytes(int64_t n_layers, int64_t n_expert, int
 std::vector<uint8_t> encode_placement_table(const std::vector<TierPlacementEntry>& entries, int entry_bytes);
 bool decode_placement_table(const uint8_t* bytes, uint64_t len, int entry_bytes,
                             std::vector<TierPlacementEntry>& entries, std::string& why);
+
+// ---- striped placement table (version 3; identical on every device, like the whole table).  One entry per expert in rank
+// order: layer i32, expert i32, start device i32, then one u64 per device: that device's piece offset (0 when it holds no
+// stripe of the expert).  Entry size: 12 + 8 bytes per device.  The pieces' lengths follow from the blob size, the stripe size,
+// the start and the device count, so they are not stored.
+struct StripedTableEntry {
+    int32_t layer = 0, expert = 0, start = 0;
+    std::vector<uint64_t> offset;   // per device, byte offset in that device's data region
+};
+constexpr uint64_t striped_entry_bytes(uint32_t n_devices) { return 12ull + 8ull * n_devices; }
+std::vector<uint8_t> encode_striped_table(const std::vector<StripedTableEntry>& entries, uint32_t n_devices);
+bool decode_striped_table(const uint8_t* bytes, uint64_t len, uint32_t n_devices, std::vector<StripedTableEntry>& entries,
+                          std::string& why);
 
 // ---- chunk checksum table: one CRC32C per 4 MiB of this device's data, big-endian-free LE u32.
 std::vector<uint8_t> encode_chunk_table(const std::vector<uint32_t>& crcs);

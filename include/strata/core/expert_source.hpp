@@ -789,9 +789,11 @@ public:
     // differ in block size keeps spares per size).
     /// Whether the compact copy holds `(layer, expert)`.
     bool has_resident(int64_t layer, int64_t expert) const;
-    /// Whether the expert tier holds `(layer, expert)` (§7.6: the tier's parallel of `has_resident`; RAM is never
-    /// asked of a tier-held expert at fill time, §4.4). `blob()` / `copy_blob()` take the order RAM copy, tier,
-    /// files (§7.1); a tier pointer is stable while the tier is open (§7.1).
+    /// Whether the expert tier holds `(layer, expert)` as a contiguous blob, so a pointer to it is stable while the tier
+    /// is open (§7.6: the tier's parallel of `has_resident`; RAM is never asked of a tier-held expert at fill time, §4.4).
+    /// A striped tier expert is held but has no such pointer, so this is false for it: the pointer paths read it from
+    /// the files, and only the copy paths (copy_blob, copy_blobs) gather it from the devices.
+    /// `blob()` / `copy_blob()` take the order RAM copy, tier, files (§7.1); a tier pointer is stable while the tier is open (§7.1).
     bool has_tier(int64_t layer, int64_t expert) const;
     /// The model files this source reads the experts from (experts.bin, or the GGUF shards read in place): the expert
     /// tier's identity covers them and no tier device may be one of them (docs/EXPERT_TIER_PLAN.md §5.4, §6.2).
@@ -1019,7 +1021,10 @@ private:
     const uint8_t* staged_blob(int64_t layer, int64_t expert);
     bool claim_stage(int64_t key, size_t& v, bool& fill, bool ahead = false);
     bool fill_stage(size_t v, int64_t layer, int64_t expert, uint8_t* dst);
-    void publish_stage(size_t v, int64_t layer, bool ok, double us);
+    // from_tier: the slot was gathered from a striped tier's devices (counted as tier reads, not file reads)
+    void publish_stage(size_t v, int64_t layer, bool ok, double us, bool from_tier = false);
+    // A striped tier expert: no contiguous copy on the devices, so its pieces are gathered into a slot (fill_stage).
+    bool striped_tier_holds(int64_t layer, int64_t expert) const;
     struct Fill { size_t v; int64_t layer, e; uint8_t* dst; };
     /// The claimed buffers' blobs: one overlapped batch when unbuffered, else the fetch threads' mapped copies.
     void fill_many(const std::vector<Fill>& todo);

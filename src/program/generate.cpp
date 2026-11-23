@@ -710,6 +710,9 @@ struct Options {
     /// Empty = no tier: every read path below stays byte-identical to the last release (§15.1). No tier by default
     /// (§9.5); the devices are never added by the engine, the user gives them.
     std::vector<strata::core::TierSpec> expert_tiers;
+    /// The layout of the whole tier set (docs/EXPERT_TIER.md, "The layout"): `--expert-tier-layout whole|striped` (whole by
+    /// default: each expert on one device) and `--expert-tier-stripe-kib N` (striped only).  Checked after the arguments.
+    strata::core::TierLayoutOpts expert_tier_layout;
     /// #477 (--serve, opt-in): where to save what the adaptive tier learned, as a profile `--expert-profile` reads
     /// (the resident experts first, then the routing counted since the start); on QUIT and every
     /// `expert_profile_save_min` minutes between requests.  Empty (the default): nothing is counted or written.
@@ -1156,6 +1159,12 @@ void usage() {
                  "                       device, in order.  The experts VRAM and RAM do not hold are written there once\n"
                  "                       and read over that device from then on; identity, torn or changed headers refill\n"
                  "                       (verify=full also checks every chunk on start).  No tier by default.\n"
+                 "  --expert-tier-layout whole|striped  (docs/EXPERT_TIER.md \"The layout\")\n"
+                 "                       whole (default): each expert on one device.  striped: each expert cut into\n"
+                 "                       stripes over all the --expert-tier devices (2 to 8).  The copy paths (the fill,\n"
+                 "                       batched prompt reads) gather them from the devices; pointer reads take the files.\n"
+                 "                       A layout change refills the tier.\n"
+                 "  --expert-tier-stripe-kib N  striped only: the stripe unit, a multiple of 4 KiB from 4 to 16384 (default 256)\n"
                  "  --no-host-worker     R2.2: the A/B arm.  By default the HOST THREAD joins the drain, so the\n"
                  "                       pool is six threads on six cores instead of five plus an idle core;\n"
                  "                       this flag restores the five-worker form for comparison on `pool phases`.\n"
@@ -3180,6 +3189,24 @@ int main(int argc, char** argv) {
             }
             o.expert_tiers.push_back(s);
         }
+        else if (a == "--expert-tier-layout") {
+            // whole (the default) or striped: how the tier set places each expert over its devices. One value for all devices.
+            const std::string v = next("--expert-tier-layout");
+            if (!strata::core::parse_tier_layout_name(v, o.expert_tier_layout.layout)) {
+                std::fprintf(stderr, "strata generate: --expert-tier-layout %s: takes whole or striped\n", v.c_str());
+                return 2;
+            }
+            o.expert_tier_layout.layout_given = true;
+        }
+        else if (a == "--expert-tier-stripe-kib") {
+            // the stripe unit of the striped layout: a multiple of 4 KiB, from 4 to 16384 (docs/EXPERT_TIER.md)
+            const std::string v = next("--expert-tier-stripe-kib");
+            std::string why;
+            if (!strata::core::parse_stripe_kib(v, o.expert_tier_layout.stripe_kib, why)) {
+                std::fprintf(stderr, "strata generate: %s\n", why.c_str());
+                return 2;
+            }
+        }
         else if (a == "--vram-reserve-mib") { o.vram_reserve_mib = std::atoi(next("--vram-reserve-mib")); o.vram_reserve_given = true; }
         else if (a == "--vram-reserve-later-mib")
             o.vram_reserve_later_mib = std::atoi(next("--vram-reserve-later-mib"));
@@ -3403,6 +3430,14 @@ int main(int argc, char** argv) {
             usage();
             return 2;
         }
+        }
+    }
+    {   // the tier layout is refused before anything is loaded: a layout with no --expert-tier, a stripe size with whole, and
+        // striped with fewer than two devices (strata::core::validate_tier_layout, the same rules the Terminal checks)
+        std::string why;
+        if (!strata::core::validate_tier_layout(o.expert_tier_layout, o.expert_tiers.size(), why)) {
+            std::fprintf(stderr, "strata generate: %s\n", why.c_str());
+            return 2;
         }
     }
 #if defined(STRATA_USE_HIP)
@@ -9361,6 +9396,9 @@ int main(int argc, char** argv) {
             tid.layer_blob_bytes.assign((size_t) g.n_layers, 0);
             for (int64_t l = 0; l < g.n_layers; ++l) tid.layer_blob_bytes[(size_t) l] = src.blob_bytes(l);
             auto tset = std::make_unique<strata::core::ExpertTierSet>();
+            // the layout before open(): a tier written in the other layout is refilled (docs/EXPERT_TIER.md)
+            tset->set_layout(o.expert_tier_layout.layout == strata::core::TierLayout::Striped,
+                             (uint64_t) strata::core::tier_stripe_kib(o.expert_tier_layout) * 1024);
             bool treuse = false;
             std::string terr;
             // §5.4: a device that cannot be opened, mapped or sized stops the start with the reason; nothing half-
@@ -9413,7 +9451,7 @@ int main(int argc, char** argv) {
                     for (int64_t e = 0; e < g.n_expert; ++e) {
                         if (gpu_holds(l, e)) ++vram_n;
                         else if (src.has_resident(l, e)) ++ram_n;
-                        else if (!tset->has(l, e)) ++file_n;
+                        else if (!tset->held(l, e)) ++file_n;   // held: a striped expert is on the devices, with no pointer
                     }
                 std::fprintf(stderr, "strata generate: experts: %lld in the GPU cache, %lld in RAM, %lld in %zu tier "
                                      "device(s), %lld on the file tier\n",

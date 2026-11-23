@@ -26,6 +26,7 @@
 #endif
 #include "ds4_launch.h"   // ds4_dbg
 #include "ds4_model.hpp"
+#include "strata/core/expert_tier_spec.hpp"   // --expert-tier-layout / --expert-tier-stripe-kib: the shared rules
 #include "ds4_experts_rule.hpp"
 #include "ds4_os.hpp"
 #include "ds4_packinfo.hpp"
@@ -91,10 +92,54 @@ void print_tier_io(const strata::ds4::Stats& s, const strata::ds4::Stats& base, 
     if (tl == nullptr || std::atoi(tl) == 0 || s.tier_dev_stats.empty()) return;
     nt = std::max(1.0, nt);
     std::fprintf(stderr, "tier io per token (DS4_TIER_LOG; counts and means are this request, p50/p95 since start):\n");
+    if (s.tier_striped) {
+        const auto& a = s.tier_striped_hits;
+        const auto& b = base.tier_striped_hits;
+        std::fprintf(stderr, "  striped logical fills submitted/token %.2f (demand %.2f, prefetch %.2f; mapped-only %.2f, direct-only %.2f, mixed %.2f)\n",
+                     (double) (a.hits - b.hits) / nt, (double) (a.demand - b.demand) / nt,
+                     (double) (a.prefetch - b.prefetch) / nt, (double) (a.mapped_only - b.mapped_only) / nt,
+                     (double) (a.direct_only - b.direct_only) / nt, (double) (a.mixed - b.mixed) / nt);
+        std::fprintf(stderr, "  stripe job bytes are requested ranges, including padding, not disk traffic; outcomes can include earlier submissions or exclude in-flight jobs.\n");
+    }
     for (size_t i = 0; i < s.tier_dev_stats.size(); ++i) {
         const strata::ds4::TierDeviceStats& a = s.tier_dev_stats[i];
         const strata::ds4::TierDeviceStats b = i < base.tier_dev_stats.size()
             ? base.tier_dev_stats[i] : strata::ds4::TierDeviceStats{};
+        if (s.tier_striped) {
+            std::fprintf(stderr, "  %s: %.2f participating fills/token; shared CPU lane wait %.3f ms/token (not additive across devices); direct mode %s\n",
+                         a.path.c_str(), (double) (a.started_experts - b.started_experts) / nt,
+                         (a.wait_ms - b.wait_ms) / nt, a.direct_mode.empty() ? "off" : a.direct_mode.c_str());
+            auto count = [nt](const char* name, const strata::ds4::StripeJobCount& x, const strata::ds4::StripeJobCount& y) {
+                std::fprintf(stderr, " %s %.2f jobs / %.3f MB", name,
+                             (double) (x.jobs - y.jobs) / nt, (double) (x.bytes - y.bytes) / 1e6 / nt);
+            };
+            std::fprintf(stderr, "    mapped stripes/token:");
+            count("submitted", a.stripe.mapped_submitted, b.stripe.mapped_submitted);
+            count("copied", a.stripe.mapped_ok, b.stripe.mapped_ok);
+            count("failed", a.stripe.mapped_failed, b.stripe.mapped_failed);
+            count("cancelled", a.stripe.mapped_cancelled, b.stripe.mapped_cancelled);
+            std::fprintf(stderr, "\n    direct stripes/token:");
+            count("submitted", a.stripe.direct_submitted, b.stripe.direct_submitted);
+            count("read", a.stripe.direct_ok, b.stripe.direct_ok);
+            count("mapped fallback", a.stripe.direct_fallback, b.stripe.direct_fallback);
+            count("failed", a.stripe.direct_failed, b.stripe.direct_failed);
+            count("cancelled", a.stripe.direct_cancelled, b.stripe.direct_cancelled);
+            const double mapped_jobs = (double) (a.completed_jobs - b.completed_jobs);
+            const double direct_jobs = (double) (a.direct_jobs - b.direct_jobs);
+            std::fprintf(stderr,
+                         "\n    mapped copy queue/service mean %.3f/%.3f ms, session service p50/p95 %.3f/%.3f ms; "
+                         "cold mapped ranges %.3f MB/token\n"
+                         "    direct job queue/service mean %.3f/%.3f ms (includes fallback), session service p50/p95 %.3f/%.3f ms; "
+                         "direct matrix payload read %.3f MB/token\n",
+                         mapped_jobs > 0 ? (a.queue_ms - b.queue_ms) / mapped_jobs : 0.0,
+                         mapped_jobs > 0 ? (a.service_ms - b.service_ms) / mapped_jobs : 0.0,
+                         a.service_p50_ms, a.service_p95_ms, (double) (a.cold_bytes - b.cold_bytes) / 1e6 / nt,
+                         direct_jobs > 0 ? (a.direct_queue_ms - b.direct_queue_ms) / direct_jobs : 0.0,
+                         direct_jobs > 0 ? (a.direct_service_ms - b.direct_service_ms) / direct_jobs : 0.0,
+                         a.direct_service_p50_ms, a.direct_service_p95_ms,
+                         (double) (a.direct_payload_ok_bytes - b.direct_payload_ok_bytes) / 1e6 / nt);
+            continue;
+        }
         const double experts = (double) (a.started_experts - b.started_experts) / nt;
         const double demand = (double) (a.demand_experts - b.demand_experts) / nt;
         const double prefetch = (double) (a.prefetch_experts - b.prefetch_experts) / nt;
@@ -153,6 +198,7 @@ void usage() {
                  "maya-ds4 --pack <model>/maya-ds4 [--gpus 0,1,...] [--max-context N] [--reserve-mib N]\n"
                  "           [--vram-experts F] [--cpu-threads N] [--expert-profile FILE|none] [--profile-readonly] [--ssd-cache GB] [--ssd-policy lru|lfu|lfulru] [--no-expert-cache] [--verbose]\n"
                  "           [--expert-tier PATH,mib=N[,reserve=M][,verify=header|full] (repeatable, one per device)] [--expert-tier-refill]\n"
+                 "           [--expert-tier-layout whole]\n"
                  "           [--tp N] [--threads on|off] [--prefill-chunk N] [--dspark on|off|none|auto] [--dspark-block N] [--dspark-conf F] [--dspark-depth N] [--dspark-expert-cache-mib N] [--experts N|auto]\n"
                  "           [--vision on|off] [--mmap-experts on|off|auto]\n"
                  "           (--ids I,J,... [--images FILE] [--n N] [--dump-logits FILE] | --serve\n"
@@ -1362,6 +1408,7 @@ int main(int argc, char** argv) {
     bool pack_info_mode = false;
     std::string images, enc_rgb, enc_out;
     std::string score_ids, score_out, prof_ids, spec_ids;
+    std::string tier_layout_arg, tier_stripe_arg;   // --expert-tier-layout, --expert-tier-stripe-kib (checked after the loop)
     int enc_w = 0, enc_h = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -1384,6 +1431,8 @@ int main(int argc, char** argv) {
         else if (a == "--ssd-cache") o.ssd_cache_gb = std::atof(val("--ssd-cache").c_str());
         else if (a == "--expert-tier") o.expert_tiers.push_back(val("--expert-tier"));   // (repeatable, one entry per device, in the order given: the order is part of the placement)
         else if (a == "--expert-tier-refill") o.expert_tier_refill = true;
+        else if (a == "--expert-tier-layout") tier_layout_arg = val("--expert-tier-layout");
+        else if (a == "--expert-tier-stripe-kib") tier_stripe_arg = val("--expert-tier-stripe-kib");
         else if (a == "--ssd-policy") {
             const std::string v = val("--ssd-policy");
             o.ssd_policy = v == "lfu" ? 1 : v == "lfulru" ? 2 : 0;
@@ -1453,6 +1502,27 @@ int main(int argc, char** argv) {
             usage();
             return 2;
         }
+    }
+    {   // the tier layout (docs/EXPERT_TIER.md, "The layout"): whole is this engine's layout; striped is the Qwen engine's for now
+        strata::core::TierLayoutOpts lo;
+        std::string lwhy;
+        if (!tier_layout_arg.empty()) {
+            if (!strata::core::parse_tier_layout_name(tier_layout_arg, lo.layout)) {
+                std::fprintf(stderr, "strata-dsv41: --expert-tier-layout %s: takes whole or striped\n", tier_layout_arg.c_str());
+                return 2;
+            }
+            lo.layout_given = true;
+        }
+        if (!tier_stripe_arg.empty() && !strata::core::parse_stripe_kib(tier_stripe_arg, lo.stripe_kib, lwhy)) {
+            std::fprintf(stderr, "strata-dsv41: %s\n", lwhy.c_str());
+            return 2;
+        }
+        if (!strata::core::validate_tier_layout(lo, o.expert_tiers.size(), lwhy)) {
+            std::fprintf(stderr, "strata-dsv41: %s\n", lwhy.c_str());
+            return 2;
+        }
+        o.expert_tier_striped = lo.layout == strata::core::TierLayout::Striped;   // (docs/EXPERT_TIER.md: the stripes over every device)
+        o.expert_tier_stripe_kib = strata::core::tier_stripe_kib(lo);
     }
     if (pack_info_mode) {   // the pack's description only: no device, no weights, no lock
         if (o.pack.empty()) {
@@ -1680,11 +1750,18 @@ int main(int argc, char** argv) {
                      (long long) s.store_zc_visible);
     }
     if (s.tier_devices > 0) {   // --expert-tier (docs/EXPERT_TIER_DSV41_PLAN.md §8.2: the tier's copies are not file bytes)
-        std::fprintf(stderr,
-                     "tier: %lld experts on %lld tier devices; %.1f experts a token copied from them (%.1f MB a token not read from the files); %s\n",
-                     (long long) s.tier_experts, (long long) s.tier_devices,
-                     (double) (s.tier_hits - s0.tier_hits) / nt, (double) (s.tier_bytes - s0.tier_bytes) / 1e6 / nt,
-                     s.tier_fill_s > 0.0 ? "the fill read them once at start" : "the placement was reused");
+        if (s.tier_striped)
+            std::fprintf(stderr,
+                         "tier: %lld experts on %lld tier devices; %.1f striped fills a token submitted (%.1f MB a token of stripe ranges); %s\n",
+                         (long long) s.tier_experts, (long long) s.tier_devices,
+                         (double) (s.tier_hits - s0.tier_hits) / nt, (double) (s.tier_bytes - s0.tier_bytes) / 1e6 / nt,
+                         s.tier_fill_s > 0.0 ? "the fill read them once at start" : "the placement was reused");
+        else
+            std::fprintf(stderr,
+                         "tier: %lld experts on %lld tier devices; %.1f experts a token copied from them (%.1f MB a token not read from the files); %s\n",
+                         (long long) s.tier_experts, (long long) s.tier_devices,
+                         (double) (s.tier_hits - s0.tier_hits) / nt, (double) (s.tier_bytes - s0.tier_bytes) / 1e6 / nt,
+                         s.tier_fill_s > 0.0 ? "the fill read them once at start" : "the placement was reused");
         print_tier_io(s, s0, nt);
     }
     if (s.ahead_picks > s0.ahead_picks) {   // lookahead

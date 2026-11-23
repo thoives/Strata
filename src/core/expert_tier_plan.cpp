@@ -70,6 +70,54 @@ std::vector<TierPlacement> plan_expert_tiers(
     return out;
 }
 
+uint64_t striped_piece_bytes(uint64_t blob_bytes, uint64_t stripe_bytes, uint32_t n_devices, int32_t start, uint32_t device) {
+    if (blob_bytes == 0 || stripe_bytes == 0 || n_devices == 0 || device >= n_devices || start < 0 || (uint32_t) start >= n_devices)
+        return 0;
+    const uint64_t n = (blob_bytes + stripe_bytes - 1) / stripe_bytes;   // stripes in the blob (the last one may be short)
+    const uint64_t j0 = (device + n_devices - (uint32_t) start) % n_devices;   // this device's first stripe
+    if (j0 >= n) return 0;
+    const uint64_t held = (n - 1 - j0) / n_devices + 1;                    // stripes this device holds
+    const uint64_t last = n - 1;
+    if ((last - j0) % n_devices == 0) return (held - 1) * stripe_bytes + (blob_bytes - last * stripe_bytes);   // the short tail
+    return held * stripe_bytes;
+}
+
+std::vector<StripedPlacement> plan_expert_tiers_striped(
+    const std::vector<std::pair<int32_t, int32_t>>& ranked_rest,
+    const std::vector<uint64_t>& layer_blob_bytes,
+    const std::vector<TierDevice>& devices,
+    uint64_t stripe_bytes) {
+    std::vector<StripedPlacement> out(ranked_rest.size());
+    const uint32_t n_devices = (uint32_t) devices.size();
+    if (n_devices == 0 || ranked_rest.empty() || stripe_bytes == 0 || stripe_bytes % 4096 != 0) return out;
+    for (StripedPlacement& p : out) p.offset.assign(n_devices, 0);
+    std::vector<uint64_t> used(n_devices, 0), piece(n_devices, 0), at(n_devices, 0);
+    uint64_t placed = 0;
+    for (size_t i = 0; i < ranked_rest.size(); ++i) {
+        const int32_t l = ranked_rest[i].first;
+        const uint64_t blob = (l >= 0 && (size_t) l < layer_blob_bytes.size()) ? layer_blob_bytes[(size_t) l] : 0;
+        if (blob == 0) continue;   // a layer with no blob bytes: nothing to place, not a stop (as the whole deal)
+        const int32_t start = (int32_t) (placed % n_devices);   // the rotation starts on the next device each placed expert
+        // every piece must fit before the expert is committed: a partial expert would leave stripes that no read reaches
+        bool fits = true;
+        for (uint32_t d = 0; d < n_devices && fits; ++d) {
+            piece[d] = striped_piece_bytes(blob, stripe_bytes, n_devices, start, d);
+            if (piece[d] == 0) continue;
+            at[d] = align_up(used[d], 4096);
+            if (at[d] + piece[d] > devices[d].capacity_bytes) fits = false;
+        }
+        if (!fits) break;   // the rank-prefix stop rule: this expert and the colder ones fall to the file tier
+        out[i].start = start;
+        for (uint32_t d = 0; d < n_devices; ++d) {
+            if (piece[d] == 0) continue;
+            out[i].offset[d] = at[d];
+            used[d] = at[d] + piece[d];
+        }
+        ++placed;
+    }
+    return out;
+}
+
 std::vector<std::pair<int32_t, int32_t>> tier_ranked_rest(
     const std::vector<std::pair<int32_t, int32_t>>& profile, int64_t n_layers, int64_t n_expert,
     const std::function<bool(int64_t, int64_t)>& held_elsewhere) {

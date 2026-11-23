@@ -49,10 +49,9 @@ public:
     struct Stats {
         std::atomic<int64_t> hits{0}, misses{0}, prefetched{0}, prefetch_used{0}, prefetch_wasted{0}, evictions{0}, fails{0};
         std::atomic<int64_t> bytes_read{0}, wait_ns{0}, no_slot{0}, cancelled{0}, put{0};
-        // the expert tier (ds4_tier.hpp, §8.2): copies served from a tier slot into a store slot.  Not counted in bytes_read
-        // (file bytes), so the file-read figure stays meaningful (§8.2 there).
+        // Tier hits and bytes count submitted logical fills, including any later cancelled or failed fills; file bytes stay separate.
         std::atomic<int64_t> tier_hits{0}, tier_bytes{0};
-        std::atomic<int64_t> tier_direct{0};   // (DS4_TIER_DIRECT: tier hits submitted as one whole-slot direct read; the rest are mapped copies)
+        std::atomic<int64_t> tier_direct{0};   // tier hits with at least one direct job (a striped hit may also have mapped jobs)
     };
     /// DS4_TIER_DIRECT (ds4_tier.hpp): a tier slot's whole read, if its device can take one now.  `fd` is the device's unbuffered
     /// descriptor (kept open until the device's queue has drained); [off, off + len) is the slot in that device; `align` and
@@ -62,6 +61,13 @@ public:
         os::fd_t fd = os::kBadFd;
         uint64_t off = 0, len = 0, align = 0, mem_align = 0;
         std::atomic<bool>* refused = nullptr;
+    };
+    // One stripe of a striped tier expert: `src` in device `dev`'s mapping, copied to `blob_off` of the store slot's blob, `len` bytes.
+    struct TierStripe {
+        int dev = -1;
+        const uint8_t* src = nullptr;
+        uint64_t blob_off = 0, len = 0;
+        uint64_t device_off = 0;   // byte offset of src in the tier device
     };
     struct Vis {                 // a slot the GPU may read from now on (dev != 0), or no longer (dev == 0)
         int layer = 0, e = 0;
@@ -93,6 +99,9 @@ public:
         // Both are null unless DS4_TIER_LOG is set; the normal path pays no counters.
         std::function<void(int dev, uint64_t bytes, bool demand)> tier_note_start;
         std::function<void(int dev, uint64_t ns)> tier_note_wait;
+        // Once per logical striped fill, not once per device; only installed when tier tracing is enabled.
+        std::function<void(bool demand, bool direct, bool mapped)> tier_note_striped_hit;
+
         // a copy out of a tier device failed (its own read error): the caller marks that device, so the tier refills at
         // the next start and its experts fall back to the files (ds4_tier.hpp note_refill, §9)
         std::function<void(int dev)> tier_fail;
@@ -103,15 +112,19 @@ public:
         // DS4_TIER_DIRECT (null: every tier hit is a mapped copy, as before): the whole slot of a tier hit as one direct read,
         // when the device can take it now (false: the mapped copies, as before)
         std::function<bool(int dev, uint64_t slot, TierDirect& out)> tier_direct;
-        // DS4_TIER_WAKE (opt-in; env read once in init(), "1" on, "0" off; unset keeps this value, false): a caller waiting for a
-        // tier-backed slot sleeps on that device's own queue until the slot's reads are done (IoQueue::wait_until_zero), where
-        // the copies run, and not on the store's queue, which none of them signals.  Off: the store queue's 2 ms poll, as in the
-        // last release.  Not yet measured faster: see docs/EXPERT_TIER_DSV41_PLAN.md §8.2.
+        // The striped tier (docs/EXPERT_TIER.md): the stripes of a tier-held striped expert, one copy job each. False: whole or not held.
+        std::function<bool(int layer, int e, std::vector<TierStripe>& out)> tier_stripes;
+        // A stripe's exact device range, available only after the arena has been made safe for direct I/O.
+        std::function<bool(int dev, uint64_t off, uint64_t len, TierDirect& out)> tier_stripe_direct;
+        // DS4_TIER_WAKE (opt-in): a whole-tier slot waits on its device's queue; a striped slot waits on a shared
+        // completion hub signalled by all its queues. Off: the store queue's 2 ms poll, as in the last release.
         bool tier_wake = false;
     };
 
     void set_pfds(const std::vector<os::fd_t>& pfds) { pfds_ = pfds; }   // (the fallback handles were reopened)
     void set_tier_direct(std::function<bool(int, uint64_t, TierDirect&)> f) { cfg_.tier_direct = std::move(f); }
+    void set_tier_stripes(std::function<bool(int, int, std::vector<TierStripe>&)> f) { cfg_.tier_stripes = std::move(f); }
+    void set_tier_stripe_direct(std::function<bool(int, uint64_t, uint64_t, TierDirect&)> f) { cfg_.tier_stripe_direct = std::move(f); }
     /// DS4_TIER_DIRECT: the arena is not inherited by a fork.  A direct read into private memory that a fork shares copy-on-write
     /// can land in the wrong copy (the kernel's O_DIRECT and fork hazard), so the arena's range is MADV_DONTFORK.  Call it before
     /// the first direct read (the tier does, when a device is direct).  False: the advice was refused (the caller stays mapped).
@@ -135,6 +148,8 @@ public:
         cfg_.tier_note_start = std::move(start);
         cfg_.tier_note_wait = std::move(wait);
     }
+
+    void set_tier_striped_trace(std::function<void(bool, bool, bool)> f) { cfg_.tier_note_striped_hit = std::move(f); }
     /// §9: a tier fill read: (layer, e)'s three matrices read exactly as a store fill reads them (the same aligned job
     /// builder, E2), landing inside a tier mapping at `slot_base` on that device's own queue (E3).  The caller owns `left`
     /// (set to 3 by the caller before this) and `bad`; bytes_out counts what was asked for, not the store's file bytes
@@ -195,9 +210,10 @@ public:
             heat_[l].assign((size_t) geo_[l].n_exp, 0.0f);
         }
         io_.reset(new IoQueue(std::max(1, c.threads)));
-        // DS4_LANE_WAKE (opt-in; "1" on, "0" off): the store's completion signal, fed by this queue, by each tier device's queue
-        // (set when a slot's reads are pushed there) and by put_done.  Off: no hub, and nothing below changes.
-        if (const char* lw = std::getenv("DS4_LANE_WAKE"); lw != nullptr && std::atoi(lw) != 0) {
+        // The lane and striped tier waiters share a completion signal, fed by the store and tier queues and put_done.
+        // DS4_TIER_WAKE alone does not enable lane scheduling.
+        if (const char* lw = std::getenv("DS4_LANE_WAKE")) lane_wake_ = std::atoi(lw) != 0;
+        if (lane_wake_ || cfg_.tier_wake) {
             hub_ = std::make_shared<CompletionHub>();
             io_->set_hub(hub_);
         }
@@ -307,7 +323,7 @@ public:
     /// True when the reads of slot sl (from begin) are all done.
     bool loaded(int s) const { return s >= 0 && slots_[(size_t) s].left.load(std::memory_order_acquire) <= 0; }
     /// DS4_LANE_WAKE on (the store has its completion signal): a lane may sleep in wait_any_loaded().  Off: false.
-    bool lane_wake_on() const { return hub_ != nullptr; }
+    bool lane_wake_on() const { return lane_wake_; }
     /// DS4_LANE_WAKE: sleeps until one of the slots sl[0..n) has its last read done, or `timeout_us` passes (the caller looks again).
     /// Returns true when one is done.  Only the slots' own counts end the wait: a completion of any other slot, or of one of several
     /// reads of a slot, wakes it to test and it sleeps again.  The test is made under the hub's mutex, and the sleep is entered
@@ -348,15 +364,21 @@ public:
                 const int tdev = sp.src_dev;
                 const auto tw0 = std::chrono::steady_clock::now();
                 wait_left(sp);
-                if (tdev >= 0 && cfg_.tier_note_wait)
-                    cfg_.tier_note_wait(tdev, (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        std::chrono::steady_clock::now() - tw0).count());
+                if (tdev >= 0 && cfg_.tier_note_wait) {
+                    const uint64_t ns = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - tw0).count();
+                    const unsigned mask = sp.stripe_mask.load(std::memory_order_acquire);
+                    // For stripes this is the same shared wall wait on each participating device, not additive device time.
+                    if (mask == 0) cfg_.tier_note_wait(tdev, ns);
+                    else for (unsigned d = 0; d < 32; ++d) if (mask & (1u << d)) cfg_.tier_note_wait((int) d, ns);
+                }
             }
             std::lock_guard<std::mutex> lk(mu_);
             finish(sp);
             if (sp.state.load() == kReady) ok[(size_t) i] = 1;
             else {
-                sp.pin--;
+                if (sp.pin > 0) --sp.pin;
+                free_failed_if_unpinned(sp, (size_t) s);
                 sl[(size_t) i] = -1;
                 all = false;
             }
@@ -425,7 +447,8 @@ public:
             std::lock_guard<std::mutex> lk(mu_);
             for (const int s : order) {
                 Slot& sp = slots_[(size_t) s];
-                if (sp.pin > 0) sp.pin--;   // (unpinned before any finish: a failed slot goes free, and no pin may outlive it)
+                if (sp.pin > 0) sp.pin--;
+                free_failed_if_unpinned(sp, (size_t) s);
                 if (sp.state.load(std::memory_order_acquire) == kLoading && sp.left.load(std::memory_order_acquire) == 0) {
                     try_ready(sp);
                     if (sp.state.load(std::memory_order_acquire) == kLoading) finish(sp);
@@ -454,7 +477,7 @@ public:
     }
     /// A slot for (layer, e) that the caller fills with the expert's blob itself (an expert the VRAM cache gives back to the CPU lane: its bytes
     /// are in memory already, so no read from the SSD while the lane waits).  Returns the blob's address, or nullptr (it is here already, or
-    /// no slot can be had).  The slot is pinned and not findable until put_done().
+    /// no slot can be had). The slot is pinned until put_done(); a concurrent caller can find it and wait for completion.
     uint8_t* put_begin(int layer, int e) {
         if (layer < 0 || layer >= (int) geo_.size() || e < 0 || e >= geo_[(size_t) layer].n_exp) return nullptr;
         std::lock_guard<std::mutex> lk(mu_);
@@ -476,6 +499,7 @@ public:
         sp.bad.store(false);
         sp.cancel.store(false);
         sp.fail.store(false);
+        sp.stripe_mask.store(0);
         sp.src_dev = -1;
         sp.left.store(1, std::memory_order_release);
         sp.state.store(kLoading, std::memory_order_release);
@@ -497,8 +521,8 @@ public:
                 where_[(size_t) layer][(size_t) e] = -1;
                 sp.layer = sp.expert = -1;
                 sp.left.store(0, std::memory_order_release);
-                sp.state.store(kFree, std::memory_order_release);
-                free_hint_ = std::min<size_t>(free_hint_, (size_t) s);
+                sp.state.store(kFailed, std::memory_order_release);
+                free_failed_if_unpinned(sp, (size_t) s);
             }
         }
         // No job of the store's queue counted this slot down: a caller waiting for it (wait_left on the store queue) is woken now
@@ -636,6 +660,7 @@ private:
     struct Slot {
         uint8_t* base = nullptr;   // the blob's first byte
         int layer = -1, expert = -1, pin = 0;
+        std::atomic<unsigned> stripe_mask{0};   // participating devices: a real striped failure marks all of them
         std::atomic<int> src_dev{-1};   // (>= 0: this slot's bytes came from tier device src_dev: a failure marks that device, §9;
                                         //  atomic: wait_left() reads it outside mu_, for a slot preload() does not pin)
         bool prefetch = false, visible = false;
@@ -666,9 +691,19 @@ private:
         if (len == 0 || a > slot_bytes_ || len > slot_bytes_ - a) return false;
         return (td.off + a) % td.align == 0 && len % td.align == 0 && (dst + a) % td.mem_align == 0 && len % td.mem_align == 0;
     }
-    // DS4_TIER_DIRECT: the range of the tier's slot that one direct read takes (mu_ held): with DS4_TIER_DIRECT_SPAN on, the aligned span
-    // that covers the layer's three matrices (the slot's leading and trailing padding left out; the matrices' gaps stay in); when
-    // that span cannot meet the device's alignments or bounds, and always with the switch off, the whole slot.  False: neither fits.
+    // A stripe must land entirely in the blob without rounding into a neighbouring stripe.
+    bool direct_stripe_fits(const TierDirect& td, const Slot& sp, const TierStripe& stripe) const {
+        if (td.fd == os::kBadFd || td.len != stripe.len || td.align == 0 || td.mem_align == 0 ||
+            (td.align & (td.align - 1)) != 0 || (td.mem_align & (td.mem_align - 1)) != 0 ||
+            stripe.len == 0 || stripe.blob_off > slot_bytes_ - 2 * kSlack ||
+            stripe.len > slot_bytes_ - 2 * kSlack - stripe.blob_off) return false;
+        const uintptr_t dst = (uintptr_t) sp.base + stripe.blob_off;
+        const uintptr_t lo = (uintptr_t) arena_;
+        if (dst < lo || dst - lo > arena_bytes_ || stripe.len > arena_bytes_ - (dst - lo)) return false;
+        return td.off % td.align == 0 && stripe.len % td.align == 0 &&
+               dst % td.mem_align == 0 && stripe.len % td.mem_align == 0;
+    }
+    // With DS4_TIER_DIRECT_SPAN, try the matrices' aligned span; otherwise read the whole slot.
     bool direct_range(const LayerGeo& g, const TierDirect& td, const Slot& sp, uint64_t& a, uint64_t& len) const {
         if (direct_span_ && td.align != 0 && (td.align & (td.align - 1)) == 0) {
             uint64_t lo = UINT64_MAX, hi = 0;
@@ -724,12 +759,97 @@ private:
         sp.bad.store(false);
         sp.cancel.store(false);
         sp.fail.store(false);
+        sp.stripe_mask.store(0);
         const LayerGeo& g = geo_[(size_t) layer];
         IoQueue::Job jobs[3];
         // §8.1: a store miss checks the tier next.  A tier hit is served by three memory-copy jobs (ds4_pool.hpp's
         // `mem` form: a copy of len bytes from memory to dst instead of a read) into this store slot, on the tier
         // device's own queue (E3), with the store's priority rule kept (§8.4: a demand copy at the front, a guess at
         // the back, and a guess the layer moved past cancelled as today).  A miss in both bands reads the file, as today.
+        // A striped tier expert: one mapped copy or direct read per stripe on its device's queue, with the store's priority
+        // and cancel rules, counted into sp.left; the slot is published when all of them are down. A
+        // device with no queue, or no stripes, leaves the expert to the files below.
+        if (cfg_.tier_stripes && cfg_.tier_queue) {
+            std::vector<TierStripe> stripes;
+            if (cfg_.tier_stripes(layer, e, stripes) && !stripes.empty()) {
+                int ndev = 0;
+                bool queues_ok = true;
+                for (const TierStripe& st : stripes) {
+                    if (st.dev < 0 || st.dev >= 32) { queues_ok = false; break; }
+                    ndev = std::max(ndev, st.dev + 1);
+                }
+                std::vector<IoQueue*> qs((size_t) ndev, nullptr);
+                for (const TierStripe& st : stripes) {
+                    if (!queues_ok || st.src == nullptr || st.len == 0 ||
+                        st.blob_off > slot_bytes_ - 2 * kSlack || st.len > slot_bytes_ - 2 * kSlack - st.blob_off) {
+                        queues_ok = false; break;
+                    }
+                    if (qs[(size_t) st.dev] == nullptr) qs[(size_t) st.dev] = cfg_.tier_queue(st.dev);
+                    if (qs[(size_t) st.dev] == nullptr) { queues_ok = false; break; }
+                }
+                if (queues_ok) {
+                    std::vector<std::vector<IoQueue::Job>> per((size_t) ndev);
+                    unsigned mask = 0;
+                    uint64_t bytes = 0;
+                    bool any_direct = false, any_mapped = false;
+                    sp.left.store((int) stripes.size(), std::memory_order_release);   // (before any job can run)
+                    for (const TierStripe& st : stripes) {
+                        IoQueue::Job j;
+                        j.dst = sp.base + st.blob_off;
+                        j.len = st.len;
+                        TierDirect td;
+                        if (cfg_.tier_stripe_direct && cfg_.tier_stripe_direct(st.dev, st.device_off, st.len, td) &&
+                            direct_stripe_fits(td, sp, st)) {
+                            j.dfd = td.fd;
+                            j.off = td.off;
+                            j.align = td.align;
+                            j.mem_align = td.mem_align;
+                            // Count matrix bytes, not the blob's padding, as useful direct payload.
+                            for (int r = 0; r < 3; ++r) {
+                                const uint64_t lo = std::max(st.blob_off, g.tr[r]);
+                                const uint64_t hi = std::min(st.blob_off + st.len, g.tr[r] + g.bytes[r]);
+                                if (hi > lo) j.payload += hi - lo;
+                            }
+                            j.fallback = st.src;
+                            j.refused = td.refused;
+                            j.tier_direct = true;
+                            any_direct = true;
+                        } else {
+                            j.mem = st.src;
+                            any_mapped = true;
+                        }
+                        j.tier_stripe = true;
+                        j.left = &sp.left;
+                        j.bad = &sp.bad;
+                        j.fail = &sp.fail;
+                        j.cancel = demand ? nullptr : &sp.cancel;
+                        j.tier_copy = true;
+                        j.demand = demand;
+                        per[(size_t) st.dev].push_back(j);
+                        mask |= 1u << (unsigned) st.dev;
+                        bytes += st.len;
+                    }
+                    sp.src_dev = stripes[0].dev;
+                    sp.stripe_mask.store(mask);
+                    st_.tier_hits.fetch_add(1, std::memory_order_relaxed);
+                    st_.tier_bytes.fetch_add((int64_t) bytes, std::memory_order_relaxed);
+                    if (any_direct) st_.tier_direct.fetch_add(1, std::memory_order_relaxed);
+                    if (cfg_.tier_note_striped_hit) cfg_.tier_note_striped_hit(demand, any_direct, any_mapped);
+                    where_[(size_t) layer][(size_t) e] = s;
+                    for (size_t d = 0; d < per.size(); ++d) {
+                        if (per[d].empty()) continue;
+                        if (cfg_.tier_note_start) {
+                            uint64_t dev_bytes = 0;
+                            for (const auto& j : per[d]) dev_bytes += j.len;
+                            cfg_.tier_note_start((int) d, dev_bytes, demand);
+                        }
+                        if (hub_ != nullptr) qs[d]->set_hub(hub_);   // (DS4_LANE_WAKE)
+                        qs[d]->push(per[d].data(), (int) per[d].size(), !demand);
+                    }
+                    return s;
+                }
+            }
+        }
         int tdev = -1;
         uint64_t tslot = 0;
         uint8_t* tbase = nullptr;
@@ -813,16 +933,22 @@ private:
         else io_->push(jobs, 3, !demand);            // (a guess waits behind every demand read)
         return s;
     }
-    // Waits until the slot's reads are all done (`left` zero).  Call it without mu_.  wait_slots() has the slot pinned.  preload()
-    // does not: once its reads are done another thread may give the slot up and fill it again, and this then waits for that
-    // fill (the slots array never moves, and src_dev is atomic); preload() looks at the state again under mu_ afterwards.
-    // DS4_TIER_WAKE off (the default): the store queue's 2 ms poll, as in the last release.  On: a tier-backed slot's copies run
-    // on its device's queue (§8.2/E3), which the store queue never hears of, so the caller sleeps there until the slot's own
-    // count is zero.  The queue is looked up again at every turn (a device that closed in the meantime falls back to the store's
-    // queue), and the wait there is bounded: a lost wake-up costs the bound, not a hang.  A slot read from the files and a slot
-    // the GPU put in (put_begin) have no tier device and keep the store queue.
+    // Waits until the slot's reads are all done (`left` zero). Call it without mu_; wait_slots() and preload() pin the slot.
+    // DS4_TIER_WAKE off: the store queue's 2 ms poll. On: wait on the device queue for whole slots, or the shared hub
+    // for stripes, since the last stripe may finish on any device. Waits are bounded; file and GPU-put slots keep the store queue.
     void wait_left(Slot& sp) {
         while (sp.left.load(std::memory_order_acquire) > 0) {
+            if (cfg_.tier_wake && hub_ && sp.stripe_mask.load(std::memory_order_acquire) != 0) {
+                std::unique_lock<std::mutex> lk(hub_->mu);
+#ifdef DS4_IOQUEUE_TEST_HOOKS
+                if (sp.left.load(std::memory_order_acquire) > 0)
+                    if (CompletionHub::WaitHook h = CompletionHub::wait_hook()) h(hub_.get());
+#endif
+                hub_->cv.wait_for(lk, std::chrono::milliseconds(50), [&] {
+                    return sp.left.load(std::memory_order_acquire) <= 0;
+                });
+                continue;
+            }
             IoQueue* tq = nullptr;
             if (cfg_.tier_wake) {
                 const int dev = sp.src_dev;
@@ -838,18 +964,29 @@ private:
         if (sp.left.load(std::memory_order_acquire) == 0 && !sp.bad.load(std::memory_order_acquire))
             sp.state.compare_exchange_strong(want, kReady, std::memory_order_acq_rel);
     }
+    // Failed slots cannot be recycled while any begin/preload waiter still holds a pin.
+    void free_failed_if_unpinned(Slot& sp, size_t s) {
+        if (sp.pin == 0 && sp.state.load(std::memory_order_acquire) == kFailed) {
+            sp.state.store(kFree, std::memory_order_release);
+            free_hint_ = std::min(free_hint_, s);
+        }
+    }
     void finish(Slot& sp) {   // mu_ held; reads done
         if (sp.state.load() != kLoading) return;
         if (sp.bad.load()) {
-            // a copy out of the tier that RAN and failed: its device refills next start (§9).  A guess the layer moved past is
-            // dropped unread (bad set, fail not): that is the store's own housekeeping and says nothing about the device.
-            if (sp.src_dev >= 0 && sp.fail.load(std::memory_order_acquire) && cfg_.tier_fail) cfg_.tier_fail(sp.src_dev);
+            const bool failed = sp.fail.load(std::memory_order_acquire);
+            if (failed && sp.src_dev >= 0 && cfg_.tier_fail) {
+                const unsigned mask = sp.stripe_mask.load(std::memory_order_acquire);
+                if (mask == 0) cfg_.tier_fail(sp.src_dev);
+                else for (unsigned d = 0; d < 32; ++d) if (mask & (1u << d)) cfg_.tier_fail((int) d);
+            }
             where_[(size_t) sp.layer][(size_t) sp.expert] = -1;
             sp.layer = sp.expert = -1;
-            sp.state.store(kFree, std::memory_order_release);
+            sp.state.store(kFailed, std::memory_order_release);
             sp.prefetch = false;
-            if (sp.cancel.load()) st_.cancelled.fetch_add(1, std::memory_order_relaxed);
+            if (!failed && sp.cancel.load()) st_.cancelled.fetch_add(1, std::memory_order_relaxed);
             else st_.fails.fetch_add(1, std::memory_order_relaxed);
+            free_failed_if_unpinned(sp, (size_t) (&sp - slots_.get()));
             return;
         }
         sp.state.store(kReady, std::memory_order_release);
@@ -945,6 +1082,7 @@ private:
     // (mu_) an upper bound on the guesses still loading: start_fill counts a guess up, preload counts its own back down (it is
     // warm, not a guess), cancel_stale recounts them exactly.  Zero: cancel_stale has nothing to cancel and does not walk.
     size_t guesses_loading_ = 0;
+    bool lane_wake_ = false;
     bool direct_span_ = false;   // DS4_TIER_DIRECT_SPAN (read in init): a direct tier read takes the matrices' span, not the slot
     bool pin_first_ = true;      // DS4_STORE_PIN_FIRST (read in init): begin() pins the held experts before it fills misses (0: the old order)
     bool cancel_scan_ = false;   // DS4_STORE_CANCEL_SCAN (read in init): 1 = cancel_stale() walks the arena on every call (the old way)
@@ -957,7 +1095,7 @@ private:
     uint64_t clock_ = 0;
     std::mutex mu_;
     std::unique_ptr<IoQueue> io_;
-    std::shared_ptr<CompletionHub> hub_;   // DS4_LANE_WAKE: the store's completion signal (null: off).  Shared with the queues that hold it.
+    std::shared_ptr<CompletionHub> hub_;   // shared completion signal for opt-in lane or striped tier wake
     Stats st_;
 };
 

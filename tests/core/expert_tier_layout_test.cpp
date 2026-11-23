@@ -138,12 +138,55 @@ static void crc32c_forms_agree() {
         }
 }
 
+
+// The striped layout (docs/EXPERT_TIER.md): its header version is its own, the reader takes either layout's version (the engine
+// checks which one it expects), and the striped table round-trips and refuses the shapes that cannot be a table of this start.
+static void striped_version_and_table() {
+    TierHeader h{};
+    std::memcpy(h.magic, kTierMagic, 8);
+    h.version = kTierLayoutVersionStriped;
+    h.reserved0 = 65536;   // the stripe unit
+    h.fill_state = 2;
+    uint8_t buf[kTierHeaderBytes];
+    encode_header(h, buf);
+    TierHeader back{};
+    std::string why;
+    require(decode_header(buf, back, why), "a striped header did not decode: " + why);
+    require(back.version == kTierLayoutVersionStriped && back.reserved0 == 65536, "striped header fields did not survive");
+    require(kTierLayoutVersionStriped != kTierLayoutVersion, "the striped layout must have its own version");
+
+    h.version = 4;   // a layout this engine does not know is refused, and the refusal names the versions it reads
+    encode_header(h, buf);
+    require(!decode_header(buf, back, why), "a version 4 header was read");
+    require(why.find("2 and 3") != std::string::npos, "the refusal does not name the versions it reads: " + why);
+
+    std::vector<StripedTableEntry> es(2);
+    es[0] = {3, 7, 1, {4096, 8192}};
+    es[1] = {4, 0, 0, {0, 12288}};
+    const std::vector<uint8_t> bytes = encode_striped_table(es, 2);
+    require(striped_entry_bytes(2) == 28 && bytes.size() == 2 * 28, "a striped entry is 12 + 8 bytes per device");
+    std::vector<StripedTableEntry> got;
+    require(decode_striped_table(bytes.data(), bytes.size(), 2, got, why), "the striped table did not decode: " + why);
+    require(got.size() == 2 && got[0].layer == 3 && got[0].expert == 7 && got[0].start == 1, "striped table entry fields");
+    require(got[0].offset == es[0].offset && got[1].offset == es[1].offset, "striped table offsets");
+    require(decode_striped_table(bytes.data(), 0, 2, got, why) && got.empty(), "an empty striped table is a table of no experts");
+
+    require(!decode_striped_table(bytes.data(), bytes.size() - 1, 2, got, why), "a table that is not whole entries was read");
+    std::vector<uint8_t> bad = bytes;
+    bad[8] = 2;                                   // the first entry's start device is 2, and there are 2 devices
+    require(!decode_striped_table(bad.data(), bad.size(), 2, got, why), "a start device outside the set was read");
+    bad = bytes;
+    bad[12] = 1;                                  // the first device's offset 4097: not 4 KiB aligned
+    require(!decode_striped_table(bad.data(), bad.size(), 2, got, why), "an unaligned piece offset was read");
+}
+
 int main() {
     try {
         header_round_trip();
         placement_table_codec();
         chunk_table_codec();
         crc32c_forms_agree();
+        striped_version_and_table();
         std::cout << "expert_tier_layout_test: PASS\n";
         return 0;
     } catch (const std::exception& error) {

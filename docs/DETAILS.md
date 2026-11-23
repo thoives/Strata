@@ -291,16 +291,25 @@ and on Windows. `STRATA_PREFILL_HOST_PLAN=0` turns it off; `STRATA_SSD_GBPS` ove
 
 ### Expert tier (`--expert-tier`, opt-in, off by default)
 
+The details below describe the Qwen engine unless stated otherwise. DeepSeek also supports the opt-in striped layout;
+see [EXPERT_TIER.md](EXPERT_TIER.md#the-layout-whole-or-striped-opt-in) for its rules and differences.
+
 An expert tier is one file you choose on a disk device of your own (an NVMe, a RAM disk, a second drive): `--expert-tier
 PATH,mib=N[,reserve=M][,verify=header|full]`, one flag per device, repeatable, in the order given. The experts the GPU
 and the RAM copy do not hold are written into the tier once at start (a `strata generate: expert tier: filled ... in ... s`
 line), and every read after that takes the order RAM copy, tier, files. With no `--expert-tier` nothing here is touched:
 the read paths stay byte-identical.
 
-- **Placement.** The tier's contents are fixed for the run. The experts are taken in the profile's rank order (hottest
+- **Placement, whole (the default).** The tier's contents are fixed for the run. The experts are taken in the profile's rank order (hottest
   first; unranked experts follow in layer order), and with several devices they are dealt round-robin, hottest first,
   each device charged the blob's real size; when a device is full the deal skips it, and when every device is full the
   rest stays on the file tier. The device order is part of the identity: another order means another placement.
+- **Placement, striped (`--expert-tier-layout striped --expert-tier-stripe-kib N`, opt-in, Qwen engine).** Each expert is cut
+  into stripes of N KiB (a multiple of 4 KiB, 4 to 16384, default 256); stripe k goes to device (start + k) mod D, and a
+  device's stripes of one expert sit back to back in one 4 KiB-aligned piece of its data region. The start device rotates
+  from one placed expert to the next. An expert is placed only when every piece fits, so the first that does not fit stops
+  the deal. All devices stay in the set: a smaller device limits the share of each, and the rest of a larger one is reported
+  as unused. The layout needs 2 to 8 devices. A plan writes nothing to the devices; it reads their sizes and headers.
 - **Which devices are refused.** Each entry follows one set of rules, shared by both engines, setup and `strata launch`
   (`include/strata/core/expert_tier_spec.hpp`, `strata_control/expert_tier.py`, cases in `tests/core/expert_tier_spec_cases.txt`).
   Devices are compared by what they are, not by their path. The start stops, before writing anything, when two entries are one
@@ -317,14 +326,15 @@ the read paths stay byte-identical.
   device; its capacity is read with `ioctl BLKGETSIZE64`, since `stat` reports 0 for it). Windows and macOS take a regular file only.
 - **Reuse or refill.** The header names the model pack (a SHA-256 over every file of the pack: its path, size and modification
   time, so a change to any one file counts; a GGUF read in place from outside the pack counts too) and the expert profile (its SHA-256),
-  plus the layout version (2: version 1 headers left `fill_state` out of the checksum and refill once) and the device count and
-  order. A fill writes `fill_state = 2` only after every device's data and chunk table are flushed and each flush has succeeded.
+  plus the layout version (2 for whole, 3 for striped; version 1 headers left `fill_state` out of the checksum and refill once), the
+  stripe size (striped: in the header's `reserved0`) and the device count and order. A fill writes `fill_state = 2` only after every device's data and chunk table are flushed and each flush has succeeded.
   A failed flush leaves `fill_state = 1`, so the next start refills. Same identity, a completed fill (`fill_state = 2`): the tier is
   reused, nothing is copied. Anything else - another pack or profile, a torn or unreadable header, a changed layout - refills
   the tier at that start and writes the headers again. A `verify=full` start checks every 4 MiB chunk's checksum: a bad chunk
   falls back to the file tier for its blobs, says so in the log, and marks the device so the next start refills it.
-- **Reading it.** A tier-held expert is never staged, warmed or claimed for RAM (the tier answers instead); `pin_cache_complement`
-  never picks a tier-held blob. The tier's counters (`tier_reads`, `tier_read_bytes`, `tier_ms`) print beside the file ones:
+- **Reading it.** A striped expert has no contiguous tier pointer. The copy paths (`copy_blob`, `copy_blobs`) gather its stripes
+  from the devices; decode can gather them into a staging slot. `blob_stable` and lent-cache refills still use the model files.
+  The tier's counters (`tier_reads`, `tier_read_bytes`, `tier_ms`) print beside the file ones:
   an appended segment on the `expert tiers` line of `--stats`, on the server's `strata serve: expert tiers:` line, and on
   `DONE` as `tier_reads=` `tier_mb=` `tier_ms=` (`GET /metrics` lists the three per request). Nothing is printed for them
   with no tier, so a tier-free line is as before. The seconds measure the time spent copying from the tier; a tier lookup

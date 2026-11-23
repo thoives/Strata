@@ -475,3 +475,116 @@ def claim(path: str, mib: int) -> None:
     with device_lock(path) as (fd, size):
         end = min(size, mib * 1024 * 1024)
         _zero_range(fd, 0, end)
+
+
+# ---- the layout of the whole set (docs/EXPERT_TIER.md, "The layout") ----------------------------------------------------
+# --expert-tier-layout whole|striped and --expert-tier-stripe-kib N apply to every --expert-tier device. The rules are the
+# engines' (include/strata/core/expert_tier_spec.hpp: validate_tier_layout, parse_stripe_kib), checked here before a download.
+
+LAYOUTS = ("whole", "striped")
+DEFAULT_STRIPE_KIB = 256            # kTierStripeKibDefault
+MIN_STRIPE_KIB, MAX_STRIPE_KIB = 4, 16384   # kTierStripeKibMin, kTierStripeKibMax
+MAX_STRIPED_DEVICES = 8             # kTierStripedMaxDevices: bounds the placement table (12 + 8 bytes per device, per expert)
+LAYOUT_FLAGS = ("--expert-tier-layout", "--expert-tier-stripe-kib")
+LAYOUT_HEADER_VERSIONS = {2: "whole", 3: "striped"}   # kTierLayoutVersion, kTierLayoutVersionStriped
+
+
+def parse_layout(text: object) -> tuple[str | None, str]:
+    """"whole" or "striped", in any case -> (the layout, ""), or (None, the reason in plain words)."""
+    raw = str(text)
+    v = raw.lower() if raw.isascii() else raw
+    if v in LAYOUTS:
+        return v, ""
+    return None, f"--expert-tier-layout {raw}: takes whole or striped"
+
+
+def parse_stripe_kib(text: object) -> tuple[int | None, str]:
+    """A stripe size in KiB: digits only, a multiple of 4 from 4 to 16384 -> (KiB, ""), or (None, the reason)."""
+    raw = str(text)
+    if not raw or any(c not in "0123456789" for c in raw):
+        return None, f"--expert-tier-stripe-kib takes a whole number of KiB (a multiple of 4), not '{raw}'"
+    n = int(raw)
+    if n < MIN_STRIPE_KIB or n > MAX_STRIPE_KIB or n % 4:
+        return None, (f"--expert-tier-stripe-kib must be a multiple of 4 KiB, from {MIN_STRIPE_KIB} to {MAX_STRIPE_KIB}, not '{raw}'")
+    return n, ""
+
+
+def layout_problem(layout: str | None, stripe_kib: int | None, n_devices: int) -> str:
+    """Why these layout options cannot be used with `n_devices` --expert-tier entries ("" when they can). None for the layout and
+    None for the stripe size mean "not given". Nothing given is always fine: the whole layout, as before."""
+    if layout is None and stripe_kib is None:
+        return ""
+    if n_devices == 0:
+        return ("--expert-tier-layout and --expert-tier-stripe-kib need at least one --expert-tier (with no tier they would do "
+                "nothing)")
+    if stripe_kib is not None and layout != "striped":
+        return "--expert-tier-stripe-kib is for --expert-tier-layout striped (the whole layout has no stripes)"
+    if layout == "striped":
+        if n_devices < 2:
+            return "--expert-tier-layout striped needs at least two --expert-tier devices (it spreads each expert over them)"
+        if n_devices > MAX_STRIPED_DEVICES:
+            return f"--expert-tier-layout striped takes at most {MAX_STRIPED_DEVICES} --expert-tier devices"
+    return ""
+
+
+def striped_stripe_kib(layout: str | None, stripe_kib: int | None) -> int | None:
+    """The stripe unit a striped set uses (the default when not given); None for the whole layout."""
+    if layout != "striped":
+        return None
+    return stripe_kib or DEFAULT_STRIPE_KIB
+
+
+def capacity_estimate(specs: Iterable[TierSpec], layout: str | None, stripe_kib: int | None = None) -> dict:
+    """What the layout can hold, from each device's capacity after its reserve, in GiB. Not measured, and before the small headers and
+    tables (a few MiB). Whole: the devices add up. Striped: every device takes an equal share of each expert, so the smallest device sets
+    the share and the rest of the larger ones stay unused (the engine reports the same in its startup log)."""
+    caps = [(s.mib - s.reserve_mib) / 1024.0 for s in specs]
+    if not caps:
+        return {"layout": layout or "whole", "usable_gib": 0.0, "unused_gib": 0.0, "per_device_gib": []}
+    if layout == "striped":
+        usable = len(caps) * min(caps)
+        return {"layout": "striped", "stripe_kib": striped_stripe_kib(layout, stripe_kib), "usable_gib": usable,
+                "unused_gib": sum(caps) - usable, "per_device_gib": caps}
+    return {"layout": layout or "whole", "usable_gib": sum(caps), "unused_gib": 0.0, "per_device_gib": caps}
+
+
+def header_layout(path: str) -> dict | None:
+    """What the Qwen engine's tier on a device is, from its header alone (read, never written): {"layout": "whole" | "striped",
+    "stripe_kib": int or None, "complete": bool} (complete: fill_state 2, the last state a fill writes), or None when the device holds no
+    Qwen tier header (blank, or another engine's data). A header that does not read (bad magic, version, or CRC) also gives None.
+    Header A, then header B at 64 KiB, as the engine reads them."""
+    import struct
+    try:
+        with open(_expand(path), "rb") as fh:
+            head = fh.read(HEADER_AREA + 160)
+    except OSError:
+        return None
+    for off in (0, HEADER_AREA):
+        h = head[off:off + 160]
+        if len(h) < 160 or h[:8] != b"STRPTIER":
+            continue
+        version, = struct.unpack_from("<I", h, 8)
+        layout = LAYOUT_HEADER_VERSIONS.get(version)
+        if layout is None:
+            continue
+        reserved0, = struct.unpack_from("<I", h, 84)
+        fill_state, = struct.unpack_from("<I", h, 152)
+        return {"layout": layout, "stripe_kib": reserved0 // 1024 if layout == "striped" else None, "complete": fill_state == 2}
+    return None
+
+
+def layout_note(path: str, layout: str | None, stripe_kib: int | None) -> str:
+    """One line for the plan: what the device holds now, and whether this launch's layout reuses it or refills it (the engine checks
+    the model, the profile and the order at the start; this line only reads the layout)."""
+    want = striped_stripe_kib(layout, stripe_kib)
+    have = header_layout(path)
+    if have is None:
+        return f"{path} holds no expert tier yet (a blank device, or data that is not one)"
+    held = "a whole-layout tier" if have["layout"] == "whole" else f"a striped tier ({have['stripe_kib']} KiB stripes)"
+    if not have["complete"]:
+        return f"{path} holds {held}, not finished: the start refills it"
+    if have["layout"] != (layout or "whole"):
+        return f"{path} holds {held}: this launch's layout refills it at the start"
+    if have["layout"] == "striped" and have["stripe_kib"] != want:
+        return f"{path} holds {held}: a different stripe size refills it at the start"
+    return f"{path} holds {held}: the start reuses it if its model, profile and device order are unchanged"

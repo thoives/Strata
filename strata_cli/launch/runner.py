@@ -521,6 +521,18 @@ def own_log_path(base: dict) -> str | None:
     return None if _SETUP_LOG_NAME.match(Path(value.replace("\\", "/")).name) else value
 
 
+#: the flags of the tier layout (docs/EXPERT_TIER.md, "The layout"): they travel with the --expert-tier devices
+TIER_LAYOUT_FLAGS = ("--expert-tier-layout", "--expert-tier-stripe-kib")
+
+
+def tier_layout_pairs(s: S.LaunchSettings) -> list[str]:
+    """The layout's engine arguments: only a striped layout is written (the whole layout is the default, so its config is unchanged)."""
+    if s.expert_tier_layout != "striped":
+        return []
+    from strata_control import expert_tier
+    return ["--expert-tier-layout", "striped", "--expert-tier-stripe-kib", str(expert_tier.striped_stripe_kib("striped", s.expert_tier_stripe_kib))]
+
+
 def derive_config(base: dict, s: S.LaunchSettings, *, bool_flags: frozenset[str], log: str | None = None, gpus: "list[int] | dict | None" = None,
                   experts: int | None = None) -> dict:
     """The private run config of this launch: the installed one plus the choices that are not setup's (host, port, key, cards, advanced)."""
@@ -559,15 +571,19 @@ def derive_config(base: dict, s: S.LaunchSettings, *, bool_flags: frozenset[str]
         cfg["args"] = tune_knobs.apply_to_argv([str(x) for x in cfg.get("args") or []], a_changes)
         if e_changes:
             cfg["env"] = tune_knobs.apply_to_env(dict(cfg.get("env") or {}), e_changes)
-    if s.expert_tiers:                                # --expert-tier: repeated flags, one per device, in order (§5.1)
-        from strata_control import user_args as _ua    # the group mechanism: replace every old --expert-tier group, keep the order
-        rest = [g for g in _ua.groups(cfg.get("args") or []) if _ua.flag_of(g) != "--expert-tier"]
-        cfg["args"] = _ua.flat(rest) + [x for v in s.expert_tiers for x in ("--expert-tier", str(v))]
+    from strata_control import user_args as _ua
+    stale = [g for g in (*_ua.groups(cfg.get("args") or []), *_ua.groups(cfg.get(_ua.USER_KEY) or [])) if _ua.flag_of(g) in TIER_LAYOUT_FLAGS]
+    if s.expert_tiers or stale:                       # --expert-tier: repeated flags, one per device, in order (§5.1)
+        # the group mechanism: replace every old --expert-tier group, keep the order. The layout flags follow the devices: a run with
+        # no device has no layout, so a layout the config remembered is dropped too (the engine refuses a layout with no tier)
+        drop = ("--expert-tier", *TIER_LAYOUT_FLAGS) if s.expert_tiers else TIER_LAYOUT_FLAGS
+        rest = [g for g in _ua.groups(cfg.get("args") or []) if _ua.flag_of(g) not in drop]
+        cfg["args"] = _ua.flat(rest) + [x for v in s.expert_tiers for x in ("--expert-tier", str(v))] + tier_layout_pairs(s)
         # serve/server.py engine_args() puts "user_args" over "args" at every start, and a --expert-tier group there would
         # replace the devices this launch asked for with the ones the config remembered: the requested devices replace the
         # tier groups of "user_args" too (its other options stay as they are)
         if cfg.get(_ua.USER_KEY):
-            kept = [g for g in _ua.groups(cfg[_ua.USER_KEY]) if _ua.flag_of(g) != "--expert-tier"]
+            kept = [g for g in _ua.groups(cfg[_ua.USER_KEY]) if _ua.flag_of(g) not in drop]
             if kept:
                 cfg[_ua.USER_KEY] = _ua.flat(kept)
             else:
@@ -1492,6 +1508,23 @@ class Runner:
             protect.append(self.s.model_path)
         return expert_tier.problems(specs, protect)
 
+    def tier_layout_problem(self) -> str:
+        """Why the tier layout cannot be used by this launch ("" when it can): the options fit the devices given, and the DeepSeek engine,
+        whose tier keeps each expert whole, has no striped layout yet. Nothing is written or read here."""
+        from strata_control import expert_tier
+        s = self.s
+        problem = expert_tier.layout_problem(s.expert_tier_layout, s.expert_tier_stripe_kib, len(s.expert_tiers or []))
+        if problem:
+            return problem
+        return ""
+
+    def check_tier_layout(self) -> None:
+        """Before anything is downloaded: the layout is one this launch can use (tier_layout_problem). A refusal says what to change."""
+        problem = self.tier_layout_problem()
+        if problem:
+            raise LaunchError(f"The expert tier layout cannot be used: {problem}.",
+                              "Leave --expert-tier-layout out (whole), or give striped devices with --expert-tier (Qwen models only).", 2)
+
     def check_expert_tiers(self) -> None:
         """Before anything is downloaded: the devices are usable (expert_tier_problems), a line says the first start writes over
         them, and a device that holds data that is not an expert tier is written over only after a yes - --expert-tier-overwrite,
@@ -2194,6 +2227,19 @@ class Runner:
             held = expert_tier.foreign(specs)
             if held:
                 warns.append(capital(expert_tier.foreign_message(held)) + ": the run asks first, or needs --expert-tier-overwrite.")
+        tier_plan = None
+        if s.expert_tiers:                                   # the layout: what it holds, and what an existing tier there would do
+            from strata_control import expert_tier
+            specs_now, _bad2 = expert_tier.parse_all(s.expert_tiers)
+            problem = self.tier_layout_problem()
+            if problem:
+                warns.append(f"The expert tier layout cannot be used: {problem}.")
+            if s.expert_tier_layout == "striped" and not problem:
+                warns.append("A striped expert tier: a start with a different layout, stripe size or device order writes the whole tier again.")
+            tier_plan = {"layout": s.expert_tier_layout or "whole",
+                         "stripe_kib": expert_tier.striped_stripe_kib(s.expert_tier_layout, s.expert_tier_stripe_kib),
+                         "estimate": expert_tier.capacity_estimate(specs_now, s.expert_tier_layout, s.expert_tier_stripe_kib),
+                         "devices": [expert_tier.layout_note(sp.path, s.expert_tier_layout, s.expert_tier_stripe_kib) for sp in specs_now]}
         row = self.row()
         try:
             self.resolved_vision()
@@ -2212,6 +2258,8 @@ class Runner:
                "speed": self.speed_line()}
         if self.multi_file():
             out["placement"] = self.placement()
+        if tier_plan is not None:
+            out["expert_tier"] = tier_plan
         return out
 
     def resolved_speed(self) -> tuple[str, bool] | None:
@@ -2427,6 +2475,7 @@ class Runner:
                 reused = self.check_serving()                # before anything is downloaded or stopped
                 if reused is not None:
                     return reused
+            self.check_tier_layout()                         # the layout fits the devices, and this engine has it, before any download
             self.check_expert_tiers()                        # the tier devices: checked, and confirmed when they hold data, before any download
             self.ensure_engine()
             self.check_cancel()

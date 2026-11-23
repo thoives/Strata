@@ -89,11 +89,25 @@ public:
     // then writes the headers with fill_state = 2 last. Records the fill time and bytes for the startup log.
     bool fill(ExpertSource& src, const std::vector<std::pair<int32_t, int32_t>>& ranked_rest,
               const TierIdentity& id, std::string& err);
-    const uint8_t* blob(int64_t layer, int64_t expert) const;   // nullptr: not held
+    // The layout (docs/EXPERT_TIER.md, "The layout"). Call before open(): the whole layout unless set. `stripe_bytes` is the
+    // stripe unit (a multiple of 4 KiB, used by the striped layout only). A tier written in one layout is refilled, not read, in the other.
+    void set_layout(bool striped, uint64_t stripe_bytes);
+    bool striped() const { return striped_; }
+    uint64_t stripe_bytes() const { return striped_ ? stripe_bytes_ : 0; }
+    // has(): the expert has a contiguous blob in a device's mapping, so a pointer to it is stable while the tier is open. Only
+    // the whole layout has one; a striped expert's stripes are on several devices, so has() is false for it and the caller's
+    // pointer paths read it from the file tier. held(): the expert is on a device in either layout (the copy paths use this).
+    const uint8_t* blob(int64_t layer, int64_t expert) const;   // nullptr: not held, or striped
     bool has(int64_t layer, int64_t expert) const;
+    bool held(int64_t layer, int64_t expert) const;
+    // Copies a held expert's bytes into `dst` (blob_bytes long): the whole layout is one copy; the striped layout reads each
+    // device's stripes into their places in dst. False when the expert is not held.
+    bool gather(int64_t layer, int64_t expert, uint8_t* dst) const;
     bool registered_of(int64_t layer, int64_t expert) const;   // §7.6: the holding device registered (pinned() reads it)
     // Prompt path: copies the held blobs of a batch, one worker thread per device, in rank order (§7.3).
     // The worker cap per device starts at 2 and is a measured value on hardware (P0-hw).
+    // Striped experts are gathered: each device's worker copies that device's stripes of every expert in the batch, and all
+    // workers are joined before this returns, so dst is complete when the call returns.
     bool copy_blobs(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, size_t n,
                     uint64_t& bytes_out);
     void set_worker_cap(int n);
@@ -108,17 +122,30 @@ public:
     void set_flush_fault(std::function<bool(size_t)> f);
 
 private:
+    // One device's piece of one held expert: the whole layout has one (the blob), the striped layout one per device it uses.
+    struct TierPiece {
+        size_t dev;
+        uint64_t off;   // byte offset in the device's data region
+        uint64_t len;   // bytes
+    };
     TierIdentity id_;
     // internals used by the fill and by the open/reuse decision, kept here so the tests and the source see only
     // the public API: lookup rebuild after reuse or fill, and the §6.4 full verification.
     bool build_lookup(const std::vector<TierPlacementEntry>& entries, int entry_bytes, std::string& why);
+    bool build_lookup_striped(const std::vector<StripedTableEntry>& entries, std::string& why);
     bool check_geometry(std::string& why);   // a reused placement lies inside each device and its chunk table fits
+    void pieces_of(size_t idx, std::vector<TierPiece>& out) const;   // the pieces of held expert idx, in device order
+    bool copy_blobs_striped(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, size_t n, uint64_t& bytes_out);
     void clear_lookup();
     void verify_chunks();
     std::vector<std::unique_ptr<ExpertTier>> tiers_;   // the devices, in configuration order
     std::vector<uint64_t> data_off_;  // per device: where its blobs begin (after the header areas and tables)
-    std::vector<int32_t> dev_of_;     // [layer * n_expert + expert] -> device, -1 not held
-    std::vector<uint64_t> off_of_;    // the same, byte offset into the device's data region
+    std::vector<int32_t> dev_of_;     // whole: [layer * n_expert + expert] -> device, -1 not held (empty when striped)
+    std::vector<uint64_t> off_of_;    // whole: the same, byte offset into the device's data region
+    std::vector<int32_t> start_of_;   // striped: [layer * n_expert + expert] -> the stripe rotation's first device, -1 not held
+    std::vector<uint64_t> soff_;      // striped: [(layer * n_expert + expert) * devices + device] -> that device's piece offset
+    bool striped_ = false;            // the layout (set_layout)
+    uint64_t stripe_bytes_ = 0;       // the striped layout's stripe unit
     std::vector<uint8_t> valid_;      // 0: a bad chunk made this expert's tier copy untrustworthy
     std::vector<std::vector<uint8_t>> bad_chunk_;   // verify=full failures: 1 = chunk untrustworthy
     std::vector<uint64_t> used_;      // per device: bytes filled in the data region

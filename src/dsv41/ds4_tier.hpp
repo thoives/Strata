@@ -37,6 +37,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -112,7 +113,8 @@ inline bool ds4_pack_identity(const std::string& model_dir, const std::vector<st
 // header_crc = CRC32C over the 172 before it.  A header whose crc does not match is read from its twin (B if A fails),
 // and both failing means the device is refilled - the same rule as the shared plan's §6.4.
 constexpr const char kDs4TierMagic[8] = { 'S', 'T', 'R', 'P', 'T', 'D', 'S', '4' };
-constexpr uint32_t kDs4TierVersion = 1;         // this header struct
+constexpr uint32_t kDs4TierVersion = 1;         // this header struct (the whole layout)
+constexpr uint32_t kDs4TierVersionStriped = 2;  // the striped layout: the same header struct, pad0 = the stripe unit in KiB
 constexpr uint32_t kDs4SlotLayoutVersion = 1;   // the store's slot layout (LayerGeo's tr[], kSlack): a change refills
 constexpr uint64_t kTierHeaderArea = 64ull << 10;   // header A's area at 0, header B's at 64 KiB
 constexpr uint64_t kTierChunk = strata::core::kTierChunk;   // the chunk CRC unit: 4 MiB
@@ -300,7 +302,7 @@ inline bool th_decode(const uint8_t* buf, TierHdr& h, std::string& why) {
     std::memcpy(g.magic, buf, 8);
     const uint8_t* b = buf + 8;
     g.version = get32(b); b += 4;
-    if (g.version != kDs4TierVersion) { why = "header version " + std::to_string(g.version) + ", this engine writes " + std::to_string(kDs4TierVersion); return false; }
+    if (g.version != kDs4TierVersion && g.version != kDs4TierVersionStriped) { why = "header version " + std::to_string(g.version) + ", this engine reads " + std::to_string(kDs4TierVersion) + " and " + std::to_string(kDs4TierVersionStriped); return false; }
     g.device_index = get32(b); b += 4;
     g.device_count = get32(b); b += 4;
     std::memcpy(g.pack_id, b, 32); b += 32;
@@ -359,13 +361,14 @@ public:
         uint64_t service_p50_ns = 0, service_p95_ns = 0;
         uint64_t cold_service_p50_ns = 0, cold_service_p95_ns = 0;
         // DS4_TIER_DIRECT: "" with the mode off; else "mapped" (no direct descriptor for this device), "direct", or "fallback"
-        // (the device refused an unbuffered read at run time: its later hits are mapped copies).  Whole-slot jobs, counted apart:
-        // one direct job is a whole slot (padding included), not three matrix copies.
+        // (the device refused an unbuffered read at run time: its later hits are mapped copies). Direct jobs count whole-slot
+        // reads or individual stripe reads; direct_payload_ok_bytes excludes blob padding.
         std::string direct_mode;
         uint64_t direct_jobs = 0, direct_ok = 0, direct_fallbacks = 0, direct_failed = 0;
         uint64_t direct_slot_bytes = 0, direct_slot_ok_bytes = 0, direct_payload_ok_bytes = 0;
         uint64_t direct_queue_ns = 0, direct_service_ns = 0;
         uint64_t direct_service_p50_ns = 0, direct_service_p95_ns = 0;
+        StripeIoStats stripe;   // submitted and terminal stripe job counts and range bytes
     };
 
     ExpertTierSet() = default;
@@ -429,11 +432,13 @@ public:
     bool tracing() const { return tracing_; }
     void note_copy_start(int dev, uint64_t bytes, bool demand);
     void note_copy_wait(int dev, uint64_t ns);
+    void note_striped_hit(bool demand, bool direct, bool mapped);
+    StripeHitStats striped_hit_stats() const;
     std::vector<DeviceStats> stats() const;
 
     /// DS4_TIER_DIRECT (opt-in, Linux; read when the tier opens): false = mapped copies, the default and the fallback; true =
-    /// a tier hit may be one whole-slot unbuffered read into the store's slot, on the device that holds it, where its
-    /// descriptor checked out at open.  A device that refuses such a read falls back to mapped copies for the rest of the run.
+    /// a tier hit may use unbuffered reads into the store's slot, where a device's descriptor checked out at open.
+    /// A device that refuses such a read falls back to mapped copies for the rest of the run.
     bool direct_mode() const { return direct_mode_; }
     /// True when at least one device opened a direct descriptor (the store then makes its arena not inherited by a fork).
     bool direct_active() const {
@@ -450,6 +455,20 @@ public:
     void set_direct_test_force(bool f) { direct_force_ = f; }
 
     bool readable() const { return readable_.load(std::memory_order_acquire); }   // lookups answer only after a reuse or a completed fill
+    // The striped layout (docs/EXPERT_TIER.md, "The layout"): each expert's blob is cut into stripes of `stripe_bytes` over every
+    // device, and a read gathers the stripes. Call before open(). The whole layout is the default and is unchanged.
+    void set_layout(bool striped, uint64_t stripe_bytes) { striped_ = striped; stripe_bytes_ = striped ? stripe_bytes : 0; }
+    bool striped() const { return striped_; }
+    /// The blob every expert occupies (the store's max blob): one slot less its two kSlack margins.
+    uint64_t blob_bytes() const { return striped_blob_bytes(); }
+    /// One stripe of a striped expert: `src` is in device `dev`'s mapping, `blob_off` its place in the blob, `len` its bytes.
+    struct StripeRef { int dev; const uint8_t* src; uint64_t blob_off; uint64_t len; uint64_t device_off; };
+    /// Describe an exact stripe range for direct I/O; false leaves that stripe on the mapped path.
+    bool direct_stripe(int dev, uint64_t off, uint64_t len, ExpertStore::TierDirect& out) const;
+    /// The stripes of tier-held striped expert (layer, e), in blob order. False: not held, not striped, or a device is marked.
+    bool stripe_refs(int64_t layer, int64_t e, std::vector<StripeRef>& out) const;
+    /// Copies a held striped expert's whole blob (blob_bytes long) into dst, from the devices. False when stripe_refs is false.
+    bool gather(int64_t layer, int64_t e, uint8_t* dst) const;
     // Tests only: `f(device)` true makes that device's next flush fail (a full disk, an I/O error).
     void set_flush_fault(std::function<bool(size_t)> f) { flush_fault_ = std::move(f); }
     int64_t experts_held() const { return held_; }
@@ -463,10 +482,14 @@ public:
     };
 
 private:
+    struct StripedTrace {
+        std::atomic<uint64_t> hits{0}, demand{0}, prefetch{0}, mapped_only{0}, direct_only{0}, mixed{0};
+    };
     struct Dev {
         TierSpec spec;
         uint8_t* base = nullptr;
         uint64_t size = 0;
+
         std::unique_ptr<TierIoStats> trace;   // (DS4_TIER_LOG: the device's queue updates it; declared before io, so it
                                               //  is destroyed after the queue's workers have been joined)
         std::unique_ptr<IoQueue> io;
@@ -500,10 +523,18 @@ private:
     std::atomic<bool> readable_{false};   // published (release) after a reuse or a completed, flushed fill
     std::function<bool(size_t)> flush_fault_;   // tests only
     bool tracing_ = false;
+    std::unique_ptr<StripedTrace> striped_trace_;
     int64_t held_ = 0;
     std::vector<std::string> notes_;
     bool direct_mode_ = false;    // DS4_TIER_DIRECT=1 (read at open)
     bool direct_force_ = false;   // tests only (set_direct_test_force)
+    bool striped_ = false;        // the layout (set_layout)
+    uint64_t stripe_bytes_ = 0;   // the striped layout's stripe unit
+    std::vector<int32_t> start_of_;                  // striped: [layer * n_expert + expert] -> the rotation's first device, -1 not held
+    std::vector<uint64_t> soff_;                     // striped: [(layer * n_expert + expert) * devices + device] -> that device's piece offset
+    std::vector<strata::core::StripedTableEntry> sentries_;   // striped: the plan in rank order (the fill iterates this)
+    std::vector<uint64_t> striped_used_;             // striped: per device, the end of its furthest piece (the chunk table covers it)
+    uint64_t striped_blob_bytes() const { return slot_bytes_ > 2 * ExpertStore::kSlack ? slot_bytes_ - 2 * ExpertStore::kSlack : 0; }
 
     static uint64_t align_up(uint64_t v, uint64_t a) { return (v + a - 1) & ~(a - 1); }
     void direct_open_all();                       // DS4_TIER_DIRECT: each device's descriptor, and the one line that says which mode it runs
@@ -514,6 +545,12 @@ private:
     bool flush(Dev& d);   // false: the bytes may not be on the disk (msync / FlushViewOfFile / FlushFileBuffers failed)
     bool write_headers(Dev& d, const TierHdr& h);   // A, flush, B, flush (§6.4: the twin written after A); false on any failure
     bool read_headers(Dev& d, TierHdr& h, std::string& why);   // A, else B
+    bool decide_striped(uint64_t slot_bytes, uint64_t vram_guard, uint64_t store_guard, uint64_t n_layers, uint64_t n_expert,
+                        const std::string& pack_id, const std::string& profile_sha, bool force_refill,
+                        const std::vector<std::pair<int32_t, int32_t>>& ranked_rest, bool& reused, std::string& why,
+                        std::vector<std::string>& notes);
+    bool fill_striped(const std::function<bool(int, int, uint8_t*, int, std::atomic<int>&, std::atomic<bool>&, uint64_t&)>& read,
+                      Fill& out, std::string& err);
 };
 
 // ------------------------------------------------------------------------ implementation ---------------------------------------------
@@ -553,6 +590,7 @@ inline bool ExpertTierSet::open(const std::vector<TierSpec>& specs, std::string&
     devs_.clear();
     const char* tl = std::getenv("DS4_TIER_LOG");
     tracing_ = tl != nullptr && std::atoi(tl) != 0;   // (0 or unset: off)
+    if (tracing_ && striped_) striped_trace_ = std::make_unique<StripedTrace>();
     const int th = std::getenv("DS4_TIER_THREADS") ? std::max(1, std::atoi(std::getenv("DS4_TIER_THREADS"))) : 2;
     for (const TierSpec& s : specs) {
         Dev d;
@@ -753,6 +791,8 @@ inline bool ExpertTierSet::decide(uint64_t slot_bytes, uint64_t vram_guard, uint
     if (devs_.empty()) { why = "expert tier: no device is open"; return false; }
     if (slot_bytes == 0) { why = "expert tier: the store's slot size is 0"; return false; }
     slot_bytes_ = slot_bytes; n_layers_ = n_layers; n_expert_ = n_expert;
+    if (striped_) return decide_striped(slot_bytes, vram_guard, store_guard, n_layers, n_expert, pack_id, profile_sha, force_refill,
+                                        ranked_rest, reused, why, notes);
 
     // The tables and the data region are fixed by the shape, the guards (the list's length) and this start's device sizes,
     // before any header is read: a reuse reads exactly where the fill wrote, and a start that configured different sizes
@@ -790,7 +830,8 @@ inline bool ExpertTierSet::decide(uint64_t slot_bytes, uint64_t vram_guard, uint
         strata::core::id_to_field(pack_id, pid32);
         const uint64_t plen = hh.n_held * (uint64_t) eb;
         bool bad = false;
-        if (hh.device_count != devs_.size()) bad = true, w = "device count " + std::to_string(hh.device_count) + " != this run's " + std::to_string(devs_.size());
+        if (hh.version != kDs4TierVersion) bad = true, w = "header version " + std::to_string(hh.version) + ": the whole layout reads v" + std::to_string(kDs4TierVersion) + " (a striped tier is refilled)";
+        else if (hh.device_count != devs_.size()) bad = true, w = "device count " + std::to_string(hh.device_count) + " != this run's " + std::to_string(devs_.size());
         else if (hh.device_index != (uint32_t) i) bad = true, w = "the device was filled as number " + std::to_string(hh.device_index) + " and is number " + std::to_string(i) + " in this run (reordered or swapped devices)";
         else if (hh.chunk_off != chunk_off || (uint64_t) hh.slots32 != slots[i]) bad = true, w = "the tables moved or the device's slots changed: filled " + std::to_string(hh.slots32) + ", this run has " + std::to_string(slots[i]);
         else if (std::memcmp(hh.pack_id, pid32, 32) != 0) bad = true, w = "a different pack (identity §7.1)";
@@ -927,10 +968,375 @@ inline bool ExpertTierSet::decide(uint64_t slot_bytes, uint64_t vram_guard, uint
     return true;   // the bytes follow in fill(); with nothing to place fill() still closes the headers at fill_state 2
 }
 
+// ---- the striped layout (docs/EXPERT_TIER.md): every expert is cut into stripes over all the devices. The header is the same struct
+// as the whole layout's, with version 2 and the stripe unit in pad0 (KiB); the placement table is the shared striped table (the start
+// device and one piece offset per device); slots32 is 0, because a device holds pieces, not slots; its used bytes are the end of its
+// furthest piece, which the chunk table covers.
+inline bool ExpertTierSet::decide_striped(uint64_t slot_bytes, uint64_t vram_guard, uint64_t store_guard, uint64_t n_layers,
+                                          uint64_t n_expert, const std::string& pack_id, const std::string& profile_sha,
+                                          bool force_refill, const std::vector<std::pair<int32_t, int32_t>>& ranked_rest,
+                                          bool& reused, std::string& why, std::vector<std::string>& notes) {
+    using strata::core::StripedTableEntry;
+    const uint32_t D = (uint32_t) devs_.size();
+    if (D < 2 || D > strata::core::kTierStripedMaxDevices || stripe_bytes_ == 0 || stripe_bytes_ % strata::core::kTierAlign != 0) {
+        why = "expert tier: the striped layout needs 2 to " + std::to_string(strata::core::kTierStripedMaxDevices) +
+              " devices and a stripe unit that is a multiple of 4 KiB";
+        return false;
+    }
+    if (slot_bytes % strata::core::kTierAlign != 0 || slot_bytes <= 2 * ExpertStore::kSlack) { why = "expert tier: the store's slot size does not fit the striped layout"; return false; }
+    const uint64_t blob = slot_bytes - 2 * ExpertStore::kSlack;
+    const uint64_t poff = 2 * kTierHeaderArea;
+    const uint64_t sbe = strata::core::striped_entry_bytes(D);
+    const uint64_t chunk_off = align_up(poff + (uint64_t) ranked_rest.size() * sbe, 64);
+    uint64_t max_cap = 0;
+    for (const Dev& d : devs_) max_cap = std::max(max_cap, tier_capacity_bytes(d.spec));
+    const uint64_t chunk_count_max = (max_cap + kTierChunk - 1) / kTierChunk;
+    data_off_ = align_up(chunk_off + chunk_count_max * 4, 4096);
+    std::vector<uint64_t> cap(D, 0);
+    for (uint32_t i = 0; i < D; ++i) {
+        const uint64_t c = tier_capacity_bytes(devs_[i].spec);
+        cap[i] = c > data_off_ ? c - data_off_ : 0;
+    }
+    const size_t total = (size_t) n_layers * (size_t) n_expert;
+    const uint32_t want_pad = (uint32_t) (stripe_bytes_ / 1024);
+    auto clear_lookup = [&] {
+        start_of_.assign(total, -1);
+        soff_.assign(total * D, 0);
+        striped_used_.assign(D, 0);
+        held_ = 0;
+        lookup_.clear();
+        entries_.clear();
+        sentries_.clear();
+    };
+    clear_lookup();
+    readable_.store(false, std::memory_order_release);
+
+    // §7.4 step 1, striped: every device's header (A, else B) must match this start.
+    bool ok = !force_refill;
+    std::string first_why;
+    if (force_refill) first_why = "--expert-tier-refill";
+    for (uint32_t i = 0; i < D; ++i) {
+        TierHdr h{};
+        std::string w;
+        if (!read_headers(devs_[i], h, w)) {
+            ok = false;
+            if (first_why.empty()) first_why = devs_[i].spec.path + ": " + w;
+            continue;
+        }
+        devs_[i].hdr = h;
+        char pid32[32];
+        strata::core::id_to_field(pack_id, pid32);
+        const uint64_t plen = h.n_held * sbe;
+        bool bad = false;
+        if (h.version != kDs4TierVersionStriped) bad = true, w = "header version " + std::to_string(h.version) + " is not the striped layout (v" + std::to_string(kDs4TierVersionStriped) + "): refill";
+        else if (h.device_count != D) bad = true, w = "device count " + std::to_string(h.device_count) + " != this run's " + std::to_string(D);
+        else if (h.device_index != i) bad = true, w = "the device was filled as number " + std::to_string(h.device_index) + " and is number " + std::to_string(i) + " in this run (reordered or swapped devices)";
+        else if (h.chunk_off != chunk_off) bad = true, w = "the tables moved (a different number of ranked experts or device sizes)";
+        else if (h.slots32 != 0) bad = true, w = "a striped header with slots (not a striped fill)";
+        else if (std::memcmp(h.pack_id, pid32, 32) != 0) bad = true, w = "a different pack (identity §7.1)";
+        else if (h.slot_bytes != slot_bytes) bad = true, w = "slot_bytes " + std::to_string(h.slot_bytes) + " != this store's " + std::to_string(slot_bytes);
+        else if (h.slot_layout != kDs4SlotLayoutVersion) bad = true, w = "slot layout v" + std::to_string(h.slot_layout) + " != v" + std::to_string(kDs4SlotLayoutVersion);
+        else if (h.n_layers != n_layers || h.n_expert != n_expert) bad = true, w = "a different model shape";
+        else if (h.vram_guard != vram_guard || h.store_guard != store_guard) bad = true, w = "guards differ from this run";
+        else if (h.pad0 != want_pad) bad = true, w = "stripe unit of " + std::to_string(h.pad0) + " KiB, this start uses " + std::to_string(want_pad) + " KiB";
+        else if (h.fill_state != 2) bad = true, w = "fill_state " + std::to_string(h.fill_state) + ": a torn or unfinished fill";
+        else if (poff + plen > devs_[i].size) bad = true, w = "the placement table does not fit the device";
+        else if (h.placement_crc != strata::core::tier_crc32c(devs_[i].base + poff, (size_t) plen)) bad = true, w = "placement_crc does not match its table";
+        else if (h.chunk_off + h.chunk_count * 4 > devs_[i].size || h.chunk_off + h.chunk_count * 4 > data_off_) bad = true, w = "the chunk table does not fit before the data";
+        if (bad) {
+            ok = false;
+            if (first_why.empty()) first_why = devs_[i].spec.path + ": " + w;
+        }
+    }
+    reused = ok;
+    if (!ok && why.empty()) why = first_why;
+    if (ok) {
+        // every device carries the same placement table (§6.3), and the table decodes to valid, non-overlapping pieces
+        const TierHdr& h0 = devs_[0].hdr;
+        for (uint32_t i = 1; i < D && ok; ++i)
+            if (devs_[i].hdr.n_held != h0.n_held || std::memcmp(devs_[i].base + poff, devs_[0].base + poff, (size_t) (h0.n_held * sbe)) != 0) {
+                ok = false;
+                why = "devices " + devs_[0].spec.path + " and " + devs_[i].spec.path + " do not carry the same placement table";
+            }
+        std::vector<StripedTableEntry> ent;
+        std::string tw;
+        if (ok && !strata::core::decode_striped_table(devs_[0].base + poff, h0.n_held * sbe, D, ent, tw)) {
+            ok = false;
+            why = "placement table: " + tw;
+        }
+        if (ok) {
+            std::vector<std::vector<std::pair<uint64_t, uint64_t>>> spans(D);
+            for (const auto& x : ent) {
+                if (x.layer < 0 || x.expert < 0 || (uint64_t) x.layer >= n_layers || (uint64_t) x.expert >= n_expert || x.start < 0 ||
+                    (uint32_t) x.start >= D || x.offset.size() != D) {
+                    ok = false;
+                    why = "a placement entry names an out-of-range layer, expert or start device";
+                    break;
+                }
+                const size_t idx = (size_t) x.layer * (size_t) n_expert + (size_t) x.expert;
+                if (start_of_[idx] >= 0) {
+                    ok = false;
+                    why = "an expert is placed twice";
+                    break;
+                }
+                start_of_[idx] = x.start;
+                ++held_;
+                for (uint32_t d = 0; d < D; ++d) {
+                    soff_[idx * D + d] = x.offset[d];
+                    const uint64_t len = strata::core::striped_piece_bytes(blob, stripe_bytes_, D, x.start, d);
+                    if (len == 0) continue;
+                    if (x.offset[d] + len > cap[d]) {
+                        ok = false;
+                        why = devs_[d].spec.path + ": a piece reaches past the device's capacity";
+                        break;
+                    }
+                    spans[d].push_back({x.offset[d], len});
+                    striped_used_[d] = std::max(striped_used_[d], x.offset[d] + len);
+                }
+                if (!ok) break;
+            }
+            for (uint32_t d = 0; d < D && ok; ++d) {
+                std::sort(spans[d].begin(), spans[d].end());
+                for (size_t i = 1; i < spans[d].size() && ok; ++i)
+                    if (spans[d][i].first < spans[d][i - 1].first + spans[d][i - 1].second) {
+                        ok = false;
+                        why = devs_[d].spec.path + ": two pieces overlap in the placement";
+                    }
+            }
+        }
+        for (uint32_t i = 0; i < D && ok; ++i) {
+            const uint64_t want_chunks = (striped_used_[i] + kTierChunk - 1) / kTierChunk;
+            if (devs_[i].hdr.chunk_count != want_chunks) {
+                ok = false;
+                why = devs_[i].spec.path + ": the chunk table's length does not match the placed pieces";
+            }
+        }
+        for (uint32_t i = 0; i < D && ok && devs_[i].spec.verify_full; ++i) {   // every chunk of this device's pieces against its table (§6.4)
+            for (uint64_t c = 0; c < devs_[i].hdr.chunk_count && ok; ++c) {
+                const uint64_t a = c * kTierChunk, b = std::min(striped_used_[i], (c + 1) * kTierChunk);
+                if (b <= a) { ok = false; why = "a chunk is past the pieces of its device"; break; }
+                const uint32_t want = ds4_tier::get32(devs_[i].base + devs_[i].hdr.chunk_off + c * 4);
+                if (strata::core::tier_crc32c(devs_[i].base + data_off_ + a, (size_t) (b - a)) != want) {
+                    ok = false;
+                    why = devs_[i].spec.path + ": chunk " + std::to_string(c) + " does not match its crc (verify=full)";
+                }
+            }
+        }
+    }
+    if (ok) {
+        readable_.store(true, std::memory_order_release);
+        for (uint32_t i = 0; i < D; ++i)
+            notes.push_back("expert tier " + devs_[i].spec.path + ": reused, striped over " + std::to_string(D) + " devices, fill_state 2, nothing copied (§7.4)");
+        reused = true;
+        return true;
+    }
+    reused = false;
+    clear_lookup();
+
+    // The refill: the shared striped planner over `ranked_rest` (rank order; the first that does not fit stops the deal), every
+    // device's header first with fill_state 1, then the table, then the header with placement_crc over it. Then fill_striped writes
+    // the pieces.
+    std::vector<strata::core::TierDevice> dv(D);
+    for (uint32_t i = 0; i < D; ++i) dv[i].capacity_bytes = cap[i];
+    const std::vector<uint64_t> blobs((size_t) n_layers, blob);
+    const auto pl = strata::core::plan_expert_tiers_striped(ranked_rest, blobs, dv, stripe_bytes_);
+    for (size_t i = 0; i < pl.size() && i < ranked_rest.size(); ++i) {
+        if (pl[i].start < 0) continue;
+        StripedTableEntry x;
+        x.layer = ranked_rest[i].first;
+        x.expert = ranked_rest[i].second;
+        x.start = pl[i].start;
+        x.offset = pl[i].offset;
+        const size_t idx = (size_t) x.layer * (size_t) n_expert + (size_t) x.expert;
+        start_of_[idx] = x.start;
+        ++held_;
+        for (uint32_t d = 0; d < D; ++d) {
+            soff_[idx * D + d] = x.offset[d];
+            const uint64_t len = strata::core::striped_piece_bytes(blob, stripe_bytes_, D, x.start, d);
+            if (len) striped_used_[d] = std::max(striped_used_[d], x.offset[d] + len);
+        }
+        sentries_.push_back(std::move(x));
+    }
+    const std::vector<uint8_t> table = strata::core::encode_striped_table(sentries_, D);
+    for (uint32_t i = 0; i < D; ++i) {
+        TierHdr h{};
+        std::memcpy(h.magic, kDs4TierMagic, 8);
+        h.version = kDs4TierVersionStriped;
+        h.device_index = i; h.device_count = D;
+        {
+            char f[32];
+            strata::core::id_to_field(pack_id, f);
+            std::memcpy(h.pack_id, f, 32);
+            strata::core::id_to_field(profile_sha, f);
+            std::memcpy(h.profile_sha, f, 32);
+        }
+        h.slot_layout = kDs4SlotLayoutVersion;
+        h.fill_state = 1;
+        h.pad0 = want_pad;
+        h.slots32 = 0;
+        h.slot_bytes = slot_bytes;
+        h.n_layers = n_layers; h.n_expert = n_expert;
+        h.vram_guard = vram_guard; h.store_guard = store_guard;
+        h.n_held = (uint64_t) sentries_.size();
+        h.chunk_off = chunk_off;
+        h.chunk_count = (striped_used_[i] + kTierChunk - 1) / kTierChunk;
+        if (poff + table.size() > devs_[i].size) { why = "device " + devs_[i].spec.path + ": too small to hold the placement table"; return false; }
+        if (!write_headers(devs_[i], h)) { why = "device " + devs_[i].spec.path + ": cannot write its header (the write or its flush failed)"; return false; }
+        if (!table.empty()) std::memcpy(devs_[i].base + poff, table.data(), table.size());
+        if (!flush(devs_[i])) { why = "device " + devs_[i].spec.path + ": the placement table could not be written (flush failed)"; return false; }
+        h.placement_crc = table.empty() ? strata::core::tier_crc32c(table.data(), 0) : strata::core::tier_crc32c(table.data(), table.size());
+        devs_[i].hdr = h;
+        devs_[i].filling = true;
+        if (!write_headers(devs_[i], h)) { why = "device " + devs_[i].spec.path + ": header after the placement table failed"; return false; }
+    }
+    return true;   // the pieces follow in fill_striped()
+}
+
+// The striped fill: each expert's three matrices are read by the store's read jobs into one RAM staging slot (page aligned, with the
+// kSlack margins a store slot has), then the slot's stripes are copied to their devices. A bounded ring of slots: at most kDepth
+// experts are in flight, and a slot is reused only after its pieces are scattered. A failed read marks every device, as the whole fill does.
+inline bool ExpertTierSet::fill_striped(const std::function<bool(int, int, uint8_t*, int, std::atomic<int>&, std::atomic<bool>&, uint64_t&)>& read,
+                                        Fill& out, std::string& err) {
+    using strata::core::StripedTableEntry;
+    const uint32_t D = (uint32_t) devs_.size();
+    const uint64_t blob = striped_blob_bytes();
+    const uint64_t stripe = stripe_bytes_;
+    const uint64_t nstr = (blob + stripe - 1) / stripe;
+    constexpr size_t kDepth = 8;
+    out.per_dev.assign(D, 0);
+    const size_t K = std::max<size_t>(1, std::min(kDepth, sentries_.size()));
+    std::vector<std::vector<uint8_t>> bufs(K);
+    std::vector<uint8_t*> stage(K, nullptr);
+    for (size_t k = 0; k < K; ++k) {
+        bufs[k].assign((size_t) slot_bytes_ + 4096, 0);
+        uint8_t* a = bufs[k].data();
+        a += (4096 - ((uintptr_t) a & 4095)) & 4095;   // the direct reads need page-aligned memory
+        stage[k] = a + ExpertStore::kSlack;             // the blob, with kSlack before it for the aligned landings (as in a store slot)
+    }
+    struct SJob {
+        std::atomic<int> left{0};
+        std::atomic<bool> bad{false};
+        size_t entry = 0, slot = 0;
+    };
+    std::deque<std::unique_ptr<SJob>> inflight;
+    std::vector<size_t> free_slots;
+    for (size_t k = 0; k < K; ++k) free_slots.push_back(k);
+    bool failed = false;
+    const auto t0 = std::chrono::steady_clock::now();
+    auto wait_for = [&](SJob& j) {
+        while (j.left.load(std::memory_order_acquire) > 0)
+            for (auto& d : devs_) if (d.io) d.io->wait_any(5000);
+    };
+    auto retire = [&] {
+        std::unique_ptr<SJob> j = std::move(inflight.front());
+        inflight.pop_front();
+        wait_for(*j);
+        if (j->bad.load(std::memory_order_acquire)) {
+            if (!failed && err.empty()) err = "a read of the model's files into the tier failed";
+            failed = true;
+        } else if (!failed) {
+            const StripedTableEntry& x = sentries_[j->entry];
+            const uint8_t* src = stage[j->slot];
+            std::vector<uint64_t> cnt(D, 0);
+            for (uint64_t k = 0; k < nstr && !failed; ++k) {
+                const uint32_t dev = (uint32_t) (((uint64_t) x.start + k) % D);
+                uint8_t* base = devs_[dev].base;
+                if (base == nullptr) { failed = true; err = "expert tier: the device of a placed piece is not open"; break; }
+                const uint64_t m = cnt[dev]++;
+                const uint64_t len = std::min<uint64_t>(stripe, blob - k * stripe);
+                std::memcpy(base + data_off_ + x.offset[dev] + m * stripe, src + k * stripe, (size_t) len);
+            }
+            if (!failed) {
+                ++out.placed;
+                ++out.per_dev[(size_t) x.start];
+            }
+        }
+        free_slots.push_back(j->slot);
+    };
+    for (size_t i = 0; i < sentries_.size() && !failed; ++i) {
+        while (free_slots.empty()) retire();
+        if (failed) break;
+        auto j = std::make_unique<SJob>();
+        j->entry = i;
+        j->slot = free_slots.back();
+        free_slots.pop_back();
+        j->left.store(3, std::memory_order_release);
+        const StripedTableEntry& x = sentries_[i];
+        SJob* raw = j.get();
+        inflight.push_back(std::move(j));
+        if (!read(x.layer, x.expert, stage[raw->slot], x.start, raw->left, raw->bad, out.bytes)) {   // (nothing of this one was queued)
+            raw->left.store(0, std::memory_order_release);
+            failed = true;
+            err = "expert tier: a fill read could not start";
+        }
+    }
+    while (!inflight.empty()) retire();   // every read is waited for before its slot is freed
+    out.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    if (failed) {
+        for (auto& d : devs_) d.mark->store(true);
+        return false;
+    }
+    for (uint32_t i = 0; i < D && !failed; ++i) {
+        TierHdr& h = devs_[i].hdr;
+        if (!flush(devs_[i])) { failed = true; err = "device " + devs_[i].spec.path + ": the experts could not be written (flush failed)"; break; }
+        const uint64_t used = striped_used_[i];
+        if (used > 0) {
+            if (h.chunk_off + h.chunk_count * 4 > devs_[i].size) { failed = true; err = "device " + devs_[i].spec.path + ": no room for its chunk table"; break; }
+            for (uint64_t c = 0; c < h.chunk_count; ++c) {
+                const uint64_t a = c * kTierChunk, b = std::min(used, (c + 1) * kTierChunk);
+                ds4_tier::put32(devs_[i].base + h.chunk_off + c * 4, strata::core::tier_crc32c(devs_[i].base + data_off_ + a, (size_t) (b - a)));
+            }
+            if (!flush(devs_[i])) { failed = true; err = "device " + devs_[i].spec.path + ": the chunk table could not be written (flush failed)"; break; }
+        }
+    }
+    for (uint32_t i = 0; i < D && !failed; ++i) {
+        TierHdr& h = devs_[i].hdr;
+        h.fill_state = 2;
+        if (!write_headers(devs_[i], h)) { failed = true; err = "device " + devs_[i].spec.path + ": the header could not be written (the write or its flush failed)"; break; }
+    }
+    if (failed) {
+        for (auto& d : devs_) d.mark->store(true);
+        return false;
+    }
+    readable_.store(true, std::memory_order_release);
+    return true;
+}
+
+inline bool ExpertTierSet::stripe_refs(int64_t layer, int64_t e, std::vector<StripeRef>& out) const {
+    out.clear();
+    if (!striped_ || !readable_.load(std::memory_order_acquire) || layer < 0 || e < 0 || (uint64_t) layer >= n_layers_ || (uint64_t) e >= n_expert_)
+        return false;
+    const size_t idx = (size_t) layer * (size_t) n_expert_ + (size_t) e;
+    if (idx >= start_of_.size() || start_of_[idx] < 0) return false;
+    const uint32_t D = (uint32_t) devs_.size();
+    const uint64_t blob = striped_blob_bytes(), stripe = stripe_bytes_;
+    const uint64_t nstr = (blob + stripe - 1) / stripe;
+    std::vector<uint64_t> cnt(D, 0);
+    for (uint64_t k = 0; k < nstr; ++k) {
+        const uint32_t dev = (uint32_t) (((uint64_t) start_of_[idx] + k) % D);
+        const Dev& d = devs_[dev];
+        if (d.base == nullptr || d.mark->load(std::memory_order_acquire)) { out.clear(); return false; }   // a marked device: the files
+        const uint64_t m = cnt[dev]++;
+        const uint64_t len = std::min<uint64_t>(stripe, blob - k * stripe);
+        const uint64_t off = data_off_ + soff_[idx * D + dev] + m * stripe;
+        out.push_back(StripeRef{ (int) dev, d.base + off, k * stripe, len, off });
+    }
+    return true;
+}
+
+inline bool ExpertTierSet::gather(int64_t layer, int64_t e, uint8_t* dst) const {
+    if (dst == nullptr) return false;
+    std::vector<StripeRef> refs;
+    if (!stripe_refs(layer, e, refs)) return false;
+    for (const StripeRef& r : refs) std::memcpy(dst + r.blob_off, r.src, (size_t) r.len);
+    return true;
+}
+
 inline bool ExpertTierSet::fill(const std::function<bool(int, int, uint8_t*, int, std::atomic<int>&, std::atomic<bool>&, uint64_t&)>& read,
                                 Fill& out, std::string& err) {
     out = Fill{};
     if (devs_.empty()) { err = "expert tier: no device is open"; return false; }
+    if (striped_) return fill_striped(read, out, err);
     out.per_dev.assign(devs_.size(), 0);
     // §9: rank order (entries_ is the placement in rank order), every expert's three matrices as the store's read jobs,
     // on the holding device's queue: the devices fill in parallel, each link keeps its own queue busy (§8.6).
@@ -1019,6 +1425,21 @@ inline void ExpertTierSet::note_copy_wait(int dev, uint64_t ns) {
     if (dev >= 0 && dev < (int)devs_.size() && devs_[(size_t)dev].trace && ns > 0)
         devs_[(size_t)dev].trace->note_wait(ns);
 }
+
+inline void ExpertTierSet::note_striped_hit(bool demand, bool direct, bool mapped) {
+    if (!striped_trace_) return;
+    StripedTrace& t = *striped_trace_;
+    t.hits.fetch_add(1, std::memory_order_relaxed);
+    (demand ? t.demand : t.prefetch).fetch_add(1, std::memory_order_relaxed);
+    (direct && mapped ? t.mixed : direct ? t.direct_only : t.mapped_only).fetch_add(1, std::memory_order_relaxed);
+}
+inline StripeHitStats ExpertTierSet::striped_hit_stats() const {
+    if (!striped_trace_) return {};
+    const StripedTrace& t = *striped_trace_;
+    return {t.hits.load(std::memory_order_relaxed), t.demand.load(std::memory_order_relaxed),
+            t.prefetch.load(std::memory_order_relaxed), t.mapped_only.load(std::memory_order_relaxed),
+            t.direct_only.load(std::memory_order_relaxed), t.mixed.load(std::memory_order_relaxed)};
+}
 inline std::vector<ExpertTierSet::DeviceStats> ExpertTierSet::stats() const {
     std::vector<DeviceStats> out;
     out.reserve(devs_.size());
@@ -1026,8 +1447,10 @@ inline std::vector<ExpertTierSet::DeviceStats> ExpertTierSet::stats() const {
         DeviceStats s;
         s.path = d.spec.path;
         s.direct_mode = direct_state(d);
+
         if (d.trace) {
             const TierIoStats& t = *d.trace;
+            s.stripe = t.stripe.snapshot();
             s.started_experts = t.started_experts.load(std::memory_order_relaxed);
             s.started_bytes = t.started_bytes.load(std::memory_order_relaxed);
             s.demand_experts = t.demand_experts.load(std::memory_order_relaxed);
@@ -1171,8 +1594,12 @@ inline void ExpertTierSet::direct_open_all() {
     for (Dev& d : devs_) {
         std::string why;
         if (direct_open_one(d, why)) {
-            std::fprintf(stderr, "expert tier %s: DS4_TIER_DIRECT=1: direct reads (one whole slot a read, unbuffered; alignment %llu, memory %llu)\n",
-                         d.spec.path.c_str(), (unsigned long long) d.dalign, (unsigned long long) d.dmem_align);
+            if (striped_)
+                std::fprintf(stderr, "expert tier %s: DS4_TIER_DIRECT=1: direct-capable (per-stripe eligibility checked on use; alignment %llu, memory %llu)\n",
+                             d.spec.path.c_str(), (unsigned long long) d.dalign, (unsigned long long) d.dmem_align);
+            else
+                std::fprintf(stderr, "expert tier %s: DS4_TIER_DIRECT=1: direct reads (one whole slot a read, unbuffered; alignment %llu, memory %llu)\n",
+                             d.spec.path.c_str(), (unsigned long long) d.dalign, (unsigned long long) d.dmem_align);
         } else {
             std::fprintf(stderr, "expert tier %s: DS4_TIER_DIRECT=1: mapped copies (%s)\n", d.spec.path.c_str(), why.c_str());
         }
@@ -1200,6 +1627,20 @@ inline bool ExpertTierSet::direct_slot(int dev, uint64_t k, ExpertStore::TierDir
     return true;
 }
 
+inline bool ExpertTierSet::direct_stripe(int dev, uint64_t off, uint64_t len, ExpertStore::TierDirect& out) const {
+    if (!striped_ || dev < 0 || dev >= (int) devs_.size()) return false;
+    const Dev& d = devs_[(size_t) dev];
+    if (!d.direct_capable || d.dfd < 0 || d.direct_refused->load(std::memory_order_acquire) ||
+        len == 0 || off < data_off_ || off > d.size || len > d.size - off) return false;
+    out.fd = (os::fd_t) d.dfd;
+    out.off = off;
+    out.len = len;
+    out.align = d.dalign;
+    out.mem_align = d.dmem_align;
+    out.refused = d.direct_refused.get();
+    return true;
+}
+
 inline void ExpertTierSet::drain() {
     for (auto& d : devs_) d.io.reset();   // (~IoQueue runs the queued jobs to the end, then joins: nothing is dropped, nothing is left running)
 }
@@ -1208,6 +1649,7 @@ inline void ExpertTierSet::close() {
     drain();   // (before any mapping goes: a queued copy reads the mapping)
     for (auto& d : devs_) close_one(d);
     devs_.clear();
+    striped_trace_.reset();
     lookup_.clear();
     entries_.clear();
     readable_.store(false, std::memory_order_release);
