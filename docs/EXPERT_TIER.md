@@ -94,8 +94,8 @@ so only the counters show which one served a read.
 - The pointer for a copy that runs later (`blob_stable`) and the refill of a lent cache slot keep the model files for a striped
   expert. Neither is a staging slot, so neither can be recycled under a copy that is still running.
 
-**DeepSeek reads and formats.** `strata-dsv41` gathers the stripes of a tier-held expert into its RAM store. Qwen and DeepSeek
-use different tier headers: Qwen writes version 2 for whole and version 3 for striped; DeepSeek writes version 1 for whole and
+**DeepSeek reads and formats.** By default, `strata-dsv41` gathers stripes into its RAM store for decode. Chunked prefill
+can opt in to reading stripes into its own staging ring (see below). Qwen and DeepSeek use different tier headers: Qwen writes version 2 for whole and version 3 for striped; DeepSeek writes version 1 for whole and
 version 2 for striped. Changing the layout refills the tier.
 
 **Limits.** In Qwen, a lent-cache refill reads the model files rather than the striped tier. GPU validation and a speed
@@ -157,6 +157,12 @@ Differences from the Qwen engine, in plain words:
 - **A per-device breakdown.** `DS4_TIER_LOG=1` (off by default; unset or `0` disables) makes `strata-dsv41` print one line per tier device at
   the end of a decode: copies and MB a token, the queue and copy times, the cold share, and the CPU lane's wait for
   that device. It is a diagnostic; the residency probe it adds runs only when the variable is set.
+- **Striped reads during chunked prefill (experimental, off by default).** Set `DS4_PREFILL_TIER=1` with a `striped`
+  tier. Chunked prefill queues tier and model-file misses into its existing staging slots without inserting them into
+  the decode RAM store. The flow submits the available window before waiting; with `DS4_FLOW=0`, the batch path submits
+  one existing batch at a time. Tier reads into staging are mapped copies, even with `DS4_TIER_DIRECT=1`. Whole-tier,
+  windowed prefill, and decode behavior do not change. With `DS4_FLOW_STATS=1`, a separate prefill line reports tier payload
+  queued, file bytes read, and tier-to-file retries. These counts are not physical disk traffic. No speedup is established.
 - **Direct reads (experimental, Linux, off by default).** Set `DS4_TIER_DIRECT=1` in the engine's environment at start to
   allow unbuffered tier reads into the RAM store. With `whole`, a tier hit can read its slot in one operation. With
   `striped`, each stripe can be read directly from its device into its place in the store. Unset or `0` keeps mapped copies;

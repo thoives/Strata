@@ -1965,6 +1965,16 @@ set_property(SOURCE src/kernels/cpu/q2_avx2.cpp APPEND PROPERTY COMPILE_DEFINITI
 find_package(Threads REQUIRED)
 target_link_libraries(strata_kernels_cpu PUBLIC Threads::Threads)
 
+# Chunked DeepSeek prefill I/O: real queue workers, with no GPU or model dependency.
+if(STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/dsv41/prefill_io_test.cpp")
+  add_executable(ds4_prefill_io_test tests/dsv41/prefill_io_test.cpp)
+  target_include_directories(ds4_prefill_io_test PRIVATE src/dsv41)
+  target_compile_definitions(ds4_prefill_io_test PRIVATE DS4_IOQUEUE_TEST_HOOKS=1)
+  target_link_libraries(ds4_prefill_io_test PRIVATE Threads::Threads)
+  add_test(NAME ds4_prefill_io_test COMMAND ds4_prefill_io_test)
+  set_tests_properties(ds4_prefill_io_test PROPERTIES TIMEOUT 30)
+endif()
+
 # ---- plan v0.3 P6: the i-quant models' CPU experts (IQ2_XS / IQ3_XXS files) ----
 #
 # The CPU computes a native expert with ggml-cpu's own dot products (`ggml_get_type_traits_cpu`), so an IQ

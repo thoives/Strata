@@ -140,10 +140,11 @@ private:
 struct CompletionHub {
     std::mutex mu;
     std::condition_variable cv;
+    uint64_t epoch = 0;  // prefill can take a snapshot before pumping the staging ring
     void notify() {
         // (a waiter holds mu from its test until it sleeps: this lock waits for that, so the count it just lowered is seen by
         //  the waiter's next test, or the notify below wakes it from its sleep)
-        { std::lock_guard<std::mutex> lk(mu); }
+        { std::lock_guard<std::mutex> lk(mu); ++epoch; }
         cv.notify_all();
     }
 #ifdef DS4_IOQUEUE_TEST_HOOKS
@@ -318,6 +319,8 @@ public:
         uint64_t align = 0, mem_align = 0, payload = 0;
         const uint8_t* fallback = nullptr;
         std::atomic<bool>* refused = nullptr;
+        bool sync_fd = false;          // exact buffered fallback uses a synchronous file handle
+        std::shared_ptr<CompletionHub> expert_done;  // prefill: notify only on the last job, across all queues
     };
     explicit IoQueue(int n, TierIoStats* trace = nullptr) : trace_(trace) {
         for (int i = 0; i < n; ++i) th_.emplace_back([this] { loop(); });
@@ -343,14 +346,24 @@ public:
             for (int i = 0; i < n; ++i) {
                 (low ? ql_ : q_).push_back(jobs[i]);
                 (low ? ql_ : q_).back().pushed = std::chrono::steady_clock::now();
-                traced = traced || jobs[i].tier_copy;
-                if (trace_ && jobs[i].tier_stripe)
+                traced = traced || (jobs[i].tier_copy && !jobs[i].expert_done);
+                if (trace_ && jobs[i].tier_stripe && !jobs[i].expert_done)
                     (jobs[i].tier_direct ? trace_->stripe.direct_submitted : trace_->stripe.mapped_submitted).add(jobs[i].len);
             }
             if (trace_ && traced) trace_->note_depth((uint64_t) (q_.size() + ql_.size()));
         }
         if (n == 1) cv_.notify_one();
         else cv_.notify_all();
+    }
+    // Turn the unread part of a speculative prefill pick into demand once routing confirms it.
+    void promote(const std::atomic<int>& left) {
+        std::lock_guard<std::mutex> lk(mu_);
+        for (auto it = ql_.begin(); it != ql_.end();) {
+            if (it->left != &left) { ++it; continue; }
+            it->demand = true;
+            q_.push_back(std::move(*it));
+            it = ql_.erase(it);
+        }
     }
     void wait_any(int us) {
         std::unique_lock<std::mutex> lk(done_mu_);
@@ -369,6 +382,12 @@ public:
     /// load): called at the start of each wait_until_zero(), with the queue waited on and the counter, while the
     /// completion mutex is held.  No completion can be announced between the call and the sleep, so a test that acts here
     /// knows the waiter is about to sleep.  It must not call into this queue.
+    // A test may gate a particular job or report a read error without touching the source or destination.
+    using ReadHook = bool (*)(const Job&);
+    static ReadHook& read_hook() {
+        static ReadHook f = nullptr;
+        return f;
+    }
     using SlotWaitHook = void (*)(const IoQueue*, const std::atomic<int>*);
     static SlotWaitHook& slot_wait_hook() {
         static SlotWaitHook f = nullptr;
@@ -404,6 +423,11 @@ public:
     uint64_t buffered_bytes() const { return buffered_.load(std::memory_order_relaxed); }
 
 private:
+    static void finish_expert(const Job& j) {
+        // No slot state is accessed after the decrement. The job owns its signal through notification.
+        if (j.left && j.left->fetch_sub(1, std::memory_order_acq_rel) == 1 && j.expert_done)
+            j.expert_done->notify();
+    }
     void loop() {
 #if defined(_WIN32)
         if (std::getenv("DS4_IO_PRIO") != nullptr) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);   // (a read in flight is the lane's critical path)
@@ -416,15 +440,15 @@ private:
                 cv_.wait(lk, [&] { return quit_ || !q_.empty() || !ql_.empty(); });
                 if (quit_ && q_.empty() && ql_.empty()) return;
                 std::deque<Job>& qq = q_.empty() ? ql_ : q_;
-                j = qq.front();
+                j = std::move(qq.front());
                 qq.pop_front();
                 if (hub_) hub = hub_;
             }
             if (j.cancel != nullptr && j.cancel->load(std::memory_order_acquire)) {   // (dropped unread)
-                if (trace_ && j.tier_stripe)
+                if (trace_ && j.tier_stripe && !j.expert_done)
                     (j.tier_direct ? trace_->stripe.direct_cancelled : trace_->stripe.mapped_cancelled).add(j.len);
                 if (j.bad != nullptr) j.bad->store(true, std::memory_order_release);
-                if (j.left != nullptr) j.left->fetch_sub(1, std::memory_order_acq_rel);
+                finish_expert(j);
                 {
                     std::lock_guard<std::mutex> lk(done_mu_);
                     ++done_;
@@ -436,8 +460,13 @@ private:
             const auto t0 = std::chrono::steady_clock::now();
             const uint64_t lead = j.off % os::kDirectAlign;
             bool ok = false, direct_hit = false, direct_fb = false;
+#ifdef DS4_IOQUEUE_TEST_HOOKS
+            if (ReadHook f = read_hook(); f && !f(j)) {
+                // Follow the same completion and error path as a reported read failure.
+            } else
+#endif
             if (j.mem != nullptr) {
-                const bool traced = trace_ != nullptr && j.tier_copy;
+                const bool traced = trace_ != nullptr && j.tier_copy && !j.expert_done;
                 const auto tc0 = traced ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 const bool cold = traced && !os::resident_sampled(j.mem, (size_t) j.len, 4);   // (a cold mapped tier range faults from the drive)
                 std::memcpy(j.dst, j.mem, (size_t) j.len);
@@ -467,14 +496,15 @@ private:
                 // unbuffered through a bounce buffer (the disk reads aligned spans), then the bytes to where they belong
                 thread_local std::vector<uint8_t> bounce;
                 const uint64_t span = os::direct_span(j.off, j.len);
-                if (bounce.size() < span + os::kDirectAlign) bounce.resize((size_t) span + 2 * os::kDirectAlign);
+                if (j.dfd != os::kBadFd && bounce.size() < span + os::kDirectAlign)
+                    bounce.resize((size_t) span + 2 * os::kDirectAlign);
                 uint8_t* bp = (uint8_t*) (((uintptr_t) bounce.data() + os::kDirectAlign - 1) & ~(uintptr_t) (os::kDirectAlign - 1));
                 if (j.dfd != os::kBadFd && !(j.map != nullptr && os::resident(j.map, (size_t) j.len)) &&
                     os::pread_direct(j.dfd, bp, j.len, j.off)) {
                     std::memcpy(j.dst, bp + lead, (size_t) j.len);
                     ok = true;
                     direct_.fetch_add(j.len, std::memory_order_relaxed);
-                } else if (os::pread_par(j.fd, j.dst, j.len, j.off)) {
+                } else if (j.sync_fd ? os::pread_full(j.fd, j.dst, j.len, j.off) : os::pread_par(j.fd, j.dst, j.len, j.off)) {
                     ok = true;
                     buffered_.fetch_add(j.len, std::memory_order_relaxed);
                 }
@@ -487,8 +517,9 @@ private:
                 buffered_.fetch_add(j.len, std::memory_order_relaxed);
             }
             const auto t_rd = std::chrono::steady_clock::now();
-            if (ok && j.keep != nullptr && j.mem == nullptr) std::memmove(j.keep, j.exact ? j.dst : j.dst + lead, (size_t) j.len);   // (keep may overlap dst: the store reads in place and moves up)
-            if (trace_ && j.tier_stripe) {
+            if (ok && j.keep != nullptr && (j.mem == nullptr || j.tier_stripe))
+                std::memmove(j.keep, (j.exact || j.mem != nullptr) ? j.dst : j.dst + lead, (size_t) j.len);
+            if (trace_ && j.tier_stripe && !j.expert_done) {
                 if (j.tier_direct) {
                     if (direct_hit) trace_->stripe.direct_ok.add(j.len);
                     else if (direct_fb) trace_->stripe.direct_fallback.add(j.len);
@@ -519,7 +550,7 @@ private:
                                std::memory_order_relaxed);
             if (!ok && j.fail != nullptr) j.fail->store(true, std::memory_order_release);   // (before bad and left: whoever sees them done sees why)
             if (!ok && j.bad != nullptr) j.bad->store(true, std::memory_order_release);
-            if (j.left != nullptr) j.left->fetch_sub(1, std::memory_order_acq_rel);
+            finish_expert(j);
             {
                 std::lock_guard<std::mutex> lk(done_mu_);
                 ++done_;

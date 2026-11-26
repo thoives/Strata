@@ -27,6 +27,7 @@
 #include "ds4_pool.hpp"
 #include "ds4_store.hpp"
 #include "ds4_tier.hpp"
+#include "ds4_prefill_io.hpp"
 #include "ds4_vision.cuh"
 #include "strata/core/expert_tier.hpp"
 #include "strata/dsv41/exl3_cpu.hpp"
@@ -679,14 +680,10 @@ struct Chunk {
     uint8_t* eg_host[2] = {nullptr, nullptr};
     cudaEvent_t emb_ev[2] = {nullptr, nullptr}, eg_ev[2] = {nullptr, nullptr};
     double stream_bytes = 0;     // the experts streamed in, in all
-    // the flow (a GGUF's in-place experts, every layer of the device on it alone; DS4_FLOW=0: the batches above): a
-    // (chunk, layer)'s streamed experts are those it routes to - its likely ones (the profile's chance of a pick by the
-    // chunk's tokens) queued once the layer before it routed, read while that one computes, the rest of its picks once
-    // it routed itself; never an expert no token of the chunk picked unless it was a likely one.  Each item read by io
-    // (unbuffered: the disk straight into its staging slot, every part of every item in flight at once - none waits
-    // for a batch) or taken from its RAM-tier slot as it lies, then DMA'd into the ring in order, item i into slot
-    // i % ring_n; the compute takes the items as they land, in runs of what has.
-    struct Item {
+    // The flow (DS4_FLOW=0: the batches above) streams a (chunk, layer)'s likely picks while the previous layer
+    // computes, then the rest of its picks once it routes. Reads go into the bounded staging ring or use pinned RAM
+    // in place; DMAs go into the GPU ring in order, item i into slot i % ring_n. Compute uses fixed batch boundaries.
+    struct Item : PrefillRead {
         int il = 0, k = 0, e = 0, v = 0, stage = -1;   // layer, chunk, expert, virtual slot, staging slot (-1: RAM)
         int mi = 0;                                    // the device's member index in the layer's group
         bool direct = false;                           // (Metal) read straight into its ring slot: no staging, no DMA
@@ -694,13 +691,15 @@ struct Chunk {
         const uint8_t* ram = nullptr;                  // its RAM-tier blob, copied into staging (not pinned there)
         uint8_t* keep = nullptr;                       // (layer-major) its layer-cache slot: what is read kept there
         int64_t after = -1;                            // (layer-major) the items up to this one read first
-        std::atomic<int> left{0};                      // parts still being read
-        std::atomic<bool> bad{false};
+        bool speculative = false;                     // not confirmed by routing yet
     };
     bool flow = false;
     bool direct = false;                     // (Metal, unified memory) the flow reads the files straight into the ring
     int dev = -1;                            // the device (index into devs) this chunk state belongs to
     std::unique_ptr<IoQueue> io;
+    int n_readers = 0;
+    std::unique_ptr<PrefillReads> prefill;   // active only during an opt-in flow run
+    uint64_t prefill_tier_bytes = 0, prefill_tier_reads = 0, prefill_tier_retries = 0;
     std::deque<Item> items;                  // items[0] is item `base`; the indices below are absolute
     size_t base = 0, n_read = 0, n_dma = 0, n_comp = 0;
     uint64_t n_file = 0;                     // file items so far (staging slot = ordinal % S)
@@ -992,7 +991,8 @@ struct Model::Impl {
     bool halt_end(int di, std::string& err) {
         Chunk& c = *chunks[(size_t) di];
         cudaSetDevice(devs[(size_t) di].id);
-        if (c.flow)
+        if (c.prefill) flow_drain(c);
+        else if (c.flow)
             for (size_t i = c.base; i < c.n_read; ++i)
                 while (fit(c, i).left.load(std::memory_order_acquire) != 0) c.io->wait_until_zero(fit(c, i).left);
         if (c.cs != nullptr) cudaStreamSynchronize(c.cs);
@@ -3173,6 +3173,7 @@ struct Model::Impl {
                     if (fl)   // (each part read unbuffered from its offset rounded down: a page more each)
                         cp->stage_stride = std::max(cp->stage_stride, flow_stride());
                     cp->S = cp->ring_n;
+                    cp->n_readers = n_readers;
                     if (!halloc(cp->stage, (size_t) cp->S * cp->stage_stride, err)) return false;
                     cp->readers = std::make_unique<Pool>(n_readers - 1, std::vector<int>{}, 50);
                     if (!fl) continue;
@@ -3813,6 +3814,88 @@ struct Model::Impl {
             ahead += nb;
         }
     }
+    bool stage_batch(Chunk& c, const Layer& l, const Batch& bt, uint8_t* sb) {
+        PrefillReads reads;
+        std::vector<PrefillRead> batch((size_t) bt.n);
+        struct Drain {
+            PrefillReads& reads;
+            std::vector<PrefillRead>& batch;
+            ~Drain() {
+                reads.cancel();
+                for (const auto& r : batch) reads.wait(r);
+            }
+        } drain{reads, batch};
+        auto file = [&](int i) {
+            const int e = l.host_list[(size_t) (bt.j0 + i)];
+            uint8_t* dst = sb + (size_t) i * c.stage_stride;
+            IoQueue::Job jobs[6];
+            int n = 0;
+            auto add_file = [&](int fi, uint64_t off, uint64_t len, uint8_t* out) {
+                auto& j = jobs[n++];
+                const os::fd_t pf = pk.pfds.empty() ? os::kBadFd : pk.pfds[(size_t) fi];
+                j.fd = pf != os::kBadFd ? pf : pk.fds[(size_t) fi];
+                j.sync_fd = pf == os::kBadFd;
+                j.dfd = pk.direct_reads && !pk.dfds.empty() ? pk.dfds[(size_t) fi] : os::kBadFd;
+                j.off = off;
+                j.len = len;
+                j.dst = out;
+                j.exact = true;   // same bounce-buffer semantics as Pack::read_at
+            };
+            if (l.lay.fmt != gg::kFmtMXFP4)
+                add_file(l.region_file[(size_t) e], l.region_off[(size_t) e], l.region_bytes[(size_t) e], dst);
+            else {
+                const int rs = l.ram.empty() ? -1 : l.ram[(size_t) e];
+                if (!l.dback.empty() || (rs >= 0 && !copy_mode)) {
+                    auto& j = jobs[n++];
+                    j.dst = dst;
+                    j.len = l.blob;
+                    j.mem = !l.dback.empty() ? l.dback[(size_t) e] : ram_slots[(size_t) rs];
+                } else if (rs >= 0) {
+                    for (int r = 0; r < 3; ++r) {
+                        const size_t len = mx_part_bytes(l, r) / NH;
+                        for (int x = 0; x < NH; ++x) {
+                            auto& j = jobs[n++];
+                            j.dst = dst + l.lay.trellis[r] + (size_t) x * len;
+                            j.len = len;
+                            j.mem = ram_part[(size_t) rs][(size_t) x] + cp_lay[(size_t) l.il][(size_t) r];
+                        }
+                    }
+                } else {
+                    for (int r = 0; r < 3; ++r)
+                        add_file(l.mx_file[r], l.mx_off[r] + (uint64_t) e * l.mx_stride[r], mx_part_bytes(l, r), dst + l.lay.trellis[r]);
+                }
+            }
+            reads.submit_file(*c.io, jobs, n, batch[(size_t) i]);
+        };
+        for (int i = 0; i < bt.n; ++i) {
+            const int e = l.host_list[(size_t) (bt.j0 + i)];
+            if (l.lay.fmt == gg::kFmtMXFP4 && l.dback.empty() && (l.ram.empty() || l.ram[(size_t) e] < 0)) {
+                uint8_t* dst = sb + (size_t) i * c.stage_stride;
+                PrefillRange ranges[3];
+                for (int r = 0; r < 3; ++r) ranges[r] = {l.lay.trellis[r], mx_part_bytes(l, r), dst + l.lay.trellis[r]};
+                if (reads.submit_tier(*tier, l.il, e, ranges, 3, batch[(size_t) i], false)) continue;
+            }
+            file(i);
+        }
+        // All slots in this batch have been submitted. Retry completed failures without waiting on other experts.
+        // The original batch DMA and event boundaries stay in copy_ahead().
+        for (;;) {
+            const uint64_t seen = reads.epoch();
+            bool pending = false;
+            for (int i = 0; i < bt.n; ++i) {
+                auto& r = batch[(size_t) i];
+                if (r.left.load(std::memory_order_acquire) != 0 || reads.retry_file(r, [&] { file(i); })) pending = true;
+                else if (r.bad.load(std::memory_order_relaxed)) return false;
+            }
+            if (!pending) break;
+            reads.wait_change(seen, 50'000);
+        }
+        c.prefill_tier_bytes += reads.tier_bytes;
+        c.prefill_tier_reads += reads.tier_reads;
+        c.prefill_tier_retries += reads.tier_retries;
+        return true;
+    }
+
     bool copy_ahead(Dev& d, Chunk& c, Streamer& S, int di, std::string& err) {
         const int P = Chunk::kParts;
         while (S.cp < S.b.size() && S.cp < S.kp + P) {
@@ -3831,7 +3914,8 @@ struct Model::Impl {
                 sb = c.stage + (size_t) half * (c.ring_n / P) * c.stage_stride;
                 std::atomic<bool> bad{false};
                 const double t_st = now_ms();
-                c.readers->run(bt.n, [&](int i) {
+                if (prefill_tier_enabled()) bad.store(!stage_batch(c, l0, bt, sb));
+                else c.readers->run(bt.n, [&](int i) {
                     const int e = l0.host_list[(size_t) (bt.j0 + i)];
                     if (l0.lay.fmt == gg::kFmtMXFP4 ? !read_mx(l0, e, sb + (size_t) i * c.stage_stride)
                                                     : !pk.read_at(l0.region_file[(size_t) e], l0.region_off[(size_t) e],
@@ -3888,7 +3972,7 @@ struct Model::Impl {
             if (member(L0, m).dev == c.dev) return m;
         return 0;
     }
-    void flow_push(Chunk& c, const Layer& l, int mi, int k, int e, int v) {
+    void flow_push(Chunk& c, const Layer& l, int mi, int k, int e, int v, bool speculative = false) {
         c.items.emplace_back();
         Chunk::Item& it = c.items.back();
         it.il = l.il;
@@ -3896,6 +3980,7 @@ struct Model::Impl {
         it.k = k;
         it.e = e;
         it.v = v;
+        it.speculative = speculative;
         bool in_ram = !l.ram.empty() && l.ram[(size_t) e] >= 0;
         const uint8_t* store_blob = nullptr;   // (the RAM store holds it: copied into staging like a RAM-tier slot, no read)
         if (!in_ram && store && l.nm == 1) {
@@ -3939,7 +4024,8 @@ struct Model::Impl {
                 it.after = (int64_t) c.lc_first - 1;
             }
         }
-        if (c.direct && l.nm == 1 && !(in_ram && copy_mode)) {   // (the ring slot is the destination: filled by flow_pump when its turn comes)
+        // Tier misses use the staging ring even on Metal. Keep direct-to-ring for the existing RAM/cache hits.
+        if (c.direct && l.nm == 1 && !(in_ram && copy_mode) && (!c.prefill || in_ram || hit)) {
             it.direct = true;
             it.stage = -1;
             it.left.store(3, std::memory_order_relaxed);
@@ -4003,7 +4089,7 @@ struct Model::Impl {
         }
         for (int e : l.host_list)
             if (!is[(size_t) e]) vs[e] = l.n_slots + j++;
-        for (const auto& x : cand) flow_push(c, l, mi, k, x.second, vs[x.second]);
+        for (const auto& x : cand) flow_push(c, l, mi, k, x.second, vs[x.second], true);
         c.n_spec = (int) cand.size();
         c.it_spec += cand.size();
     }
@@ -4013,13 +4099,18 @@ struct Model::Impl {
         const int mi = flow_mi(c, l);
         const int* vs = member(l, mi).vs_pin;
         for (size_t i = c.spec_begin; i < c.spec_begin + (size_t) c.n_spec; ++i) {
-            const int v = fit(c, i).v;
-            if (b[(size_t) v + 1] == b[(size_t) v]) ++c.it_spec_unused;
+            Chunk::Item& it = fit(c, i);
+            if (b[(size_t) it.v + 1] == b[(size_t) it.v]) ++c.it_spec_unused;
+            else if (c.prefill) {
+                it.speculative = false;
+                if (it.submitted && it.left.load(std::memory_order_acquire) != 0) {
+                    if (it.tier) {
+                        for (size_t d = 0; d < tier->device_count(); ++d) tier->queue((int) d)->promote(it.left);
+                    } else c.io->promote(it.left);
+                }
+            }
         }
-        for (int e : l.host_list) {   // (index order: their virtual slots ascending)
-            const int v = vs[e];
-            if (v >= l.n_slots + c.n_spec && b[(size_t) v + 1] > b[(size_t) v]) flow_push(c, l, mi, k, e, v);
-        }
+        prefill_routed(l.host_list, vs, l.n_slots + c.n_spec, b.data(), [&](int e, int v) { flow_push(c, l, mi, k, e, v); });
     }
     // the next (chunk, layer) of the device after (k, il) in the run's order that streams experts (false: none) - a
     // long prompt's skip leaves out its early chunks' layers from Run::yoco on (kv_only there: no experts)
@@ -4062,31 +4153,100 @@ struct Model::Impl {
         }
         return false;
     }
-    // the reads (in order, each into its staging slot once that slot's last DMA is done) and the DMAs (in order, each
-    // into its ring slot once that slot's last use is queued: the copy stream waits for it) as far as they can go now
+    bool prefill_tier_enabled() const {
+        static const bool on = [] {
+            const char* v = std::getenv("DS4_PREFILL_TIER");
+            return v && std::strcmp(v, "1") == 0;
+        }();
+        return on && tier && tier->striped() && tier->readable();
+    }
+
+    void flow_stage_read(Chunk& c, Chunk::Item& it, bool try_tier) {
+        const Layer& l = L[(size_t) it.il];
+        uint8_t* sb = c.stage + (size_t) it.stage * c.stage_stride;
+        const int cs = copy_mode && it.ram != nullptr ? l.ram[(size_t) it.e] : -1;
+        IoQueue::Job jobs[6];
+        PrefillRange ranges[3]{};
+        int nj = 0;
+        for (int r = 0; r < 3; ++r) {
+            if (cs >= 0) {   // a copy: each matrix's NH parts of rows, side by side into staging
+                const size_t nb = (size_t) (mx_n(r) / NH) * mx_row_b(l, r);
+                for (int X = 0; X < NH; ++X) {
+                    IoQueue::Job& j = jobs[nj++];
+                    j.len = nb;
+                    j.dst = sb + (size_t) X * nb;
+                    j.left = &it.left;
+                    j.bad = &it.bad;
+                    j.mem = ram_part[(size_t) cs][(size_t) X] + cp_lay[(size_t) l.il][(size_t) r];
+                }
+                sb += flow_region(r);
+                continue;
+            }
+            IoQueue::Job& j = jobs[nj++];
+            const os::fd_t pf = pk.pfds.empty() ? os::kBadFd : pk.pfds[(size_t) l.mx_file[r]];
+            j.fd = pf != os::kBadFd ? pf : pk.fds[(size_t) l.mx_file[r]];
+            j.dfd = pk.dfds.empty() ? os::kBadFd : pk.dfds[(size_t) l.mx_file[r]];
+            const size_t start = mx_read_off(l, it.mi, r);
+            j.off = l.mx_off[r] + (uint64_t) it.e * l.mx_stride[r] + start;
+            j.len = mx_read_len(l, r);
+            j.dst = sb;
+            j.left = &it.left;
+            j.bad = &it.bad;
+            j.mem = it.ram != nullptr ? it.ram + l.lay.trellis[r] + start : nullptr;
+            j.map = pk.at(l.mx_file[r], j.off);
+            j.keep = it.keep != nullptr ? it.keep + l.lay.trellis[r] : nullptr;
+            if (try_tier) ranges[r] = {l.lay.trellis[r] + start, j.len, sb + j.off % os::kDirectAlign, j.keep};
+            sb += flow_region(r);
+        }
+        if (try_tier && it.ram == nullptr && c.prefill->submit_tier(*tier, it.il, it.e, ranges, 3, it, it.speculative))
+            return;
+        if (c.prefill) c.prefill->submit_file(*c.io, jobs, nj, it, it.speculative);
+        else c.io->push(jobs, nj);
+    }
+
+    void flow_drain(Chunk& c) {
+        c.prefill->cancel();
+        // A read beyond n_read can have started: that index only tracks the contiguous prefix.
+        for (size_t i = c.n_dma; i < c.base + c.items.size(); ++i)
+            if (fit(c, i).submitted) c.prefill->wait(fit(c, i));
+    }
+
+    // Submit eligible reads before looking at completions. DMA (and thus compute) keeps the original ring order.
     bool flow_pump(Chunk& c, std::string& err) {
         const size_t end = c.base + c.items.size();
-        IoQueue::Job jobs[6];
-        while (c.n_read < end) {
-            Chunk::Item& it = fit(c, c.n_read);
+        bool failed = false;
+        auto event_ready = [&](cudaError_t q) {
+            if (q == cudaErrorNotReady) return false;
+            if (q == cudaSuccess) return true;
+            err = std::string("checking prefill slot event: ") + cudaGetErrorString(q);
+            failed = true;
+            return false;
+        };
+        auto submit = [&](size_t i, Chunk::Item& it) -> bool {
+            if (failed) return false;
+            auto ready = [&](size_t q) {
+                return c.prefill ? fit(c, q).ready() : fit(c, q).left.load(std::memory_order_acquire) == 0;
+            };
             if (it.after >= 0) {   // layer-major: a slot's expert copied out of it once its reader is done; a slot
                 // written again once the layer before's items are all read (none still copies out of it)
                 bool wait = false;
                 if (it.keep == nullptr)
-                    wait = (size_t) it.after >= c.base && fit(c, (size_t) it.after).left.load(std::memory_order_acquire) != 0;
+                    wait = (size_t) it.after >= c.base &&
+                           ((c.prefill && !fit(c, (size_t) it.after).submitted) || !ready((size_t) it.after));
                 else {
                     while (c.lc_chk < c.n_read &&
-                           (c.lc_chk < c.base || fit(c, c.lc_chk).left.load(std::memory_order_acquire) == 0))
+                           (c.lc_chk < c.base || ready(c.lc_chk)))
                         ++c.lc_chk;
                     wait = c.lc_chk <= (size_t) it.after;
                 }
-                if (wait) break;
+                if (wait) return false;
             }
             if (it.direct) {
-                const size_t R = (size_t) c.ring_n, r = c.n_read % R;
-                if (c.n_read >= R) {   // the slot's last use has to be computed - and finished: the CPU writes it
-                    if (c.n_comp <= c.n_read - R) break;
-                    CK(cudaEventSynchronize(c.ring_free[r]));
+                const size_t R = (size_t) c.ring_n, r = i % R;
+                if (i >= R) {   // the slot's last use has to be computed - and finished: the CPU writes it
+                    if (c.n_comp <= i - R) return false;
+                    if (!event_ready(c.prefill ? cudaEventQuery(c.ring_free[r]) : cudaEventSynchronize(c.ring_free[r])))
+                        return false;
                 }
                 const Layer& l = L[(size_t) it.il];
 #if defined(STRATA_METAL)
@@ -4095,6 +4255,7 @@ struct Model::Impl {
                 uint8_t* dst = c.ring + r * c.ring_stride;
 #endif
                 const x3::ExpertLayout& lay = l.lay;
+                IoQueue::Job jobs[3];
                 int nj = 0;
                 for (int q = 0; q < 3; ++q) {
                     IoQueue::Job& j = jobs[nj++];
@@ -4112,52 +4273,30 @@ struct Model::Impl {
                     j.map = pk.at(l.mx_file[q], j.off);
                     j.keep = it.keep != nullptr ? it.keep + lay.trellis[q] : nullptr;
                 }
-                c.io->push(jobs, nj);
+                if (c.prefill) c.prefill->submit_file(*c.io, jobs, nj, it, it.speculative);
+                else c.io->push(jobs, nj);
             } else if (it.stage >= 0) {
                 const int64_t prev = c.stage_item[(size_t) it.stage];
                 if (prev >= 0) {
-                    if ((size_t) prev >= c.n_dma) break;
-                    const cudaError_t q = cudaEventQuery(c.stage_ev[(size_t) it.stage]);
-                    if (q == cudaErrorNotReady) break;
-                    CK(q);
+                    if ((size_t) prev >= c.n_dma) return false;
+                    if (!event_ready(cudaEventQuery(c.stage_ev[(size_t) it.stage]))) return false;
                 }
-                c.stage_item[(size_t) it.stage] = (int64_t) c.n_read;
-                const Layer& l = L[(size_t) it.il];
-                uint8_t* sb = c.stage + (size_t) it.stage * c.stage_stride;
-                const int cs = copy_mode && it.ram != nullptr ? l.ram[(size_t) it.e] : -1;   // (a copy's slot)
-                int nj = 0;
-                for (int r = 0; r < 3; ++r) {
-                    if (cs >= 0) {   // a copy: each matrix's NH parts of rows, side by side into staging
-                        const size_t nb = (size_t) (mx_n(r) / NH) * mx_row_b(l, r);
-                        for (int X = 0; X < NH; ++X) {
-                            IoQueue::Job& j = jobs[nj++];
-                            j = IoQueue::Job{};
-                            j.len = nb;
-                            j.dst = sb + (size_t) X * nb;
-                            j.left = &it.left;
-                            j.bad = &it.bad;
-                            j.mem = ram_part[(size_t) cs][(size_t) X] + cp_lay[(size_t) l.il][(size_t) r];
-                        }
-                        sb += flow_region(r);
-                        continue;
-                    }
-                    IoQueue::Job& j = jobs[nj++];
-                    const os::fd_t pf = pk.pfds.empty() ? os::kBadFd : pk.pfds[(size_t) l.mx_file[r]];
-                    j.fd = pf != os::kBadFd ? pf : pk.fds[(size_t) l.mx_file[r]];
-                    j.dfd = pk.dfds.empty() ? os::kBadFd : pk.dfds[(size_t) l.mx_file[r]];
-                    j.off = l.mx_off[r] + (uint64_t) it.e * l.mx_stride[r] + mx_read_off(l, it.mi, r);
-                    j.len = mx_read_len(l, r);
-                    j.dst = sb;
-                    j.left = &it.left;
-                    j.bad = &it.bad;
-                    j.mem = it.ram != nullptr ? it.ram + l.lay.trellis[r] + mx_read_off(l, it.mi, r) : nullptr;
-                    j.map = pk.at(l.mx_file[r], j.off);
-                    j.keep = it.keep != nullptr ? it.keep + l.lay.trellis[r] : nullptr;
-                    sb += flow_region(r);
-                }
-                c.io->push(jobs, nj);
+                c.stage_item[(size_t) it.stage] = (int64_t) i;
+                flow_stage_read(c, it, c.prefill != nullptr);
             }
-            ++c.n_read;
+            return true;
+        };
+        if (c.prefill)
+            submit_prefill_window(c.n_read, end, (size_t) c.S, [&](size_t i) -> Chunk::Item& { return fit(c, i); }, submit);
+        else
+            while (c.n_read < end && submit(c.n_read, fit(c, c.n_read))) ++c.n_read;
+        if (failed) return false;
+        if (c.prefill) {
+            for (int64_t i : c.stage_item) {
+                if (i < 0 || (size_t) i < c.n_dma) continue;
+                Chunk::Item& it = fit(c, (size_t) i);
+                c.prefill->retry_file(it, [&] { flow_stage_read(c, it, false); });
+            }
         }
         const size_t R = (size_t) c.ring_n, dma0 = c.n_dma;
         struct Kick {   // (every way out: what was queued is submitted)
@@ -4170,6 +4309,7 @@ struct Model::Impl {
         while (c.n_dma < c.n_read && c.n_dma < c.n_comp + R) {
             Chunk::Item& it = fit(c, c.n_dma);
             if (it.left.load(std::memory_order_acquire) != 0) break;
+            if (c.prefill && c.prefill->retry_file(it, [&] { flow_stage_read(c, it, false); })) break;
             if (it.bad.load(std::memory_order_acquire)) {
                 err = "reading layer " + std::to_string(it.il) + " expert " + std::to_string(it.e) +
                       " from the model's files failed";
@@ -4222,11 +4362,17 @@ struct Model::Impl {
             // has landed: the experts' outputs are summed batch after batch (the VRAM ones' shares between them), so
             // the sums come out the same on every run whatever the reads' timing
             const size_t i0 = c.n_comp, i1 = std::min({le, i0 + bmax, (i0 / R + 1) * R});
+            if (c.prefill && halt_now()) return halt_end(c.dev, err);
+            const uint64_t seen = c.prefill ? c.prefill->epoch() : 0;
+            const size_t dma0 = c.n_dma;
             if (!flow_pump(c, err)) return false;
             if (c.n_dma < i1) {   // not all of the batch landed: wait for a read, or for a staging slot's copy
                 const double tw = now_ms();
                 kick(s);
-                if (c.n_read > c.n_dma) c.io->wait_any(500);
+                if (c.prefill) {
+                    // Refill after new DMA events before sleeping. Time out to check GPU events, which don't signal the hub.
+                    if (c.n_dma == dma0) c.prefill->wait_change(seen, 500);
+                } else if (c.n_read > c.n_dma) c.io->wait_any(500);
                 else {
                     const Chunk::Item& it = fit(c, c.n_read);
                     if (it.stage >= 0) CK(cudaEventSynchronize(c.stage_ev[(size_t) it.stage]));
@@ -9231,11 +9377,31 @@ struct Model::Impl {
         const int D = g.dim, H = g.hc, nk = (int) run.T.size();
         Streamer S;
         const int B = std::max(1, c.ring_n / Chunk::kParts);
+        const bool tier_prefill = c.stage != nullptr && prefill_tier_enabled();
+        struct DrainFlow {
+            Impl& impl;
+            Chunk& c;
+            ~DrainFlow() {
+                if (!c.prefill) return;
+                impl.flow_drain(c);
+                c.prefill_tier_bytes = c.prefill->tier_bytes;
+                c.prefill_tier_reads = c.prefill->tier_reads;
+                c.prefill_tier_retries = c.prefill->tier_retries;
+                c.prefill.reset();
+            }
+        } drain{*this, c};
+        if (tier_prefill) {
+            if (!c.io) c.io = std::make_unique<IoQueue>(c.n_readers);
+            c.prefill_tier_bytes = c.prefill_tier_reads = c.prefill_tier_retries = 0;
+            c.io_d0 = c.io->direct_bytes();
+            c.io_b0 = c.io->buffered_bytes();
+        }
         if (c.flow) {   // (the flow decides its streams as the layers route; nothing planned here)
             CK(cudaStreamSynchronize(s));
             CK(cudaStreamSynchronize(c.cs));
             c.items.clear();
             c.base = c.n_read = c.n_dma = c.n_comp = 0;
+            if (tier_prefill) c.prefill = std::make_unique<PrefillReads>();
             c.n_file = 0;
             std::fill(c.stage_item.begin(), c.stage_item.end(), -1);
             c.fl_layers.clear();
@@ -9277,7 +9443,8 @@ struct Model::Impl {
         }
         std::atomic<bool> ra_stop{false};
         std::thread ra;
-        if (file_experts && !S.b.empty()) ra = std::thread([this, &S, di, &ra_stop] { read_ahead(S, di, ra_stop); });
+        // The tier path already queues each batch's misses. File-only read-ahead would also fetch its tier hits.
+        if (file_experts && !tier_prefill && !S.b.empty()) ra = std::thread([this, &S, di, &ra_stop] { read_ahead(S, di, ra_stop); });
         struct Join {   // (every way out of the run: the read-ahead ends before S does)
             std::atomic<bool>& stop;
             std::thread& th;
@@ -10027,6 +10194,13 @@ struct Model::Impl {
             const double ms = now_ms() - tl;
             for (size_t di = 0; di < chunks.size(); ++di) {
                 const Chunk& c = *chunks[di];
+                if (c.io && prefill_tier_enabled()) {
+                    const uint64_t file_bytes = (c.io->direct_bytes() - c.io_d0) + (c.io->buffered_bytes() - c.io_b0);
+                    std::fprintf(stderr, "ds4 prefill tier, CUDA%d (%s): %llu tier bytes queued in %llu experts, "
+                                 "%llu model-file bytes read, %llu tier-to-file retries\n", devs[di].id, c.flow ? "flow" : "batch",
+                                 (unsigned long long) c.prefill_tier_bytes, (unsigned long long) c.prefill_tier_reads,
+                                 (unsigned long long) file_bytes, (unsigned long long) c.prefill_tier_retries);
+                }
                 if (!c.flow) continue;
                 const double db = (double) (c.io->direct_bytes() - c.io_d0) / 1e9;
                 const double bb = (double) (c.io->buffered_bytes() - c.io_b0) / 1e9;
@@ -10046,7 +10220,8 @@ struct Model::Impl {
                              "from RAM (%.1f GB)%s; %llu likely ones queued early, %llu of them unpicked; the compute waited "
                              "%.0f ms for reads%s\n",
                              devs[di].id, n, ms, (unsigned long long) (c.it_file + c.it_ram + c.it_lc),
-                             (unsigned long long) c.it_file, fb, fb / std::max(1e-3, ms / 1000.0), db, bb,
+                             (unsigned long long) (c.it_file - c.prefill_tier_reads + c.prefill_tier_retries), fb,
+                             fb / std::max(1e-3, ms / 1000.0), db, bb,
                              (unsigned long long) c.it_ram, rb, lcs, (unsigned long long) c.it_spec,
                              (unsigned long long) c.it_spec_unused, c.wait_ms, dbgs);
             }
